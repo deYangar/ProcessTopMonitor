@@ -8,6 +8,7 @@
 //     via the m_data_lock snapshot + PostMessage (0xc0000374 lessons)
 //   - double-buffered tooltip text (torn-read protection)
 #include "plugin_main.h"
+#include "options_dialog.h"
 #include "utils.h"
 #include <shellapi.h>
 #include <dbghelp.h>
@@ -683,10 +684,65 @@ void CProcessTopPlugin::TopListRefreshFromSnapshot() {
 }
 
 ITMPlugin::OptionReturn CProcessTopPlugin::ShowOptionsDialog(void* hParent) {
-    (void)hParent;
-    // M1: 选项对话框在 M3（方案 §11）——首版以任务栏 item + 窗口右键菜单
-    // 覆盖核心设置面，宿主「插件设置」按钮报告未提供
-    return OR_OPTION_NOT_PROVIDED;
+    return PtShowOptionsDialog((HWND)hParent);
+}
+
+// ---- M4 选项对话框接缝 ----
+
+void CProcessTopPlugin::CopySnapshot(MetricsSnapshot& out, bool& valid) {
+    EnterCriticalSection(&m_data_lock);
+    out = m_snapshot;
+    valid = m_snapshot_valid;
+    LeaveCriticalSection(&m_data_lock);
+}
+
+std::vector<std::wstring> CProcessTopPlugin::EnumerateGpuEnginesForDialog() {
+    if (m_gpu.IsRunning()) {
+        MetricsSnapshot snap;
+        bool valid;
+        CopySnapshot(snap, valid);
+        if (!snap.gpu_engtypes.empty()) return snap.gpu_engtypes;
+    }
+    return m_gpu.EnumerateEngines();
+}
+
+void CProcessTopPlugin::GetIoStatusForDialog(wchar_t* out, size_t cap) {
+    if (!out || cap == 0) return;
+    FileIoGrade g = m_etw.Grade();
+    switch (g) {
+    case FileIoGrade::A:
+        wcsncpy_s(out, cap, TR(L"A：精确口径（文件读写，ETW 会话 PTMFileIoSession）"), _TRUNCATE);
+        break;
+    case FileIoGrade::B:
+        wcsncpy_s(out, cap, TR(L"B：精确口径（Win7 NT Kernel Logger）"), _TRUNCATE);
+        break;
+    case FileIoGrade::C: {
+        wcsncpy_s(out, cap, TR(L"C：全句柄口径（含网络）"), _TRUNCATE);
+        // 原因追加（GetStatusText 的 "C: reason" 段）
+        wchar_t base[160];
+        m_etw.GetStatusText(base, 160);
+        const wchar_t* p = wcschr(base, L':');
+        if (p && p[1] == L' ' && p[2] && wcslen(out) + 4 + wcslen(p + 2) < cap) {
+            wcscat_s(out, cap, TR(L"—— "));
+            wcscat_s(out, cap, p + 2);
+        }
+        break;
+    }
+    default:
+        wcsncpy_s(out, cap, L"off", _TRUNCATE);
+        break;
+    }
+    uint64_t lost = 0;
+    {
+        EnterCriticalSection(&m_data_lock);
+        lost = m_snapshot.io_events_lost;
+        LeaveCriticalSection(&m_data_lock);
+    }
+    if (lost > 0) {
+        wchar_t lbuf[48];
+        swprintf_s(lbuf, 48, TR(L"｜丢事件：%llu"), (unsigned long long)lost);
+        if (wcslen(out) + wcslen(lbuf) < cap) wcscat_s(out, cap, lbuf);
+    }
 }
 
 void CProcessTopPlugin::DataRequired() {

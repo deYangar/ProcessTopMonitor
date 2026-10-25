@@ -569,3 +569,36 @@ void GpuCollector::Tick(GpuTickData& out,
         out.sys_mem_valid = out.mem_valid;
     }
 }
+
+// ============================================================
+// EnumerateEngines — one-shot engtype list for the options dialog (M4)
+// Independent throwaway query: safe to run from the UI thread while the
+// tick-thread query is live (PDH supports concurrent queries).
+// ============================================================
+std::vector<std::wstring> GpuCollector::EnumerateEngines() {
+    std::vector<std::wstring> out;
+    DWORD build = 0;
+    if (!PTM_GetOSBuild(build) || build < 16299) return out;   // G2/G3：无引擎命名
+    PDH_HQUERY q = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) return out;
+    PDH_HCOUNTER c = nullptr;
+    if (AddCounter(q, kPathUtil, (void**)&c)) {
+        PdhCollectQueryData(q);   // 实例名首拍即现；利用率数值不取
+        std::vector<PDH_FMT_COUNTERVALUE_ITEM_W> items;
+        std::vector<BYTE> buf;
+        if (GetFormattedArray(c, buf, items)) {
+            std::unordered_set<std::wstring> set;
+            for (auto& it : items) {
+                std::wstring inst = it.szName ? it.szName : L"";
+                DWORD pid = 0;
+                std::wstring eng;
+                if (ParseEngineInstance(inst, pid, eng) && !eng.empty())
+                    set.insert(eng);
+            }
+            out.assign(set.begin(), set.end());
+            std::sort(out.begin(), out.end());
+        }
+    }
+    if (q) PdhCloseQuery(q);
+    return out;
+}

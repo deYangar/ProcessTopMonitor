@@ -76,6 +76,14 @@ public:
     GpuScopeConfig GpuScope() const { return m_settings.GpuScope(); }
     void ApplyGpuScope(const GpuScopeConfig& cfg);
 
+    // ---- M4 选项对话框接缝（对话框只经这些通道访问插件内部）----
+    GpuGrade GpuCollectorGrade() const { return m_gpu.Grade(); }
+    const wchar_t* GpuGradeReason() const { return m_gpu.Reason(); }
+    void CopySnapshot(MetricsSnapshot& out, bool& valid);          // 锁内拷贝
+    std::vector<std::wstring> EnumerateGpuEnginesForDialog();      // 运行中取快照，否则临时查询
+    FileIoGrade RetryFileIoSession() { return m_etw.Start(); }     // 幂等重试
+    void GetIoStatusForDialog(wchar_t* out, size_t cap);           // 档位文案 + 丢事件
+
     // settings live here; the window reads a copy on push
     PtSettings m_settings;
     std::wstring m_config_dir;           // <plugins>\ProcessTopMonitor

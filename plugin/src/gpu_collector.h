@@ -100,6 +100,11 @@ public:
     // G1 (PDH) ignores it.
     void Tick(GpuTickData& out, const std::vector<DWORD>& pid_candidates);
 
+    // UI thread (options dialog). One-shot engtype enumeration with a
+    // throwaway PDH query — independent of the tick-thread query, ~几 ms,
+    // only names collected, no values (M4 方案 §4).
+    std::vector<std::wstring> EnumerateEngines();
+
 private:
     bool OpenQuery();                  // tick thread (G1)
     void CloseQuery();                 // tick thread (G1)
