@@ -126,7 +126,9 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
         if (pos == std::string::npos) return;
         pos = json.find(':', pos);
         if (pos == std::string::npos) return;
-        out = (json.compare(pos + 1, 4, "true") == 0);
+        size_t v = pos + 1;
+        while (v < json.size() && (json[v] == ' ' || json[v] == '\t')) v++;
+        out = (json.compare(v, 4, "true") == 0);
     };
     auto gets = [&](const char* key, std::wstring& out) {
         size_t pos = json.find(key);

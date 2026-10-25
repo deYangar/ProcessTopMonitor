@@ -339,116 +339,7 @@ void WINAPI EtwFileCollector::EventCallback(PEVENT_RECORD rec) {
 void EtwFileCollector::OnEvent(PEVENT_RECORD rec) {
     // handoff check: one relaxed load on the hot path (~1ns)
     if (m_take_req.load(std::memory_order_relaxed)) DoHandoffLocked();
-    // TEMP diag: count ALL incoming events + opcode histogram (removed after bring-up)
     m_ev_seen++;
-    // TEMP diag: resolve the official event name per opcode via TDH (once
-    // per opcode) - definitive opcode mapping, replaces all guesswork.
-    {
-        unsigned opn = rec->EventHeader.EventDescriptor.Opcode & 0xFF;
-        if (!m_tdh_done[opn]) {
-            m_tdh_done[opn] = 1;
-            wchar_t namebuf[256] = L"?";
-            static BYTE eb[16384];
-            ULONG esize = sizeof(eb);
-            PTRACE_EVENT_INFO ei = (PTRACE_EVENT_INFO)eb;
-            ULONG tstatus = TdhGetEventInformation(rec, 0, nullptr, ei, &esize);
-            if (tstatus == ERROR_SUCCESS) {
-                if (ei->EventNameOffset)
-                    wcsncpy_s(namebuf, 256, (PCWSTR)((PBYTE)ei + ei->EventNameOffset), _TRUNCATE);
-                else
-                    wcsncpy_s(namebuf, 256, L"(no name)", _TRUNCATE);
-            } else {
-                wchar_t tmp[48];
-                swprintf_s(tmp, 48, L"(tdh err %lu)", tstatus);
-                wcsncpy_s(namebuf, 256, tmp, _TRUNCATE);
-            }
-            LogLine(L"TDH op=%u ver=%u name=%s ulen=%u props=%u",
-                    opn, rec->EventHeader.EventDescriptor.Version,
-                    namebuf, rec->UserDataLength, (unsigned)ei->TopLevelPropertyCount);
-            // property layout (payload offsets): name@offset size
-            for (unsigned pi = 0; pi < ei->TopLevelPropertyCount && pi < 12; pi++) {
-                PEVENT_PROPERTY_DESCRIPTOR pd = (PEVENT_PROPERTY_DESCRIPTOR)(
-                    (PBYTE)ei + ei->PropertyDescriptorOffset) + pi;
-                PCWSTR pn = (PCWSTR)((PBYTE)ei + pd->NameOffset);
-                unsigned in_payload = (unsigned)pd->UnsignedLong;   // offset within payload (TDH)
-                LogLine(L"  prop[%u] +%u size=%u %s",
-                        pi, in_payload, (unsigned)pd->Length, pn);
-            }
-        }
-    }
-    unsigned op_diag = rec->EventHeader.EventDescriptor.Opcode;
-    if (op_diag == 64 || op_diag == 65 || op_diag == 66 || op_diag == 67 || op_diag == 68 || op_diag == 12 || op_diag == 13) {
-        USHORT ul = rec->UserDataLength;
-        unsigned di = (op_diag >= 64) ? (op_diag - 64) : (op_diag % 3);
-        di = di % 3;
-        if (m_diag_samples[di] < 4) {
-            m_diag_samples[di]++;
-            const unsigned char* d = (const unsigned char*)rec->UserData;
-            wchar_t hx[400] = L"";
-            for (int i = 0; i < 64 && i < ul; i++) {
-                wchar_t t[8];
-                swprintf_s(t, 8, L"%02x ", d[i]);
-                wcscat_s(hx, 200, t);
-            }
-            LogLine(L"op%u sample ver=%u ulen=%u pid=%lu: %s",
-                    op_diag, rec->EventHeader.EventDescriptor.Version, ul,
-                    (unsigned long)rec->EventHeader.ProcessId, hx);
-        }
-    }
-    if (op_diag == 76) {
-        m_prov76_last = rec->EventHeader.ProviderId.Data1;
-        m_prov76_count++;
-        USHORT ul = rec->UserDataLength;
-        m_ulen_hist[ul < 80 ? ul : 79]++;
-        if (m_prov76_count <= 3 && ul >= 20) {
-            const unsigned char* d = (const unsigned char*)rec->UserData;
-            wchar_t hx[400] = L"";
-            for (int i = 0; i < 20 && i < ul; i++) {
-                wchar_t t[8];
-                swprintf_s(t, 8, L"%02x ", d[i]);
-                wcscat_s(hx, 200, t);
-            }
-            LogLine(L"op76 sample ver=%u ulen=%u pid=%lu: %s",
-                    rec->EventHeader.EventDescriptor.Version, ul,
-                    (unsigned long)rec->EventHeader.ProcessId, hx);
-        }
-    }
-    {
-        unsigned op = rec->EventHeader.EventDescriptor.Opcode;
-        m_op_hist[op & 0xFF]++;
-        if ((m_ev_seen & 0x3FF) == 0) {
-            ULONGLONG now = GetTickCount64();
-            if (now - m_last_diag >= 2000) {
-                m_last_diag = now;
-                wchar_t top[128] = L"";
-                int n = 0;
-                for (int i = 0; i < 256 && n < 8; i++)
-                    if (m_op_hist[i]) {
-                        int w = -1;
-                        wchar_t tmp[32];
-                        swprintf_s(tmp, 32, L"%d:%llu ", i, (unsigned long long)m_op_hist[i]);
-                        wcscat_s(top, 128, tmp);
-                        n++;
-                    }
-                LogLine(L"diag seen=%llu kept=%llu short=%llu lost=%lu op[]: %s prov76=%08lx n=%u",
-                        (unsigned long long)m_ev_seen,
-                        (unsigned long long)m_ev_kept,
-                        (unsigned long long)m_ev_short,
-                        m_events_lost, top,
-                        (unsigned long)m_prov76_last, m_prov76_count);
-                {
-                    wchar_t uh[256] = L"";
-                    for (int i = 0; i < 80; i++)
-                        if (m_ulen_hist[i]) {
-                            wchar_t tmp[40];
-                            swprintf_s(tmp, 40, L"ulen%d:%llu ", i, (unsigned long long)m_ulen_hist[i]);
-                            wcscat_s(uh, 256, tmp);
-                        }
-                    LogLine(L"diag ulen: %s", uh);
-                }
-            }
-        }
-    }
 
     const auto& h = rec->EventHeader;
     // ProviderId IS FileIoGuid for these kernel events (measured with the
@@ -460,19 +351,21 @@ void EtwFileCollector::OnEvent(PEVENT_RECORD rec) {
     }
 
     unsigned op = h.EventDescriptor.Opcode;
-    // Measured flag/op map (Win11 26300, 2026-10-25):
-    //   EVENT_TRACE_FLAG_FILE_IO alone carries ONLY metadata events (create/
-    //   close/rename + op76 status events) — NO read/write bytes.
-    //   FileIo Read/Write arrive under EVENT_TRACE_FLAG_DISK_IO as opcodes
-    //   64 (read) / 65 (write) / 66 (write variant). Legacy 67/68 showed up
-    //   only as rare stragglers (<0.1%) and are ignored: double-counting
-    //   them would be worse than losing the stragglers.
+    // Definitive opcode/payload map (Win11 26300, TDH-verified 2026-10-25,
+    // full flag set DISK_FILE_IO|FILE_IO|FILE_IO_INIT):
+    //   op67 = FileIo/Read, op68 = FileIo/Write — the MSDN table is correct;
+    //   the earlier "rare stragglers" reading came from sessions whose
+    //   EnableFlags lacked EVENT_TRACE_FLAG_DISK_FILE_IO (metadata-only).
+    //   op64/65/66 are Create/Cleanup/Close metadata; op76 is the per-IO
+    //   OpEnd status event; none of them carry transfer bytes.
     if (op != kFileEvtRead && op != kFileEvtWrite)
         return;
 
-    // FileIo_ReadWrite layout (MSDN): IrpPtr[ptr] ByteOffset[8]
-    // FileObject[ptr] TransferSize[4]. Pointer width = kernel bitness.
-    const UINT32 ud_off = (UINT32)(2 * m_ptr_size + 8);
+    // FileIo Read/Write payload (TDH EVENT_PROPERTY_INFO array, ver=3):
+    //   Offset[8] IrpPtr[ptr] FileObject[ptr] FileKey[ptr] TTID[4]
+    //   IoSize[4] IoFlags[4] — pointer width = kernel bitness, so IoSize
+    //   sits at 8 + 3*ptr + 4 (36 on x64 kernels, 24 on x86).
+    const UINT32 ud_off = (UINT32)(8 + 3 * m_ptr_size + 4);
     USHORT ulen = rec->UserDataLength;
     if (ulen < ud_off + 4) { m_ev_short++; return; }
 
