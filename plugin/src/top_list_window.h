@@ -158,6 +158,8 @@ private:
     std::wstring m_gpu_reason;
     std::vector<std::wstring> m_gpu_engtypes;   // 动态引擎列表（口径菜单）
     int m_tm_gpu_usage = -1;                    // 宿主整机 GPU（G3 摘要兜底）
+    // 宿主传感器（M3-3 L0）：0 = TM 未采集 → 摘要行传感器段整体隐藏
+    int m_tm_cpu_temp = 0, m_tm_gpu_temp = 0, m_tm_cpu_freq = 0;
     int m_topn = 10;
     int m_io_view = 0;
     int m_color_mode = 0;

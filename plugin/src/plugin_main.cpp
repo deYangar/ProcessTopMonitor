@@ -340,9 +340,13 @@ void CProcessTopPlugin::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* da
 }
 
 void CProcessTopPlugin::OnMonitorInfo(const MonitorInfo& mi) {
-    // host tick（TM 自己的线程）：整机 GPU 利用率缓存，G3 摘要兜底用。
-    // 只写一个 atomic int，无锁。
+    // host tick（TM 自己的线程）：整机 GPU 利用率缓存，G3 摘要兜底用；
+    // 传感器三件套（M3-3 L0 白拿）——值为 0 表示 TM 未启用该项监控，
+    // 窗口端据此自动隐藏传感器段。只写 atomic int，无锁。
     m_tm_gpu_usage.store((int)mi.gpu_usage);
+    m_tm_cpu_temp.store((int)mi.cpu_temperature);
+    m_tm_gpu_temp.store((int)mi.gpu_temperature);
+    m_tm_cpu_freq.store((int)mi.cpu_freq);
 }
 
 void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
@@ -580,6 +584,10 @@ void CProcessTopPlugin::RefreshTick() {
     if (m_etw.IsRunning()) snap.io_grade = m_etw.Grade();   // true grade (A/B/C)
     snap.gpu_grade = m_gpu.Grade();                          // true grade even when off
     snap.tm_gpu_usage = m_tm_gpu_usage.load();
+    // 宿主传感器（M3-3）：进快照供窗口摘要行取用（0 = 未采集）
+    snap.tm_cpu_temp = m_tm_cpu_temp.load();
+    snap.tm_gpu_temp = m_tm_gpu_temp.load();
+    snap.tm_cpu_freq = m_tm_cpu_freq.load();
 
     // 4) publish + taskbar item text (lock)
     {

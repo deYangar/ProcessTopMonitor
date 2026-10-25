@@ -45,6 +45,10 @@ struct MetricsSnapshot {
     std::wstring gpu_reason;             // G3 display reason
     std::vector<std::wstring> gpu_engtypes;   // dynamic engine list (menu)
     int tm_gpu_usage = -1;               // host TM whole-GPU value (G3 summary fallback)
+    // 宿主传感器（M3-3 L0 白拿；0 = TM 未启用该项监控 → 摘要行自动隐藏）
+    int tm_cpu_temp = 0;
+    int tm_gpu_temp = 0;
+    int tm_cpu_freq = 0;                 // MHz
     FileIoGrade io_grade = FileIoGrade::C;
     uint64_t io_events_lost = 0;
     ULONGLONG stamp = 0;

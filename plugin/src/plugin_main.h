@@ -95,6 +95,10 @@ private:
 
     // 宿主整机 GPU 利用率（OnMonitorInfo 回调缓存；G3 摘要兜底）
     std::atomic<int> m_tm_gpu_usage{ -1 };
+    // 宿主传感器缓存（M3-3 L0 白拿：宿主线程写，tick/任意线程读；0 = TM 未采集）
+    std::atomic<int> m_tm_cpu_temp{ 0 };
+    std::atomic<int> m_tm_gpu_temp{ 0 };
+    std::atomic<int> m_tm_cpu_freq{ 0 };
     // 窗口实例集合（多窗模式，M3-1）：WindowManager 单例持有，plugin 经
     // WindowManager::Instance() 访问——窗口侧也要直达，成员+单例二选一
     // 取单例（方案 §2.1 Instance 与 §6 m_wmgr 的矛盾在此定案：单例）

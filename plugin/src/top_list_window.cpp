@@ -1199,6 +1199,10 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
     if (!snap.gpu_engtypes.empty() || m_gpu_engtypes.empty())
         m_gpu_engtypes = snap.gpu_engtypes;   // PDH 关闭期保留旧列表供菜单显示
     m_tm_gpu_usage = snap.tm_gpu_usage;
+    // 宿主传感器同步（M3-3）：必须与显示同拍，否则脏检查指纹与内容脱节
+    m_tm_cpu_temp = snap.tm_cpu_temp;
+    m_tm_gpu_temp = snap.tm_gpu_temp;
+    m_tm_cpu_freq = snap.tm_cpu_freq;
 
     const MetricView* view = nullptr;
     switch (m_kind) {
@@ -1237,7 +1241,11 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
     // unchanged picture costs zero repaints) ----
     std::vector<std::pair<DWORD, long long>> sig;
     sig.reserve(m_rows.size() + 1);
-    sig.push_back({ 0xDEAD, (long long)(m_summary_value * 10.0) });
+    // summary 指纹折入传感器值（M3-3）：传感器变化才触发重绘，静止期仍 0 重绘
+    sig.push_back({ 0xDEAD, (long long)(m_summary_value * 10.0)
+                          + (long long)m_tm_cpu_temp * 1000003LL
+                          + (long long)m_tm_gpu_temp * 100000037LL
+                          + (long long)m_tm_cpu_freq });
     for (auto& r : m_rows)
         sig.push_back({ r.pid, (long long)(r.value * 10.0) + r.count * 1000003 });
     bool changed = first_tick || !m_rows_has_value || sig != m_dirty_sig;
@@ -1432,6 +1440,43 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
     RECT rc = { PADDING, y, w - PADDING, y + SUMMARY_H };
     DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
+    // 传感器段（M3-3 L0 白拿）：开关开着且值非 0 才显示（风险 #18——
+    // TM 未启用温度监控时自动隐藏，不留空白占位）；画在摘要行右端，
+    // 与左侧数值之间留 8px，小号字体 + 次要色（与状态行同款灰）
+    wchar_t sensor[48] = L"";
+    if (CProcessTopPlugin::Instance().m_settings.sensor_summary) {
+        wchar_t seg[32];
+        if (m_kind == MetricKind::Cpu) {
+            // CPU：温度 + 频率（各有值才拼各自段）；频率 MHz 整数 ≥1000
+            // 换算 GHz 一位小数（单位换算，不是精度截断），<1000 显示 MHz
+            if (m_tm_cpu_temp > 0) {
+                swprintf_s(seg, 32, L"%d\x00b0C", m_tm_cpu_temp);
+                wcscat_s(sensor, 48, seg);
+            }
+            if (m_tm_cpu_freq > 0) {
+                if (sensor[0]) wcscat_s(sensor, 48, L" ");
+                if (m_tm_cpu_freq >= 1000) {
+                    swprintf_s(seg, 32, L"%d.%dGHz", m_tm_cpu_freq / 1000,
+                               (m_tm_cpu_freq % 1000 + 50) / 100);
+                } else {
+                    swprintf_s(seg, 32, L"%dMHz", m_tm_cpu_freq);
+                }
+                wcscat_s(sensor, 48, seg);
+            }
+        } else if (m_kind == MetricKind::Gpu || m_kind == MetricKind::Vram) {
+            if (m_tm_gpu_temp > 0) {
+                swprintf_s(seg, 32, L"%d\x00b0C", m_tm_gpu_temp);
+                wcscat_s(sensor, 48, seg);
+            }
+        }
+        // 内存/磁盘维度无对应传感器：不显示（温度与维度无关反而误导）
+    }
+    if (sensor[0]) {
+        SetTextColor(hdc, UseTextTheme() ? RGB(150, 150, 150) : RGB(110, 110, 110));
+        RECT rs = { PADDING, y, w - PADDING, y + SUMMARY_H };
+        InflateRect(&rs, -(int)(8 * m_dpi_scale), 0);
+        DrawTextW(hdc, sensor, -1, &rs, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
     SelectObject(hdc, hOld);
 }
 

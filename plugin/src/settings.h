@@ -45,6 +45,7 @@ struct PtSettings {
     std::wstring lang = L"auto";   // auto or BCP-47
     bool debug_logs = false;
     int dock_edge = 0;              // 停靠边偏好（M3-2 方案 §7.2）：0=auto 1=right 2=left
+    bool sensor_summary = false;    // 标题栏传感器摘要（M3-3 L0，方案 §9 默认关）
 
     // clamp everything to its legal domain (hand-edited settings.json must
     // not brick the plugin)
@@ -168,6 +169,7 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"debug_logs\": %s,\n", st.debug_logs ? "true" : "false");
     fprintf(f, "  \"lang\": \"%s\",\n", PtToUtf8(st.lang).c_str());
     fprintf(f, "  \"dock_edge\": %d,\n", st.dock_edge);
+    fprintf(f, "  \"sensor_summary\": %s,\n", st.sensor_summary ? "true" : "false");
     // windows[]（schema 2 核心字段；v1 的 metric/win_x/win_y 停止写出）
     fprintf(f, "  \"windows\": [\n");
     for (size_t i = 0; i < st.windows.size(); i++) {
@@ -239,6 +241,7 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     getb("\"debug_logs\"", st.debug_logs);
     gets("\"lang\"", st.lang);
     geti("\"dock_edge\"", st.dock_edge);
+    getb("\"sensor_summary\"", st.sensor_summary);
 
     // windows[] 段解析：定位 "windows" → [ → 逐 {…} 行按 key 读 7 个 int。
     // 行内无嵌套对象/转义引号，find('}') 即行界（方案 §5.2）。
