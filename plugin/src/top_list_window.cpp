@@ -1,5 +1,6 @@
 // top_list_window.cpp — ranking popup: ULW pipeline (PNM-inherited) + N rows
 #include "top_list_window.h"
+#include "plugin_main.h"    // WM_PTM_REFRESH pulls the snapshot via the plugin
 #include "utils.h"
 #include "i18n.h"
 #include <shellapi.h>
@@ -326,7 +327,15 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_PTM_REFRESH:
-        return 0;   // data arrives via UpdateFromSnapshot; reserved
+        // pull the latest snapshot on the UI thread (posted by the refresh
+        // timer thread — same discipline as PNM's PopupRefreshFromSnapshot)
+        CProcessTopPlugin::Instance().TopListRefreshFromSnapshot();
+        return 0;
+
+    case WM_PTM_LANG_CHANGED:
+        // 运行期语言变化：重绘（文本绘制时 TR 实时取词）
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return 0;
 
     case WM_DPICHANGED: {
         RECT* prc = (RECT*)lp;
@@ -1064,13 +1073,15 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
 }
 
 void CTopListWindow::RecalcAndRepaint(bool reposition) {
+    (void)reposition;   // 行数变化必须跟着变尺寸（第二行曾被窗口边缘切断），
+                        // 统一走 Reposition：重算尺寸 + 工作区 clamp + 显示
     m_dark_mode = IsDarkMode();
     ApplyBackdrop(m_backdrop_effect, m_backdrop_opacity);   // theme re-check, idempotent
     if (UseTextTheme() != m_pen_dark) RecreateScaledResources();
     RECT rc;
     GetWindowRect(m_hwnd, &rc);
     UpdateDpiScale();
-    if (reposition) Reposition();
+    Reposition();
     InvalidateRect(m_hwnd, nullptr, FALSE);
     if (m_acrylic_active) UpdateWindow(m_hwnd);   // compose synchronously, no blank frame
 }

@@ -182,19 +182,21 @@ void MetricsCollector::Tick(CpuMemIoMetrics& out) {
                           ? r.io_read - it->second.io_read : 0;
             uint64_t dw = r.io_write >= it->second.io_write
                           ? r.io_write - it->second.io_write : 0;
+            // 100ns units -> seconds: dc/1e7 over (dt*cores) -> percent
             double denom = dt * (double)m_cpu_cores;
-            if (denom > 0) m.cpu_pct = (double)dc / denom / 10000.0; // 100ns->s
+            if (denom > 0) m.cpu_pct = (dc / 1e7) / denom * 100.0;
             m.io_read_bps = (double)dr / dt;
             m.io_write_bps = (double)dw / dt;
         }
         out.procs.push_back(std::move(m));
     }
 
-    // system CPU%: 100 - idle% (idle counted against ALL logical cores)
+    // system CPU%: 100 - idle% (idle counted against ALL logical cores,
+    // 100ns units -> seconds: di/1e7 over dt*cores)
     if (m_have_prev) {
         uint64_t di = idle_time >= m_prev_idle_time
                       ? idle_time - m_prev_idle_time : 0;
-        double idle_pct = (double)di / (dt * (double)m_cpu_cores) / 10000.0 * 100.0;
+        double idle_pct = (di / 1e7) / (dt * (double)m_cpu_cores) * 100.0;
         if (idle_pct < 0) idle_pct = 0;
         if (idle_pct > 100) idle_pct = 100;
         out.cpu_total_pct = 100.0 - idle_pct;
