@@ -1,0 +1,2 @@
+// resource.rc - ProcessTopMonitor 插件资源
+1 ICON "src\\app.ico"

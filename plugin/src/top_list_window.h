@@ -1,0 +1,191 @@
+#pragma once
+// ============================================================
+// top_list_window — per-metric Top-N ranking popup window
+// (技术方案 §3.2/§6.1: CTooltipPopup 视觉管线改造)
+//
+// Inherited from PNM's CTooltipPopup (proven ULW pipeline):
+//   - ULW per-pixel channel: coverage double-pass (white/black) -> premultiplied
+//     ARGB compose -> UpdateLayeredWindow. Acrylic/transparent/blur/opaque.
+//   - SWCA blur-behind effect layer underneath (system real-time blur).
+//   - Text flip judgment (affinity no-flash capture, hysteresis band).
+//   - Frame-split icon extraction (draw path is cache-only, <=2 disk
+//     extractions per paint).
+// Changed for PTM:
+//   - Multi-instance: HWND -> CTopListWindow* registry (PNM was a singleton).
+//   - Rows: one metric, N ranked rows (no upload/download sections).
+//   - Resident window: no hover state machine; title-bar drag to move,
+//     close button, wheel/quick-menu metric switching.
+// ============================================================
+#include <windows.h>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include "top_aggregator.h"
+#include "settings.h"
+
+// Set during DLL_PROCESS_DETACH: window teardown skips DestroyWindow
+// (issue #7 class of host crashes, PNM-inherited discipline)
+extern volatile bool g_shutting_down;
+
+// Destroy a window with IME detached and SEH-guarded (C2712-safe standalone)
+void PtSafeDestroyWindow(HWND hwnd);
+
+class CTopListWindow {
+public:
+    static const int MAX_WINDOWS = 6;   // 方案 §6.3 上限
+
+    CTopListWindow();
+    ~CTopListWindow();
+
+    // Register the window class once per DLL (idempotent). Call before Create.
+    static bool EnsureClassRegistered(HINSTANCE hInst);
+
+    // UI thread. suggested: screen pos hint (falls back to cascading default)
+    bool Create(const POINT* suggested);
+    void Destroy();                    // public UI-thread teardown
+
+    // Backdrop effect (0 acrylic / 1 transparent / 2 blur / 3 opaque) +
+    // opacity 10-100. Idempotent; call before/while showing.
+    void ApplyBackdrop(int effect, int opacity);
+
+    // Push a fresh snapshot (already copied under the plugin data lock by
+    // the caller) and refresh the display (dirty-check gated repaint).
+    void UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind kind,
+                            int topn, int io_view, bool first_tick);
+
+    // 切换指标：只换读取的快照子集，零额外采集（方案 §6.2）
+    void SetKind(MetricKind k);
+    MetricKind GetKind() const { return m_kind; }
+
+    bool IsVisible() const { return m_visible; }
+    HWND GetHwnd() const { return m_hwnd; }
+    void GetWindowPos(POINT& pt) const;   // settings persistence
+
+    // settings pass-through for draw-time reads (effect/opacity/color mode)
+    void SetAppearance(int color_mode, int effect, int opacity) {
+        m_color_mode = color_mode;
+        ApplyBackdrop(effect, opacity);
+    }
+
+    int GetIoView() const { return m_io_view; }   // plugin syncs it into settings
+
+private:
+    // ---- ULW pipeline (PNM-inherited) ----
+    bool EnsureLayeredSurface(int w, int h);
+    void ComposeLayeredSurface(int w, int h);
+    void EnsureBlurLayer();
+    void DestroyBlurLayer();
+    void RefreshBackdrop(const RECT& popup_rect);
+    bool CaptureSnapNoFlash(const RECT& popup_rect, int w, int h);
+    void ClearLayeredSurfaceForCapture();
+
+    // ---- layout & rendering ----
+    void CalcLayout(HDC hdc, int& out_w, int& out_h);
+    void DrawContent(HDC dc, int w, int h, bool content_only);
+    void DrawRow(HDC hdc, int y, int idx, const TopRow& row);
+    void DrawTitleBar(HDC hdc, int w, int y);
+    void DrawSummary(HDC hdc, int w, int y);
+    void DrawStatusLine(HDC hdc, int w, int y);
+    void Reposition();                       // clamp to work area, show
+    void OnPaint();
+
+    // ---- helpers ----
+    bool IsDarkMode();
+    bool UseTextTheme() const { return m_text_adaptive ? m_text_dark : m_dark_mode; }
+    COLORREF GetBgColor();
+    COLORREF GetTextColor();
+    COLORREF GetAccentColor();
+    void UpdateDpiScale();
+    void RecreateScaledResources();
+    HICON LookupIcon(const std::wstring& name, DWORD pid);
+    HICON ExtractIconFor(const std::wstring& name, DWORD pid);   // not "ExtractIcon": shellapi macro clash
+    bool PumpIconExtraction(int count);
+    void ResolvePendingPaths();
+    const wchar_t* MetricTitle() const;
+    void BuildContextMenu(POINT pt);
+    void RecalcAndRepaint(bool reposition);
+
+    // ---- message handling ----
+    LRESULT HandleMessage(UINT msg, WPARAM wp, LPARAM lp);
+    static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+    static CTopListWindow* FromHwnd(HWND hwnd);
+
+    // ---- state ----
+    HWND m_hwnd = nullptr;
+    HINSTANCE m_hinst = nullptr;
+    bool m_visible = false;
+    bool m_dark_mode = true;
+    bool m_dark_mode_cached = true;
+    ULONGLONG m_dark_mode_tick = 0;
+
+    // current data
+    MetricKind m_kind = MetricKind::Cpu;
+    std::vector<TopRow> m_rows;
+    bool m_rows_has_value = false;
+    double m_summary_value = 0;       // per-metric system total
+    double m_cpu_total = -1;
+    uint64_t m_mem_total = 0, m_mem_used = 0;
+    double m_io_read_total = 0, m_io_write_total = 0;
+    FileIoGrade m_io_grade = FileIoGrade::C;
+    uint64_t m_io_events_lost = 0;
+    int m_topn = 10;
+    int m_io_view = 0;
+    int m_color_mode = 0;
+
+    // 脏检查基线：序号+量化值指纹（方案 §5.3/§8.2 静止画面零重绘）
+    std::vector<std::pair<DWORD, long long>> m_dirty_sig;
+
+    // backdrop state (PNM-inherited semantics)
+    int m_backdrop_mode = 0;          // 0=not-yet 1=layered
+    int m_backdrop_effect = 0;
+    int m_backdrop_opacity = 100;
+    bool m_acrylic_active = false;
+    bool m_acrylic_dark = true;
+    bool m_noise_acrylic = false;
+    HWND m_blur_hwnd = nullptr;
+    bool m_text_dark = false;
+    bool m_text_adaptive = false;
+    double m_bg_lum = -1.0;
+
+    // ULW surfaces
+    HDC m_ulw_dc = nullptr;  HBITMAP m_ulw_bmp = nullptr;  void* m_ulw_bits = nullptr;
+    HDC m_cov_a_dc = nullptr; HBITMAP m_cov_a_bmp = nullptr; void* m_cov_a_bits = nullptr;
+    HDC m_cov_c_dc = nullptr; HBITMAP m_cov_c_bmp = nullptr; void* m_cov_c_bits = nullptr;
+    HDC m_snap_dc = nullptr;  HBITMAP m_snap_bmp = nullptr;  void* m_snap_bits = nullptr;
+    int m_ulw_w_cache = 0, m_ulw_h_cache = 0;
+    RECT m_last_snap_rect = {};
+    ULONGLONG m_last_refresh_tick = 0;
+    bool m_affinity_ok = true;
+    bool m_steady_probe_fast = false;
+
+    // icons: pid -> icon or nullptr (negative cache; ICON_SIZE is fixed so
+    // the pid alone is the key)
+    std::unordered_map<DWORD, HICON> m_icon_cache;
+    std::vector<DWORD> m_icon_pending;
+    std::unordered_map<DWORD, std::wstring> m_path_cache;   // pid -> exe path
+    std::unordered_set<std::string> m_path_missed;          // unresolvable, don't retry
+
+    // cached GDI objects
+    HFONT m_font_normal = nullptr;
+    HFONT m_font_small = nullptr;
+    HPEN m_pen_separator = nullptr;
+    bool m_pen_dark = true;
+
+    // hover state for title bar + close button (repaint on flip only)
+    bool m_hover_close = false;
+    RECT m_rc_close = {};
+    bool m_tracking = false;
+
+    // layout constants (96-DPI base, DPI-scaled members)
+    int PADDING = 12, ROW_HEIGHT = 30, ICON_SIZE = 20, CORNER_RADIUS = 8;
+    int TITLE_H = 30, SUMMARY_H = 26, STATUS_H = 20;
+    int VALUE_AREA_W = 90, IDX_W = 22;
+    static constexpr int BASE_PADDING = 12, BASE_ROW_HEIGHT = 30, BASE_ICON_SIZE = 20;
+    static constexpr int BASE_CORNER_RADIUS = 8;
+    static constexpr int BASE_TITLE_H = 30, BASE_SUMMARY_H = 26, BASE_STATUS_H = 20;
+    static constexpr int BASE_VALUE_AREA_W = 90, BASE_IDX_W = 22;
+    int BASE_WIDTH = 300;
+    float m_dpi_scale = 1.0f;
+    bool m_dpi_inited = false;
+};

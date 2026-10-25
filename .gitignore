@@ -1,25 +1,10 @@
-# Build outputs
-*.obj
-*.pdb
-*.exp
-*.ilk
-*.map
-*.res
-x64/
-x86/
-Debug/
-Release/
-.vs/
-*.user
-
-# Plugin DLL (built artifacts, not source)
-*.dll
-
-# Runtime data
-debug/
-werdumps/
+plugin/*.obj
+plugin/*.res
+plugin/*.dll
+plugin/*.lib
+plugin/*.exp
+plugin/*.map
+plugin/*.pdb
+plugin/vc140.pdb
+plugin/build_log.txt
 *.log
-*.dmp
-
-# Python
-__pycache__/
