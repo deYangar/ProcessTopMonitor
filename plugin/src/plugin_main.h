@@ -46,6 +46,7 @@ public:
     OptionReturn ShowOptionsDialog(void* hParent) override;
     void OnInitialize(ITrafficMonitor* pApp) override;
     void OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data) override;
+    void OnMonitorInfo(const MonitorInfo& monitor_info) override;
     ~CProcessTopPlugin();
 
     // DllMain DLL_PROCESS_DETACH: stop the timer + ETW consumer thread
@@ -53,13 +54,23 @@ public:
     void ShutdownForDllUnload() {
         StopRefreshTimer();
         m_etw.Stop();
+        m_gpu.EnsureStopped();
     }
 
     // ---- UI thread entry points (called from the top-list window) ----
     void TopListRefreshFromSnapshot();   // WM_PTM_REFRESH handler
     void ToggleTopListWindow(HWND parent);
     void SaveSettingsIfDirty();
-    void ApplySettingsToCollectors();    // memory basis / debug logs
+    void ApplySettingsToCollectors();    // memory basis / GPU scope / debug logs
+
+    // 窗口在 UI 线程通知「当前绑定的指标」（滚轮/菜单切换/关闭）——
+    // tick 线程据此按需启停 GPU 采集（方案 §4 设计决策 2）
+    void NotifyBoundMetric(MetricKind k) { m_bound_metric.store((int)k); }
+    void ClearBoundMetric() { m_bound_metric.store(-1); }
+
+    // GPU 口径（窗口口径菜单读写，均 UI 线程）
+    GpuScopeConfig GpuScope() const { return m_settings.GpuScope(); }
+    void ApplyGpuScope(const GpuScopeConfig& cfg);
 
     // settings live here; the window reads a copy on push
     PtSettings m_settings;
@@ -72,12 +83,19 @@ private:
 
     MetricsCollector m_metrics;
     EtwFileCollector m_etw;
+    GpuCollector m_gpu;
+    GpuTickData m_gpu_last;              // GPU 上一次采集结果（tick 线程私有）
     TopAggregator m_aggregator;
     MetricsSnapshot m_snapshot;          // guarded by m_data_lock
     bool m_snapshot_valid = false;
 
     std::unique_ptr<CTopListWindow> m_wnd;
     bool m_wnd_shown = false;            // 用户 intent（点击 item 切换）
+
+    // 宿主整机 GPU 利用率（OnMonitorInfo 回调缓存；G3 摘要兜底）
+    std::atomic<int> m_tm_gpu_usage{ -1 };
+    // 当前绑定指标（窗口 UI 线程写，tick 读；-1=无窗口）
+    std::atomic<int> m_bound_metric{ -1 };
 
     CRITICAL_SECTION m_data_lock;
     bool m_lock_inited = false;
@@ -86,6 +104,7 @@ private:
     HANDLE m_refresh_timer = nullptr;
     bool m_refresh_timer_ok = false;
     int m_tick_count = 0;
+    int m_gpu_tick_div = 0;              // GPU 采集分频（每 2 拍 ≈1s）
     ULONGLONG m_last_save_tick = 0;
 
     std::wstring m_tm_config_dir;

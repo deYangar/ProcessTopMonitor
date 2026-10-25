@@ -13,18 +13,22 @@ struct Acc {
     double cpu = 0;
     uint64_t mem = 0;
     double io_r = 0, io_w = 0;
+    double gpu = 0;              // %, scope+clamp applied by gpu_collector
+    uint64_t vram_ded = 0, vram_shared = 0;
 };
 
 } // namespace
 
 void TopAggregator::Build(const CpuMemIoMetrics& m,
                           const EtwFileCollector::IoDelta* io_delta,
+                          const GpuTickData* gpu,
                           double dt,
                           const AggregateSettings& cfg,
                           MetricsCollector& mc,
                           MetricsSnapshot& out) {
     out.cpu.rows.clear(); out.mem.rows.clear();
     out.io.rows.clear(); out.io_read.rows.clear(); out.io_write.rows.clear();
+    out.gpu.rows.clear(); out.vram.rows.clear();
     out.cpu_total_pct = m.cpu_total_pct;
     out.mem_total = m.mem_total;
     out.mem_used = m.mem_used;
@@ -51,6 +55,17 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
                 io_w = (double)it->second.second / dt;
             }
         }
+        double gpu_pct = 0;
+        uint64_t vram_d = 0, vram_s = 0;
+        if (gpu) {
+            auto gu = gpu->util_by_pid.find(p.pid);
+            if (gu != gpu->util_by_pid.end()) gpu_pct = gu->second;
+            auto gm = gpu->mem_by_pid.find(p.pid);
+            if (gm != gpu->mem_by_pid.end()) {
+                vram_d = gm->second.first;
+                vram_s = gm->second.second;
+            }
+        }
         const std::wstring& key = p.name;
         if (key.empty()) continue;   // unnamed protected rows (no name to merge by)
         auto it = by_name.find(key);
@@ -64,6 +79,9 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             a.mem = p.mem;
             a.io_r = io_r;
             a.io_w = io_w;
+            a.gpu = gpu_pct;
+            a.vram_ded = vram_d;
+            a.vram_shared = vram_s;
             merged.push_back(std::move(a));
         } else {
             Acc& a = merged[it->second];
@@ -72,6 +90,9 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             a.mem += p.mem;
             a.io_r += io_r;
             a.io_w += io_w;
+            a.gpu += gpu_pct;
+            a.vram_ded += vram_d;
+            a.vram_shared += vram_s;
             // representative = biggest live contributor by CPU (stable pick)
             if (p.cpu_pct > 0.01 && a.main_pid == 0) a.main_pid = p.pid;
         }
@@ -148,6 +169,13 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     fill(out.io, [](const Acc* a) { return a->io_r + a->io_w; }, has_delta);
     fill(out.io_read, [](const Acc* a) { return a->io_r; }, has_delta);
     fill(out.io_write, [](const Acc* a) { return a->io_w; }, has_delta);
+    bool gpu_ok = gpu && gpu->util_valid;
+    bool vram_ok = gpu && gpu->mem_valid;
+    fill(out.gpu, [](const Acc* a) { return a->gpu; }, gpu_ok);
+    fill(out.vram, [&](const Acc* a) {
+        return (double)(cfg.vram_with_shared ? a->vram_ded + a->vram_shared
+                                             : a->vram_ded);
+    }, vram_ok);
 
     // totals for the summary line
     if (etw_exact) {
@@ -163,4 +191,19 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     }
     out.io_grade = etw_exact ? FileIoGrade::A : FileIoGrade::C;   // caller overwrites with the true grade (A/B/C)
     out.io_events_lost = io_delta ? io_delta->events_lost : 0;
+
+    // GPU/VRAM summary + grade passthrough (窗口状态行/口径菜单用)
+    if (gpu) {
+        out.gpu_total_pct = gpu->total_util_pct;
+        out.gpu_total_valid = gpu->util_valid;
+        out.vram_sys_dedicated = gpu->sys_dedicated;
+        out.vram_sys_shared = gpu->sys_shared;
+        out.vram_sys_valid = gpu->sys_mem_valid;
+        out.gpu_grade = gpu->grade;
+        out.gpu_reason = gpu->unsupported_reason;
+        out.gpu_engtypes = gpu->known_engtypes;
+    } else {
+        out.gpu_total_valid = false;
+        out.vram_sys_valid = false;
+    }
 }

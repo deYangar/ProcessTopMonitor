@@ -339,6 +339,12 @@ void CProcessTopPlugin::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* da
     }
 }
 
+void CProcessTopPlugin::OnMonitorInfo(const MonitorInfo& mi) {
+    // host tick（TM 自己的线程）：整机 GPU 利用率缓存，G3 摘要兜底用。
+    // 只写一个 atomic int，无锁。
+    m_tm_gpu_usage.store((int)mi.gpu_usage);
+}
+
 void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     InitCrashHandlers();
 
@@ -359,6 +365,7 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     PtLoadSettings(m_config_dir, m_settings);
     ApplySettingsToCollectors();
     EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
+    m_gpu.ProbeGrade();   // OS-version gate: menu gray-state on G3 systems
 
     // ---- i18n (PNM-inherited): scan <config>\lang\, auto-follow TM ----
     {
@@ -392,9 +399,28 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
 
 void CProcessTopPlugin::ApplySettingsToCollectors() {
     m_metrics.SetMemBasisWorkingSet(m_settings.memory_basis == 1);
+    m_gpu.Configure(m_settings.GpuScope());
     if (m_wnd)
         m_wnd->SetAppearance(m_settings.color_mode, m_settings.popup_effect,
                              m_settings.popup_opacity);
+}
+
+void CProcessTopPlugin::ApplyGpuScope(const GpuScopeConfig& cfg) {
+    // UI 线程（窗口口径菜单）：settings 持久化 + 采集器即时生效
+    if (cfg.all_engines || cfg.engines.empty()) {
+        m_settings.gpu_engines = L"all";
+    } else {
+        std::wstring joined;
+        for (size_t i = 0; i < cfg.engines.size(); i++) {
+            if (i) joined += L",";
+            joined += cfg.engines[i];
+        }
+        m_settings.gpu_engines = joined;
+    }
+    m_settings.gpu_cap_100 = cfg.cap_100;
+    m_settings.vram_basis = cfg.vram_with_shared ? 1 : 0;
+    m_settings_dirty = true;
+    m_gpu.Configure(cfg);
 }
 
 void CProcessTopPlugin::CreateTopListWindow() {
@@ -443,6 +469,7 @@ void CProcessTopPlugin::PollWindowAlive() {
         }
         m_wnd.reset();   // destructor frees ULW surfaces / icon cache
         m_wnd_shown = false;
+        ClearBoundMetric();   // 无窗口 → GPU 维度下拍停采
     }
 }
 
@@ -532,6 +559,17 @@ void CProcessTopPlugin::RefreshTick() {
         have_etw = io_delta.valid;
     }
 
+    // 2b) GPU 按需启停（绑定指标不含 GPU/显存 → PDH 全关，方案 §4）。
+    // 关停时同步清空缓存结果，重开后的首拍不会拿旧数据冒充。
+    int bound = m_bound_metric.load();
+    bool gpu_bound = (bound == (int)MetricKind::Gpu || bound == (int)MetricKind::Vram);
+    if (gpu_bound) {
+        m_gpu.EnsureStarted();
+    } else {
+        m_gpu.EnsureStopped();
+        m_gpu_last = GpuTickData{};
+    }
+
     ULONGLONG now = GetTickCount64();
     static ULONGLONG prev_wall = 0;   // tick-thread only (CAS-guarded)
     double dt = prev_wall ? (double)(now - prev_wall) / 1000.0 : 0.0;
@@ -542,9 +580,22 @@ void CProcessTopPlugin::RefreshTick() {
     // 3) aggregate: merge + sort + TopN
     AggregateSettings agg;
     agg.topn = m_settings.topn;
+    agg.vram_with_shared = (m_settings.vram_basis == 1);
+    // GPU 采集单独降频（每 2 拍 ≈1s，方案 §2.4）。非采集拍沿用上一次结果
+    // （GPU 数据本就是 1s 档口径），否则快照 valid 位逐拍闪烁。
+    GpuTickData gpu_data;
+    bool gpu_tick = (++m_gpu_tick_div % 2 == 0);
+    if (m_gpu.IsRunning()) {
+        if (gpu_tick) m_gpu.Tick(m_gpu_last);
+        gpu_data = m_gpu_last;
+    }
     MetricsSnapshot snap;
-    m_aggregator.Build(m, have_etw ? &io_delta : nullptr, dt, agg, m_metrics, snap);
+    m_aggregator.Build(m, have_etw ? &io_delta : nullptr,
+                       m_gpu.IsRunning() ? &gpu_data : nullptr,
+                       dt, agg, m_metrics, snap);
     if (m_etw.IsRunning()) snap.io_grade = m_etw.Grade();   // true grade (A/B/C)
+    snap.gpu_grade = m_gpu.Grade();                          // true grade even when off
+    snap.tm_gpu_usage = m_tm_gpu_usage.load();
 
     // 4) publish + taskbar item text (lock)
     {
@@ -631,6 +682,12 @@ void CProcessTopPlugin::TopListRefreshFromSnapshot() {
     // io_view 菜单切换经由窗口回写（500ms 内下一次 tick 纠正显示口径）
     if (m_settings.io_view != m_wnd->GetIoView()) {
         m_settings.io_view = m_wnd->GetIoView();
+        m_settings_dirty = true;
+    }
+    // 指标切换（滚轮/菜单）同样回写持久化（M2：Gpu/Vram 也走这里）
+    MetricKind wk = m_wnd->GetKind();
+    if (m_settings.Kind() != wk) {
+        m_settings.SetKind(wk);
         m_settings_dirty = true;
     }
 }

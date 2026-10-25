@@ -86,7 +86,15 @@ private:
     void DrawRow(HDC hdc, int y, int idx, const TopRow& row);
     void DrawTitleBar(HDC hdc, int w, int y);
     void DrawSummary(HDC hdc, int w, int y);
-    void DrawStatusLine(HDC hdc, int w, int y);
+    enum StatusTone {
+        ToneIoGrade,      // 黄：IO C 档警示
+        ToneEventsLost,   // 黄：ETW 丢事件
+        ToneGpuG2,        // 灰：G2 档无引擎命名说明
+        ToneGpuHidden,    // 黄：GPU 维度不可用原因
+    };
+    void DrawStatusLine(HDC hdc, int w, int y, StatusTone tone);
+    // 当前实际显示的状态行清单（布局/绘制/菜单判定共用，保持一致）
+    void ActiveStatusLines(StatusTone out[4], int& count) const;
     void Reposition();                       // clamp to work area, show
     void OnPaint();
 
@@ -129,6 +137,15 @@ private:
     double m_io_read_total = 0, m_io_write_total = 0;
     FileIoGrade m_io_grade = FileIoGrade::C;
     uint64_t m_io_events_lost = 0;
+    // GPU / VRAM
+    double m_gpu_total = 0;
+    bool m_gpu_total_valid = false;
+    uint64_t m_vram_sys_ded = 0, m_vram_sys_shared = 0;
+    bool m_vram_sys_valid = false;
+    GpuGrade m_gpu_grade = GpuGrade::G3;
+    std::wstring m_gpu_reason;
+    std::vector<std::wstring> m_gpu_engtypes;   // 动态引擎列表（口径菜单）
+    int m_tm_gpu_usage = -1;                    // 宿主整机 GPU（G3 摘要兜底）
     int m_topn = 10;
     int m_io_view = 0;
     int m_color_mode = 0;

@@ -19,6 +19,11 @@
 HINSTANCE s_dll_hinst = nullptr;                 // captured in DllMain (plugin_main.cpp)
 volatile bool g_shutting_down = false;
 
+// 显存口径（专用 / 专用+共享，方案 §2.5）：窗口绘制/摘要共用，设置经 plugin
+static bool PtVramWithShared() {
+    return CProcessTopPlugin::Instance().GpuScope().vram_with_shared;
+}
+
 void PtSafeDestroyWindow(HWND hwnd) {
     if (!hwnd) return;
     // Detach IME first (third-party IME hooks must not run in the destroy
@@ -246,7 +251,7 @@ COLORREF CTopListWindow::GetTextColor() {
 }
 
 // 指标 accent 色（排行数值/标题），深浅两变体跟文字主题。
-// CPU 青蓝 / 内存 紫 / IO 橙（与 PNM 橙绿体系区分，一眼辨指标）
+// CPU 青蓝 / 内存 紫 / IO 橙 / GPU 绿 / 显存 天蓝（一眼辨指标）
 COLORREF CTopListWindow::GetAccentColor() {
     bool light = UseTextTheme();
     switch (m_kind) {
@@ -254,6 +259,10 @@ COLORREF CTopListWindow::GetAccentColor() {
         return light ? RGB(200, 150, 255) : RGB(160, 100, 220);
     case MetricKind::DiskIo:
         return light ? RGB(230, 150, 40) : RGB(230, 126, 34);
+    case MetricKind::Gpu:
+        return light ? RGB(60, 190, 100) : RGB(80, 200, 120);
+    case MetricKind::Vram:
+        return light ? RGB(70, 160, 230) : RGB(100, 180, 240);
     default:
         return light ? RGB(90, 190, 255) : RGB(60, 160, 230);
     }
@@ -263,6 +272,8 @@ const wchar_t* CTopListWindow::MetricTitle() const {
     switch (m_kind) {
     case MetricKind::Mem: return TR(L"内存");
     case MetricKind::DiskIo: return TR(L"磁盘 IO");
+    case MetricKind::Gpu: return TR(L"GPU");
+    case MetricKind::Vram: return TR(L"显存");
     default: return TR(L"CPU");
     }
 }
@@ -416,11 +427,12 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         // 滚轮循环切换指标（方案 §6.2）：零额外采集，只换快照子集
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         static const MetricKind order[] = {
-            MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo
+            MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
+            MetricKind::Gpu, MetricKind::Vram
         };
         int idx = 0;
-        for (int i = 0; i < 3; i++) if (order[i] == m_kind) idx = i;
-        idx = (idx + (delta > 0 ? 1 : 2)) % 3;
+        for (int i = 0; i < 5; i++) if (order[i] == m_kind) idx = i;
+        idx = (idx + (delta > 0 ? 1 : 4)) % 5;
         SetKind(order[idx]);
         return 0;
     }
@@ -430,10 +442,11 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (id >= 100 && id <= 199) {
             // 指标切换菜单
             static const MetricKind kinds[] = {
-                MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo
+                MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
+                MetricKind::Gpu, MetricKind::Vram
             };
             int sel = id - 100;
-            if (sel >= 0 && sel < 3) SetKind(kinds[sel]);
+            if (sel >= 0 && sel < 5) SetKind(kinds[sel]);
         } else if (id >= 200 && id <= 202) {
             m_io_view = id - 200;
             InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -441,6 +454,8 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id == 300) {
             PostMessage(m_hwnd, WM_CLOSE, 0, 0);
         }
+        // GPU 口径菜单（400 全部 / 410+N 引擎 toggle / 500 截断开关）由
+        // BuildContextMenu 直接处理（toggle 后需重开菜单刷新勾选态）
         return 0;
     }
 
@@ -459,52 +474,111 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
 void CTopListWindow::SetKind(MetricKind k) {
     if (k == m_kind) return;
     m_kind = k;
+    // 绑定指标变化 → tick 线程按需启停采集维度（GPU: PDH 零残留关停，
+    // 方案 §4 设计决策 2）
+    CProcessTopPlugin::Instance().NotifyBoundMetric(k);
     RecalcAndRepaint(true);
 }
 
 // ============================================================
-// context menu (指标 / IO 视图 / 关闭)
+// context menu (指标 / IO 视图 / GPU 口径 / 关闭)
 // ============================================================
 
 void CTopListWindow::BuildContextMenu(POINT pt) {
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    // 指标组（M1：CPU/内存/磁盘 IO）
-    struct { UINT id; MetricKind kind; const wchar_t* label; } kinds[] = {
-        { 100, MetricKind::Cpu, L"CPU" },
-        { 101, MetricKind::Mem, L"内存" },
-        { 102, MetricKind::DiskIo, L"磁盘 IO" },
-    };
-    for (auto& k : kinds) {
-        UINT flags = MF_STRING;
-        if (k.kind == m_kind) flags |= MF_CHECKED;
-        AppendMenuW(menu, flags, k.id, TR(k.label));
-    }
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    if (m_kind == MetricKind::DiskIo) {
-        // IO 视图子菜单：合计/读/写（方案 §1.2 子视图）
-        HMENU sub = CreatePopupMenu();
-        const wchar_t* views[] = { L"读+写", L"仅读", L"仅写" };
-        for (int i = 0; i < 3; i++) {
+    // GPU 口径 toggle 后要重开菜单刷新勾选态（多选交互）；
+    // 其余命令一次即走。
+    for (;;) {
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        // 指标组（M2：CPU/内存/磁盘 IO/GPU/显存；不可用维度灰显并标注原因）
+        bool gpu_hidden = (m_gpu_grade == GpuGrade::G3);
+        struct { UINT id; MetricKind kind; const wchar_t* label; bool gray; } kinds[] = {
+            { 100, MetricKind::Cpu, L"CPU", false },
+            { 101, MetricKind::Mem, L"内存", false },
+            { 102, MetricKind::DiskIo, L"磁盘 IO", false },
+            { 103, MetricKind::Gpu, L"GPU", gpu_hidden },
+            { 104, MetricKind::Vram, L"显存", gpu_hidden },
+        };
+        for (auto& k : kinds) {
             UINT flags = MF_STRING;
-            if (m_io_view == i) flags |= MF_CHECKED;
-            AppendMenuW(sub, flags, 200 + i, TR(views[i]));
+            if (k.kind == m_kind) flags |= MF_CHECKED;
+            if (k.gray) flags |= MF_GRAYED;
+            AppendMenuW(menu, flags, k.id, TR(k.label));
         }
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"IO 视图"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (m_kind == MetricKind::DiskIo) {
+            // IO 视图子菜单：合计/读/写（方案 §1.2 子视图）
+            HMENU sub = CreatePopupMenu();
+            const wchar_t* views[] = { L"读+写", L"仅读", L"仅写" };
+            for (int i = 0; i < 3; i++) {
+                UINT flags = MF_STRING;
+                if (m_io_view == i) flags |= MF_CHECKED;
+                AppendMenuW(sub, flags, 200 + i, TR(views[i]));
+            }
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"IO 视图"));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+        bool toggle_taken = false;
+        if (m_kind == MetricKind::Gpu && m_gpu_grade != GpuGrade::G3) {
+            // GPU 口径子菜单：全部引擎 + 动态引擎类型多选 + 截断开关
+            // （方案 §2.4：设置内自定义，列表动态枚举当前系统实际存在的 engtype）
+            GpuScopeConfig scope = CProcessTopPlugin::Instance().GpuScope();
+            HMENU sub = CreatePopupMenu();
+            UINT flags_all = MF_STRING | (scope.all_engines ? MF_CHECKED : 0);
+            AppendMenuW(sub, flags_all, 400, TR(L"全部引擎"));
+            AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+            for (size_t i = 0; i < m_gpu_engtypes.size() && i < 16; i++) {
+                bool on = false;
+                for (auto& e : scope.engines)
+                    if (e == m_gpu_engtypes[i]) { on = true; break; }
+                UINT flags = MF_STRING | (on ? MF_CHECKED : 0);
+                AppendMenuW(sub, flags, 410 + (UINT)i, m_gpu_engtypes[i].c_str());
+            }
+            AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+            UINT flags_cap = MF_STRING | (scope.cap_100 ? MF_CHECKED : 0);
+            AppendMenuW(sub, flags_cap, 500, TR(L"超过 100% 截断"));
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"GPU 口径"));
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+        AppendMenuW(menu, MF_STRING, 300, TR(L"关闭"));
+        SetForegroundWindow(m_hwnd);
+        int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                 pt.x, pt.y, 0, m_hwnd, nullptr);
+        DestroyMenu(menu);
+        if (cmd) {
+            auto& plugin = CProcessTopPlugin::Instance();
+            if (cmd == 400 || cmd == 500 ||
+                (cmd >= 410 && cmd < 410 + (int)m_gpu_engtypes.size())) {
+                // GPU 口径 toggle：改 settings + 通知采集器，重开菜单
+                GpuScopeConfig scope = plugin.GpuScope();
+                if (cmd == 400) {
+                    scope.all_engines = true;
+                    scope.engines.clear();
+                } else if (cmd == 500) {
+                    scope.cap_100 = !scope.cap_100;
+                } else {
+                    const std::wstring& eng = m_gpu_engtypes[cmd - 410];
+                    size_t at = scope.engines.size();
+                    for (size_t i = 0; i < scope.engines.size(); i++)
+                        if (scope.engines[i] == eng) { at = i; break; }
+                    if (at < scope.engines.size()) scope.engines.erase(scope.engines.begin() + at);
+                    else scope.engines.push_back(eng);
+                    if (scope.engines.empty()) scope.all_engines = true;
+                    else scope.all_engines = false;
+                }
+                plugin.ApplyGpuScope(scope);
+                toggle_taken = true;
+            } else {
+                // WM_COMMAND 语义复用（TrackPopupMenu TPM_RETURNCMD 不投递）
+                HandleMessage(WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+            }
+        }
+        // 菜单留下的 hover 状态复位（区域可能已变）
+        m_hover_close = false;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        if (!toggle_taken) return;
+        // 重开：光标位置不变，勾选态已刷新
     }
-    AppendMenuW(menu, MF_STRING, 300, TR(L"关闭"));
-    SetForegroundWindow(m_hwnd);
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                             pt.x, pt.y, 0, m_hwnd, nullptr);
-    DestroyMenu(menu);
-    if (cmd) {
-        // WM_COMMAND 语义复用（TrackPopupMenu TPM_RETURNCMD 不投递）
-        HandleMessage(WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
-    }
-    // 菜单留下的 hover 状态复位（区域可能已变）
-    m_hover_close = false;
-    InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
 // ============================================================
@@ -1010,6 +1084,16 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
     m_io_write_total = snap.io_write_total_bps;
     m_io_grade = snap.io_grade;
     m_io_events_lost = snap.io_events_lost;
+    m_gpu_total = snap.gpu_total_pct;
+    m_gpu_total_valid = snap.gpu_total_valid;
+    m_vram_sys_ded = snap.vram_sys_dedicated;
+    m_vram_sys_shared = snap.vram_sys_shared;
+    m_vram_sys_valid = snap.vram_sys_valid;
+    m_gpu_grade = snap.gpu_grade;
+    m_gpu_reason = snap.gpu_reason;
+    if (!snap.gpu_engtypes.empty() || m_gpu_engtypes.empty())
+        m_gpu_engtypes = snap.gpu_engtypes;   // PDH 关闭期保留旧列表供菜单显示
+    m_tm_gpu_usage = snap.tm_gpu_usage;
 
     const MetricView* view = nullptr;
     switch (m_kind) {
@@ -1019,6 +1103,8 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
              : (m_io_view == 2) ? &snap.io_write : &snap.io;
         break;
     }
+    case MetricKind::Gpu: view = &snap.gpu; break;
+    case MetricKind::Vram: view = &snap.vram; break;
     default: view = &snap.cpu; break;
     }
     m_rows = view->rows;
@@ -1029,6 +1115,12 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
         m_summary_value = (m_io_view == 1) ? m_io_read_total
                         : (m_io_view == 2) ? m_io_write_total
                         : m_io_read_total + m_io_write_total;
+        break;
+    case MetricKind::Gpu: m_summary_value = m_gpu_total; break;
+    case MetricKind::Vram:
+        m_summary_value = (double)(PtVramWithShared()
+                                   ? m_vram_sys_ded + m_vram_sys_shared
+                                   : m_vram_sys_ded);
         break;
     default: m_summary_value = snap.cpu_total_pct; break;
     }
@@ -1126,12 +1218,27 @@ void CTopListWindow::Reposition() {
 // layout & draw
 // ============================================================
 
+void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
+    count = 0;
+    if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C)
+        out[count++] = ToneIoGrade;
+    if (m_io_events_lost > 0 &&
+        !(m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C))
+        out[count++] = ToneEventsLost;
+    if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G2)
+        out[count++] = ToneGpuG2;
+    if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G3 &&
+        !m_gpu_reason.empty())
+        out[count++] = ToneGpuHidden;
+}
+
 void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
     int rows = m_rows_has_value ? (int)m_rows.size() : 1;
-    int status_lines = 0;
-    if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C) status_lines++;
-    if (m_io_events_lost > 0) status_lines++;
+    StatusTone lines[4];
+    int nlines = 0;
+    ActiveStatusLines(lines, nlines);
+    int status_lines = nlines;
     SelectObject(hdc, hOld);
 
     out_w = (int)(BASE_WIDTH * m_dpi_scale);
@@ -1185,6 +1292,25 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             swprintf_s(text, 160, L"%s", v);
         }
         break;
+    case MetricKind::Gpu:
+        // G3（Win7/无 GPU）：维度隐藏，摘要回落宿主整机值（方案 §2.4 G3 行）
+        if (m_gpu_grade == GpuGrade::G3 && m_tm_gpu_usage >= 0)
+            swprintf_s(text, 160, L"%d%% %s", m_tm_gpu_usage, TR(L"(整机)"));
+        else if (m_gpu_total_valid)
+            swprintf_s(text, 160, L"%.1f%%", m_gpu_total);
+        else
+            wcscpy_s(text, 160, L"--");
+        break;
+    case MetricKind::Vram:
+        if (m_vram_sys_valid) {
+            uint64_t used = PtVramWithShared() ? m_vram_sys_ded + m_vram_sys_shared
+                                               : m_vram_sys_ded;
+            FormatMem(used, v, 48);
+            swprintf_s(text, 160, L"%s", v);
+        } else {
+            wcscpy_s(text, 160, L"--");
+        }
+        break;
     default:
         if (m_summary_value < 0)
             swprintf_s(text, 160, L"--");
@@ -1200,17 +1326,24 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
     SelectObject(hdc, hOld);
 }
 
-void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y) {
-    // 黄色警示：档位/丢事件如实标注（口径不冒充，方案 §2.3）
+void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y, StatusTone tone) {
+    // 黄色警示：档位/丢事件如实标注（口径不冒充，方案 §2.3）；
+    // 灰色：信息性档位说明（G2 无引擎命名）
     wchar_t text[256] = L"";
-    if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C) {
+    if (tone == ToneIoGrade) {
         swprintf_s(text, 256, TR(L"\u26a0 IO 口径：全句柄（含网络）——需要管理员权限获取精确磁盘口径"));
-    } else if (m_io_events_lost > 0) {
+    } else if (tone == ToneEventsLost) {
         swprintf_s(text, 256, TR(L"\u26a0 ETW 缓冲不足，已丢失 %llu 个事件"), m_io_events_lost);
+    } else if (tone == ToneGpuG2) {
+        swprintf_s(text, 256, TR(L"GPU 口径：全部节点求和（本系统无引擎类型细分）"));
+    } else if (tone == ToneGpuHidden) {
+        swprintf_s(text, 256, TR(L"\u26a0 GPU 排行不可用：%s"), m_gpu_reason.c_str());
     }
     if (!text[0]) return;
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, UseTextTheme() ? RGB(255, 200, 80) : RGB(190, 120, 0));
+    SetTextColor(hdc, tone == ToneGpuG2
+                          ? (UseTextTheme() ? RGB(150, 150, 150) : RGB(110, 110, 110))
+                          : (UseTextTheme() ? RGB(255, 200, 80) : RGB(190, 120, 0)));
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_small);
     RECT rc = { PADDING, y, w - PADDING, y + STATUS_H };
     DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -1276,6 +1409,9 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
         case MetricKind::DiskIo:
             FormatSpeed(row.value, val, 64);
             break;
+        case MetricKind::Vram:
+            FormatMem((uint64_t)row.value, val, 64);
+            break;
         default:
             swprintf_s(val, 64, L"%.1f%%", row.value);
             break;
@@ -1322,12 +1458,12 @@ void CTopListWindow::DrawContent(HDC dc, int w, int h, bool content_only) {
     y += TITLE_H;
     DrawSummary(dc, w, y);
     y += SUMMARY_H;
-    if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C) {
-        DrawStatusLine(dc, w, y);
-        y += STATUS_H;
-    }
-    if (m_io_events_lost > 0 && !(m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C)) {
-        DrawStatusLine(dc, w, y);
+    // 状态行（清单与 CalcLayout 共用，顺序一致）
+    StatusTone lines[4];
+    int nlines = 0;
+    ActiveStatusLines(lines, nlines);
+    for (int i = 0; i < nlines; i++) {
+        DrawStatusLine(dc, w, y, lines[i]);
         y += STATUS_H;
     }
 

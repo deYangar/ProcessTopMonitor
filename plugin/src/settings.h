@@ -20,6 +20,10 @@ struct PtSettings {
     int popup_opacity = 100;       // 10-100
     int metric = 0;                // single-window bound metric (MetricKind)
     int win_x = INT_MIN, win_y = INT_MIN;   // single-window position
+    // GPU 口径（方案 §2.4 引擎类型多选 + 截断；§2.5 显存口径）
+    std::wstring gpu_engines = L"all";   // "all" 或逗号分隔 engtype 列表
+    bool gpu_cap_100 = true;             // 引擎求和 >100% 截断
+    int vram_basis = 0;                  // 0=dedicated 1=dedicated+shared
     std::wstring lang = L"auto";   // auto or BCP-47
     bool debug_logs = false;
 
@@ -35,7 +39,9 @@ struct PtSettings {
         if (popup_effect < 0 || popup_effect > 3) popup_effect = 0;
         if (popup_opacity < 10) popup_opacity = 10;
         if (popup_opacity > 100) popup_opacity = 100;
-        if (metric < 0 || metric > 2) metric = 0;   // M1: cpu/mem/io
+        if (metric < 0 || metric > 4) metric = 0;   // cpu/mem/io/gpu/vram
+        if (vram_basis != 0 && vram_basis != 1) vram_basis = 0;
+        if (gpu_engines.empty()) gpu_engines = L"all";
         if (lang.empty()) lang = L"auto";
     }
 
@@ -43,6 +49,8 @@ struct PtSettings {
         switch (metric) {
         case 1: return MetricKind::Mem;
         case 2: return MetricKind::DiskIo;
+        case 3: return MetricKind::Gpu;
+        case 4: return MetricKind::Vram;
         default: return MetricKind::Cpu;
         }
     }
@@ -50,8 +58,34 @@ struct PtSettings {
         switch (k) {
         case MetricKind::Mem: metric = 1; break;
         case MetricKind::DiskIo: metric = 2; break;
+        case MetricKind::Gpu: metric = 3; break;
+        case MetricKind::Vram: metric = 4; break;
         default: metric = 0; break;
         }
+    }
+
+    // gpu_engines -> scope config（逗号分隔 engtype 列表 / "all"）
+    GpuScopeConfig GpuScope() const {
+        GpuScopeConfig c;
+        c.cap_100 = gpu_cap_100;
+        c.vram_with_shared = (vram_basis == 1);
+        c.all_engines = (gpu_engines == L"all");
+        if (!c.all_engines) {
+            size_t pos = 0;
+            while (pos <= gpu_engines.size()) {
+                size_t comma = gpu_engines.find(L',', pos);
+                if (comma == std::wstring::npos) comma = gpu_engines.size();
+                std::wstring one = gpu_engines.substr(pos, comma - pos);
+                // trim spaces
+                size_t b = one.find_first_not_of(L" \t");
+                size_t e = one.find_last_not_of(L" \t");
+                if (b != std::wstring::npos)
+                    c.engines.push_back(one.substr(b, e - b + 1));
+                pos = comma + 1;
+            }
+            if (c.engines.empty()) c.all_engines = true;
+        }
+        return c;
     }
 };
 
@@ -95,6 +129,9 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"color_mode\": %d,\n", st.color_mode);
     fprintf(f, "  \"popup_effect\": %d,\n", st.popup_effect);
     fprintf(f, "  \"popup_opacity\": %d,\n", st.popup_opacity);
+    fprintf(f, "  \"gpu_engines\": \"%s\",\n", PtToUtf8(st.gpu_engines).c_str());
+    fprintf(f, "  \"gpu_cap_100\": %s,\n", st.gpu_cap_100 ? "true" : "false");
+    fprintf(f, "  \"vram_basis\": %d,\n", st.vram_basis);
     fprintf(f, "  \"debug_logs\": %s,\n", st.debug_logs ? "true" : "false");
     fprintf(f, "  \"lang\": \"%s\"\n", PtToUtf8(st.lang).c_str());
     fprintf(f, "}\n");
@@ -152,6 +189,9 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     geti("\"color_mode\"", st.color_mode);
     geti("\"popup_effect\"", st.popup_effect);
     geti("\"popup_opacity\"", st.popup_opacity);
+    gets("\"gpu_engines\"", st.gpu_engines);
+    getb("\"gpu_cap_100\"", st.gpu_cap_100);
+    geti("\"vram_basis\"", st.vram_basis);
     getb("\"debug_logs\"", st.debug_logs);
     gets("\"lang\"", st.lang);
     st.Clamp();
