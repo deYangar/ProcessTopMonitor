@@ -2,6 +2,7 @@
 #include "top_list_window.h"
 #include "plugin_main.h"    // WM_PTM_REFRESH pulls the snapshot via the plugin
 #include "window_manager.h"
+#include "dock_manager.h"
 #include "utils.h"
 #include "i18n.h"
 #include <shellapi.h>
@@ -217,6 +218,8 @@ void CTopListWindow::Destroy() {
     }
     m_visible = false;
     UnregisterDispatch();
+    // 停靠关系摘除 + 其余 Docked 窗补位（M3-2 方案 §7.3）
+    DockManager::Instance().OnWindowDestroyed(this);
     // × 语义 = windows[] 删行（配置不保留，方案 §3.2）：标脏等节流落盘
     CProcessTopPlugin::Instance().m_settings_dirty = true;
     WindowManager::Instance().RecomputeBoundMask();
@@ -381,6 +384,8 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             m_cfg.x = rc.left;
             m_cfg.y = rc.top;
         }
+        // Docked 态拖离判定：距锚 >48px → Detached；微调则吸回布局位（M3-2）
+        DockManager::Instance().OnWindowDragged(this);
         WindowManager::Instance().OnWindowMoveEnded(m_index);
         return 0;
     }
@@ -502,6 +507,18 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             c.y = INT_MIN;
             WindowManager::Instance().AddWindow(c);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
+        } else if (id >= 700 && id <= 702) {
+            // 停靠到…（M3-2）：锚不在时如实提示，不静默
+            if (!DockManager::Instance().Dock(this, (DockTarget)(id - 700))) {
+                MessageBoxW(m_hwnd, TR(L"未找到可停靠窗口"),
+                            TR(L"停靠"), MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+            } else {
+                CProcessTopPlugin::Instance().m_settings_dirty = true;
+            }
+        } else if (id == 710) {
+            // 解除停靠：窗口留在当前位置（M3-2 方案 §5）
+            DockManager::Instance().Undock(this);
+            CProcessTopPlugin::Instance().m_settings_dirty = true;
         } else if (id == 300) {
             PostMessage(m_hwnd, WM_CLOSE, 0, 0);
         }
@@ -611,6 +628,19 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             AppendMenuW(menu, MF_STRING | (mgr.Count() >= CTopListWindow::MAX_WINDOWS
                                                ? MF_GRAYED : 0),
                         310, TR(L"新建悬浮窗"));
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        // 停靠（M3-2 方案 §7）：全程不主动，只由显式菜单动作触发
+        {
+            bool docked_now = DockManager::Instance().StateOf(this) == DockState::Docked;
+            HMENU dock_sub = CreatePopupMenu();
+            AppendMenuW(dock_sub, MF_STRING, 700, TR(L"自动（优先 PNM 详情窗）"));
+            AppendMenuW(dock_sub, MF_STRING, 701, TR(L"PNM 详情窗"));
+            AppendMenuW(dock_sub, MF_STRING, 702, TR(L"TrafficMonitor 主窗"));
+            AppendMenuW(menu, MF_POPUP | (docked_now ? MF_GRAYED : 0),
+                        (UINT_PTR)dock_sub, TR(L"停靠到…"));
+            AppendMenuW(menu, MF_STRING | (!docked_now ? MF_GRAYED : 0),
+                        710, TR(L"解除停靠"));
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, 300, TR(L"关闭"));

@@ -6,6 +6,7 @@
 #include "top_aggregator.h"
 #include "top_list_window.h"
 #include "window_manager.h"
+#include "dock_manager.h"
 #include "settings.h"
 #include "i18n.h"
 #include <atomic>
@@ -56,6 +57,9 @@ public:
         StopRefreshTimer();
         m_etw.Stop();
         m_gpu.EnsureStopped();
+        // hook 是进程资源，TM 退出随进程回收；显式清理防 FMW 场景 DLL
+        // 先于进程卸载时回调进已卸载代码（M3-2 边界 6，PNM issue #7 同族）
+        DockManager::Instance().RemoveHooks();
     }
 
     // ---- UI thread entry points (called from the top-list window) ----

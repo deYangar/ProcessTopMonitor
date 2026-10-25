@@ -44,6 +44,7 @@ struct PtSettings {
     int vram_basis = 0;                  // 0=dedicated 1=dedicated+shared
     std::wstring lang = L"auto";   // auto or BCP-47
     bool debug_logs = false;
+    int dock_edge = 0;              // 停靠边偏好（M3-2 方案 §7.2）：0=auto 1=right 2=left
 
     // clamp everything to its legal domain (hand-edited settings.json must
     // not brick the plugin)
@@ -61,6 +62,7 @@ struct PtSettings {
         if (vram_basis != 0 && vram_basis != 1) vram_basis = 0;
         if (gpu_engines.empty()) gpu_engines = L"all";
         if (lang.empty()) lang = L"auto";
+        if (dock_edge < 0 || dock_edge > 2) dock_edge = 0;
         // windows[]：数量钳到上限，每行字段钳域（手改 settings.json 防砖）。
         // kind 域 = MetricKind 枚举全集 [0,6]（3/4 是 DiskRead/DiskWrite 占位）
         if (windows.size() > 6) windows.resize(6);
@@ -165,6 +167,7 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"vram_basis\": %d,\n", st.vram_basis);
     fprintf(f, "  \"debug_logs\": %s,\n", st.debug_logs ? "true" : "false");
     fprintf(f, "  \"lang\": \"%s\",\n", PtToUtf8(st.lang).c_str());
+    fprintf(f, "  \"dock_edge\": %d,\n", st.dock_edge);
     // windows[]（schema 2 核心字段；v1 的 metric/win_x/win_y 停止写出）
     fprintf(f, "  \"windows\": [\n");
     for (size_t i = 0; i < st.windows.size(); i++) {
@@ -235,6 +238,7 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     geti("\"vram_basis\"", st.vram_basis);
     getb("\"debug_logs\"", st.debug_logs);
     gets("\"lang\"", st.lang);
+    geti("\"dock_edge\"", st.dock_edge);
 
     // windows[] 段解析：定位 "windows" → [ → 逐 {…} 行按 key 读 7 个 int。
     // 行内无嵌套对象/转义引号，find('}') 即行界（方案 §5.2）。

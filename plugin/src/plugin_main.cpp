@@ -403,6 +403,9 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
         def.io_view = m_settings.io_view;
         WindowManager::Instance().AddWindow(def);
     }
+    // 停靠恢复：cfg.docked==1 的窗逐个尝试贴锚（锚不在 → Floating 落位，
+    // cfg.docked 置 0），流程结束统一落盘一次（M3-2 方案 §5）
+    DockManager::Instance().RestoreFromConfigs();
     TopListRefreshFromSnapshot();
 }
 
