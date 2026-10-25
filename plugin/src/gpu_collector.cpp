@@ -397,11 +397,15 @@ bool GpuCollector::TickG2(GpuTickData& out,
                 qn.hProcess = hp;
                 qn.Param = n;
                 if (pQuery(&qn) != 0) { state[ai][n] = -1; continue; }
-                LONGLONG rt = ((LARGE_INTEGER*)qn.Result)->QuadPart;   // µs (WDK)
+                LONGLONG rt = ((LARGE_INTEGER*)qn.Result)->QuadPart;
+                // 实测定案：RunningTime 单位是 100ns（NT 时间惯例），WDK 头里
+                // "micro-second" 注释是错的——强制 G2 实测 G2 值恰为 G1(PDH)
+                // 的 10 倍，除以 10 后逐进程吻合
                 LONGLONG& prev = state[ai][n];
                 if (prev >= 0 && rt >= prev) {
-                    // util% = ΣΔ / (wall_µs × node_count) × 100（每适配器独立归一）
-                    util_pct += (double)(rt - prev) / (dt_us * (double)a.node_count) * 100.0;
+                    // util% = ΣΔ_100ns / (wall_100ns × node_count) × 100（每适配器独立归一）
+                    double wall_100ns = dt_us * 10.0;
+                    util_pct += (double)(rt - prev) / (wall_100ns * (double)a.node_count) * 100.0;
                     pid_util_ok = true;
                 }
                 prev = rt;

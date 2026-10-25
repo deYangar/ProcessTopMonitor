@@ -134,9 +134,10 @@ private:
     // ---- G2 (D3DKMTQueryStatistics, Win8~Win10 1607) ----
     // 按本机 SDK d3dkmthk.h 转录的最小查询布局：成员顺序与官方一致，Result
     // 用冗余缓冲替代结果 union（内核只写不超缓冲，我们只读已知头部字段）。
-    // 26300 实测：Win8+ 时代的 per-process 类型(2/4/6/8/9)已被系统拒收
-    // C000000D（仅 Win7 时代类型 0/1/3/5 存活）——G2 只在其目标版本
-    // (Win8~1607) 真正可用，现代 build 一律走 G1。
+    // 实测定案（2026-10-25 探针+插件双路验证）：PROCESS_NODE/SEGMENT_GROUP
+    // 在 26300 上可用，但要求 hProcess 为 PROCESS_QUERY_INFORMATION 权限
+    // （LIMITED 被拒 C000000D），且进程在该适配器有 GPU 统计（无上下文进程
+    // 同样拒收）——失败按无数据处理，受保护进程（dwm 等）如实缺席。
     struct G2Adapter {
         LUID luid;
         ULONG node_count = 0;
