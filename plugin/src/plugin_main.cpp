@@ -586,7 +586,13 @@ void CProcessTopPlugin::RefreshTick() {
     GpuTickData gpu_data;
     bool gpu_tick = (++m_gpu_tick_div % 2 == 0);
     if (m_gpu.IsRunning()) {
-        if (gpu_tick) m_gpu.Tick(m_gpu_last);
+        if (gpu_tick) {
+            // G1 (PDH) 不需要候选表；G2 (D3DKMT) 用快照 pid 做查询候选
+            std::vector<DWORD> pids;
+            pids.reserve(m.procs.size());
+            for (auto& p : m.procs) pids.push_back(p.pid);
+            m_gpu.Tick(m_gpu_last, pids);
+        }
         gpu_data = m_gpu_last;
     }
     MetricsSnapshot snap;

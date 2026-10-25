@@ -53,7 +53,7 @@ struct GpuScopeConfig {
 
 // One collection result (tick thread -> snapshot via the aggregator).
 struct GpuTickData {
-    bool util_valid = false;             // needs 2 PDH collections (range counter)
+    bool util_valid = false;             // needs 2 collections (range counter)
     bool mem_valid = false;              // raw counter: valid from the 1st collection
     bool sys_mem_valid = false;          // adapter-memory counters present
     // per-pid values with the scope + clamp already applied:
@@ -66,6 +66,9 @@ struct GpuTickData {
     GpuGrade grade = GpuGrade::G3;
     std::wstring unsupported_reason;     // G3 display reason
 };
+
+class MetricsCollector;
+struct ProcMetric;
 
 class GpuCollector {
 public:
@@ -93,12 +96,17 @@ public:
 
     // Tick thread, every 2nd tick (~1s). Fills out; safe to call when not
     // running (returns immediately with grade=G3).
-    void Tick(GpuTickData& out);
+    // procs: current snapshot pid list — G2 (D3DKMT) needs candidate pids;
+    // G1 (PDH) ignores it.
+    void Tick(GpuTickData& out, const std::vector<DWORD>& pid_candidates);
 
 private:
-    bool OpenQuery();                  // tick thread
-    void CloseQuery();                 // tick thread
+    bool OpenQuery();                  // tick thread (G1)
+    void CloseQuery();                 // tick thread (G1)
+    bool InitG2();                     // tick thread (G2): gdi32 + adapters
+    void StopG2();
     void DetectGrade(std::wstring& reason);   // tick thread
+    bool TickG2(GpuTickData& out, const std::vector<DWORD>& pid_candidates);
 
     mutable std::mutex m_cfg_mutex;
     GpuScopeConfig m_cfg;
@@ -122,4 +130,25 @@ private:
     std::unordered_set<std::wstring> m_engtypes;
 
     std::vector<BYTE> m_fmt_buf;                 // reused formatted-array buffer
+
+    // ---- G2 (D3DKMTQueryStatistics, Win8~Win10 1607) ----
+    // 按本机 SDK d3dkmthk.h 转录的最小查询布局：成员顺序与官方一致，Result
+    // 用冗余缓冲替代结果 union（内核只写不超缓冲，我们只读已知头部字段）。
+    // 26300 实测：Win8+ 时代的 per-process 类型(2/4/6/8/9)已被系统拒收
+    // C000000D（仅 Win7 时代类型 0/1/3/5 存活）——G2 只在其目标版本
+    // (Win8~1607) 真正可用，现代 build 一律走 G1。
+    struct G2Adapter {
+        LUID luid;
+        ULONG node_count = 0;
+        ULONG nb_segments = 0;
+        std::vector<ULONG> seg_aperture;         // per-segment (0xFF=unknown)
+        bool seg_group_ok = false;               // PROCESS_SEGMENT_GROUP 可用(WDDM2.1+)
+    };
+    std::vector<G2Adapter> m_g2_adapters;
+    // per-pid delta 基线：adapter idx -> per-node RunningTime（µs，WDK 注释）
+    std::unordered_map<DWORD, std::vector<std::vector<LONGLONG>>> m_g2_last_rt;
+    LONGLONG m_g2_last_wall_us = 0;
+    void* m_gdi32 = nullptr;
+    void* m_pfn_d3dkmt_query = nullptr;          // D3DKMTQueryStatistics
+    void* m_pfn_d3dkmt_enum = nullptr;           // D3DKMTEnumAdapters
 };

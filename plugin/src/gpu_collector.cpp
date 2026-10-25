@@ -106,7 +106,12 @@ void GpuCollector::DetectGrade(std::wstring& reason) {
         reason = L"Windows 7";
         return;
     }
-    if (build < 16299) {
+    // 测试开关：PTM_GPU_FORCE_G2=1 在现代 build 上强制走 G2 路径——
+    // 26300 实测系统拒收 Win8+ 时代查询类型，恰好验证「查询被拒 → 如实
+    // 空态」的回退行为（不伪造数据）。
+    wchar_t force[4] = L"";
+    bool forced = GetEnvironmentVariableW(L"PTM_GPU_FORCE_G2", force, 4) > 0;
+    if (build < 16299 || forced) {
         // G2 range (Win8 ~ Win10 1607): D3DKMTQueryStatistics path.
         m_grade = GpuGrade::G2;
         reason.clear();
@@ -121,26 +126,36 @@ void GpuCollector::DetectGrade(std::wstring& reason) {
 bool GpuCollector::EnsureStarted() {
     if (m_running.load()) return true;
     DetectGrade(m_grade_reason);
-    if (m_grade != GpuGrade::G1) {
-        // G2 path (D3DKMT) lands with the G2 implementation; until then
-        // only G1 systems collect. G3 = hidden dimension.
-        m_running.store(false);
-        return false;
+    if (m_grade == GpuGrade::G1) {
+        if (!OpenQuery()) {
+            m_grade = GpuGrade::G3;
+            m_grade_reason = L"GPU counters unavailable (RDP / no GPU?)";
+            m_running.store(false);
+            return false;
+        }
+        m_collections = 0;
+        m_running.store(true);
+        return true;
     }
-    if (!OpenQuery()) {
-        m_grade = GpuGrade::G3;
-        m_grade_reason = L"GPU counters unavailable (RDP / no GPU?)";
-        m_running.store(false);
-        return false;
+    if (m_grade == GpuGrade::G2) {
+        if (!InitG2()) {
+            m_grade = GpuGrade::G3;
+            m_grade_reason = L"D3DKMT adapters unavailable";
+            m_running.store(false);
+            return false;
+        }
+        m_g2_last_wall_us = 0;
+        m_running.store(true);
+        return true;
     }
-    m_collections = 0;
-    m_running.store(true);
-    return true;
+    m_running.store(false);
+    return false;
 }
 
 void GpuCollector::EnsureStopped() {
     if (!m_running.exchange(false)) return;
     CloseQuery();
+    StopG2();
     m_eng_cache.clear();
     m_pid_cache.clear();
     m_engtypes.clear();
@@ -185,14 +200,263 @@ void GpuCollector::CloseQuery() {
 }
 
 // ============================================================
-// collection
+// G2 — D3DKMTQueryStatistics (Win8 ~ Win10 1607)
 // ============================================================
 
-void GpuCollector::Tick(GpuTickData& out) {
+namespace {
+
+// ---- 最小手抄结构（成员顺序 = 本机 SDK d3dkmthk.h，探针已验证偏移）----
+
+struct PtD3dkmtAdapterInfo {
+    ULONG hAdapter;
+    LUID  AdapterLuid;
+    ULONG NumOfSources;
+    BOOL  bPrecisePresentRegionsPreferred;
+};
+struct PtD3dkmtEnumAdapters {
+    ULONG NumAdapters;
+    PtD3dkmtAdapterInfo Adapters[16];
+};
+
+// 查询结构：头部字段与官方逐一对应（Type@0 Luid@4 hProcess@ptr对齐），
+// 结果 union 用 1KB 冗余缓冲替代（任何 per-process 结果 << 1KB），尾部
+// query-param union 只有一个 ULONG 大小——用 Param 收尾保持布局。
+struct PtD3dkmtQuery {
+    ULONG  Type;
+    LUID   AdapterLuid;
+    HANDLE hProcess;
+    UCHAR  Result[1024];
+    ULONG  Param;
+};
+enum PtQType {
+    PtQAdapter = 0, PtQProcess = 1, PtQSegment = 3, PtQProcessSegment = 4,
+    PtQProcessNode = 6, PtQProcessSegmentGroup = 9,
+};
+
+// 结果头部读取（Win8+ 布局；只读已知字段，尾部不碰）
+struct PtSegHead {            // PtQSegment
+    ULONGLONG CommitLimit, BytesCommitted, BytesResident;
+    ULONGLONG TotalBytesEvicted; ULONG AllocsCommitted, AllocsResident;
+    ULONG Aperture;
+};
+
+// WIN32_LEAN_AND_MEAN 不含 ntdef.h（26100 SDK 实测：NTSTATUS 未定义，
+// C2059 事故源头）——这里等价用 LONG
+typedef LONG(APIENTRY* PFN_D3dkmtQuery)(const void*);
+typedef LONG(APIENTRY* PFN_D3dkmtEnum)(void*);
+
+} // namespace
+
+bool GpuCollector::InitG2() {
+    if (m_pfn_d3dkmt_query) return true;
+    m_gdi32 = (void*)LoadLibraryW(L"gdi32.dll");
+    if (!m_gdi32) return false;
+    m_pfn_d3dkmt_query = (void*)GetProcAddress((HMODULE)m_gdi32,
+                                               "D3DKMTQueryStatistics");
+    m_pfn_d3dkmt_enum = (void*)GetProcAddress((HMODULE)m_gdi32,
+                                              "D3DKMTEnumAdapters");
+    if (!m_pfn_d3dkmt_query || !m_pfn_d3dkmt_enum) {
+        FreeLibrary((HMODULE)m_gdi32);
+        m_gdi32 = nullptr;
+        return false;
+    }
+    auto pEnum = (PFN_D3dkmtEnum)m_pfn_d3dkmt_enum;
+    auto pQuery = (PFN_D3dkmtQuery)m_pfn_d3dkmt_query;
+
+    PtD3dkmtEnumAdapters ea = {};
+    ea.NumAdapters = 16;
+    if (pEnum(&ea) != 0 || ea.NumAdapters == 0) {
+        FreeLibrary((HMODULE)m_gdi32);
+        m_gdi32 = nullptr;
+        m_pfn_d3dkmt_query = m_pfn_d3dkmt_enum = nullptr;
+        return false;
+    }
+    m_g2_adapters.clear();
+    for (ULONG i = 0; i < ea.NumAdapters; i++) {
+        G2Adapter a;
+        a.luid = ea.Adapters[i].AdapterLuid;
+        // 适配器统计：NodeCount/NbSegments（无 hProcess，Win7 时代类型）
+        PtD3dkmtQuery q = {};
+        q.Type = PtQAdapter;
+        q.AdapterLuid = a.luid;
+        if (pQuery(&q) != 0) continue;
+        a.nb_segments = *(ULONG*)(q.Result + 0);
+        a.node_count = *(ULONG*)(q.Result + 4);
+        if (!a.node_count || !a.nb_segments) continue;
+        // 段属性（Aperture）：WDDM2.1+ 用 SEGMENT_GROUP，不需要；老系统
+        // 专用/共享拆分依赖它——探针一次，存档
+        a.seg_aperture.assign(a.nb_segments > 32 ? 32 : a.nb_segments, 0xFF);
+        for (ULONG s = 0; s < a.seg_aperture.size(); s++) {
+            PtD3dkmtQuery qs = {};
+            qs.Type = PtQSegment;
+            qs.AdapterLuid = a.luid;
+            qs.Param = s;
+            if (pQuery(&qs) == 0) {
+                a.seg_aperture[s] = ((PtSegHead*)qs.Result)->Aperture;
+            }
+        }
+        // SEGMENT_GROUP 类型可用性（WDDM2.1+ = Win10 1607+）：空 hProcess
+        // 的探测调用，接受即走新路径（Win8~1511 落到逐段求和）
+        PtD3dkmtQuery qg = {};
+        qg.Type = PtQProcessSegmentGroup;
+        qg.AdapterLuid = a.luid;
+        qg.Param = 0;   // LOCAL
+        LONG rcg = pQuery(&qg);
+        a.seg_group_ok = (rcg == 0);
+        m_g2_adapters.push_back(a);
+    }
+    if (m_g2_adapters.empty()) {
+        FreeLibrary((HMODULE)m_gdi32);
+        m_gdi32 = nullptr;
+        m_pfn_d3dkmt_query = m_pfn_d3dkmt_enum = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void GpuCollector::StopG2() {
+    m_g2_adapters.clear();
+    m_g2_last_rt.clear();
+    m_g2_last_wall_us = 0;
+    if (m_gdi32) {
+        FreeLibrary((HMODULE)m_gdi32);
+        m_gdi32 = nullptr;
+    }
+    m_pfn_d3dkmt_query = m_pfn_d3dkmt_enum = nullptr;
+}
+
+// G2 一拍：候选 pid × 适配器 × 节点查询 + delta 换算（方案 §2.4 G2 行）
+bool GpuCollector::TickG2(GpuTickData& out,
+                          const std::vector<DWORD>& pid_candidates) {
+    auto pQuery = (PFN_D3dkmtQuery)m_pfn_d3dkmt_query;
+    if (!pQuery) return false;
+
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    LONGLONG wall_us = (LONGLONG)(t.QuadPart * 1000000.0 / f.QuadPart);
+    double dt_us = m_g2_last_wall_us ? (double)(wall_us - m_g2_last_wall_us) : 0.0;
+    m_g2_last_wall_us = wall_us;
+
+    // per-pid 逐适配器采集
+    std::unordered_set<DWORD> seen;
+    bool util_any = false, mem_any = false;
+    for (DWORD pid : pid_candidates) {
+        if (!pid || seen.count(pid)) continue;
+        HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (!hp) continue;    // 受保护进程：如实缺席
+        seen.insert(pid);
+        auto& state = m_g2_last_rt[pid];   // [adapter][node]
+
+        double util_pct = 0;
+        uint64_t ded = 0, shr = 0;
+        bool pid_util_ok = false, pid_mem_ok = false;
+        if (state.size() < m_g2_adapters.size())
+            state.resize(m_g2_adapters.size());
+
+        for (size_t ai = 0; ai < m_g2_adapters.size(); ai++) {
+            G2Adapter& a = m_g2_adapters[ai];
+            if (a.seg_group_ok) {
+                // ---- 显存：SEGMENT_GROUP LOCAL/NON_LOCAL（WDDM2.1+）----
+                for (int g = 0; g < 2; g++) {
+                    PtD3dkmtQuery qg = {};
+                    qg.Type = PtQProcessSegmentGroup;
+                    qg.AdapterLuid = a.luid;
+                    qg.hProcess = hp;
+                    qg.Param = (ULONG)g;
+                    if (pQuery(&qg) == 0) {
+                        ULONGLONG usage = *(ULONGLONG*)(qg.Result + 16);
+                        if (g == 0) { ded += usage; pid_mem_ok = true; }
+                        else shr += usage;
+                    }
+                }
+            } else {
+                // ---- 老路径：PROCESS_SEGMENT 逐段求和（Win8~1511）----
+                for (ULONG s = 0; s < a.seg_aperture.size(); s++) {
+                    if (a.seg_aperture[s] == 0xFF) continue;
+                    PtD3dkmtQuery qp = {};
+                    qp.Type = PtQProcessSegment;
+                    qp.AdapterLuid = a.luid;
+                    qp.hProcess = hp;
+                    qp.Param = s;
+                    if (pQuery(&qp) == 0) {
+                        ULONGLONG committed = *(ULONGLONG*)(qp.Result + 0);
+                        if (a.seg_aperture[s]) shr += committed;
+                        else { ded += committed; pid_mem_ok = true; }
+                    }
+                }
+            }
+
+            // ---- 利用率：PROCESS_NODE 逐节点 RunningTime delta ----
+            if (dt_us > 0 && state[ai].size() < a.node_count)
+                state[ai].resize(a.node_count, -1);
+            for (ULONG n = 0; n < a.node_count && dt_us > 0; n++) {
+                PtD3dkmtQuery qn = {};
+                qn.Type = PtQProcessNode;
+                qn.AdapterLuid = a.luid;
+                qn.hProcess = hp;
+                qn.Param = n;
+                if (pQuery(&qn) != 0) { state[ai][n] = -1; continue; }
+                LONGLONG rt = ((LARGE_INTEGER*)qn.Result)->QuadPart;   // µs (WDK)
+                LONGLONG& prev = state[ai][n];
+                if (prev >= 0 && rt >= prev) {
+                    // util% = ΣΔ / (wall_µs × node_count) × 100（每适配器独立归一）
+                    util_pct += (double)(rt - prev) / (dt_us * (double)a.node_count) * 100.0;
+                    pid_util_ok = true;
+                }
+                prev = rt;
+            }
+        }
+        if (pid_util_ok) {
+            if (util_pct < 0) util_pct = 0;
+            out.util_by_pid[pid] += util_pct;
+            out.total_util_pct += util_pct;
+            util_any = true;
+        }
+        if (pid_mem_ok) {
+            out.mem_by_pid[pid] = { ded, shr };
+            out.sys_dedicated += ded;
+            out.sys_shared += shr;
+            mem_any = true;
+        }
+        CloseHandle(hp);
+    }
+
+    // 退场 pid 的基线清理
+    for (auto it = m_g2_last_rt.begin(); it != m_g2_last_rt.end();) {
+        if (!seen.count(it->first)) it = m_g2_last_rt.erase(it);
+        else ++it;
+    }
+
+    // 截断 + valid 位
+    GpuScopeConfig cfg = Scope();
+    auto cap = [&](double v) { return (cfg.cap_100 && v > 100.0) ? 100.0 : v; };
+    for (auto& kv : out.util_by_pid) kv.second = cap(kv.second);
+    out.total_util_pct = cap(out.total_util_pct);
+    out.util_valid = util_any;
+    out.mem_valid = mem_any;
+    out.sys_mem_valid = mem_any;
+    return util_any || mem_any;
+}
+
+
+
+// ============================================================
+// collection — G1 PDH main path (G2 dispatched inside)
+// ============================================================
+
+void GpuCollector::Tick(GpuTickData& out,
+                        const std::vector<DWORD>& pid_candidates) {
     out.grade = m_grade;
     out.unsupported_reason = m_grade_reason;
     out.util_valid = out.mem_valid = out.sys_mem_valid = false;
-    if (!m_running.load() || !m_query) return;
+    if (!m_running.load()) return;
+
+    if (m_grade == GpuGrade::G2) {
+        TickG2(out, pid_candidates);
+        return;
+    }
+    if (!m_query) return;
 
     if (PdhCollectQueryData((PDH_HQUERY)m_query) != ERROR_SUCCESS)
         return;
