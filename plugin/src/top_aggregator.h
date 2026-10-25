@@ -12,6 +12,10 @@
 
 enum class MetricKind { Cpu, Mem, DiskIo, DiskRead, DiskWrite, Gpu, Vram };
 
+// 指标绑定位集（bit per MetricKind，M3-1 方案 §2.2）：多窗模式下 GPU 按
+// 需启停的判定基础——mask 含 Gpu/Vram 任一位才保采集。
+inline int PtKindMask(MetricKind k) { return 1 << (int)k; }
+
 struct TopRow {
     std::wstring name;
     std::wstring exe_path;   // resolved lazily by the window (icon lookup)

@@ -1,6 +1,7 @@
 // top_list_window.cpp — ranking popup: ULW pipeline (PNM-inherited) + N rows
 #include "top_list_window.h"
 #include "plugin_main.h"    // WM_PTM_REFRESH pulls the snapshot via the plugin
+#include "window_manager.h"
 #include "utils.h"
 #include "i18n.h"
 #include <shellapi.h>
@@ -133,7 +134,12 @@ CTopListWindow::~CTopListWindow() {
     if (m_pen_separator) DeleteObject(m_pen_separator);
     // 不 UnregisterClass：窗口类是 DLL 级共享的（多实例同类名），第一个
     // 实例销毁就注销会让其余实例的消息分发崩——类随进程退出自然清理
-    // deregister from the dispatch table
+    UnregisterDispatch();
+}
+
+void CTopListWindow::UnregisterDispatch() {
+    // deregister from the dispatch table（UI 线程调用；tick 线程的收尸
+    // 转由 WM_PTM_RECLAIM 回到 UI 线程，RegTable 保持 UI 线程私有）
     auto& t = RegTable();
     for (size_t i = 0; i < t.size(); i++)
         if (t[i].self == this) { t.erase(t.begin() + i); break; }
@@ -205,9 +211,23 @@ bool CTopListWindow::Create(const POINT* suggested) {
 void CTopListWindow::Destroy() {
     if (m_hwnd && !g_shutting_down) {
         PtSafeDestroyWindow(m_hwnd);
-        m_hwnd = nullptr;
+        // m_hwnd 故意保留死句柄不置空：ReclaimDead 用 GetHwnd() &&
+        // !IsWindow(hwnd) 识别待收尸对象——置空会让该窗永远识别不到
+        // （M1 老代码同病，× 后对象滞留至进程退出）
     }
     m_visible = false;
+    UnregisterDispatch();
+    // × 语义 = windows[] 删行（配置不保留，方案 §3.2）：标脏等节流落盘
+    CProcessTopPlugin::Instance().m_settings_dirty = true;
+    WindowManager::Instance().RecomputeBoundMask();
+}
+
+void CTopListWindow::ApplyCfg(const WindowCfg& c) {
+    m_cfg = c;
+    m_kind = (MetricKind)c.kind;
+    m_io_view = c.io_view;
+    m_topn = c.topn;
+    if (m_hwnd) RecalcAndRepaint(true);
 }
 
 void CTopListWindow::GetWindowPos(POINT& pt) const {
@@ -348,6 +368,23 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
 
+    case WM_PTM_RECLAIM:
+        // tick 线程发现死窗，转交 UI 线程做 vector 清理（M3-1）
+        WindowManager::Instance().ReclaimDead();
+        return 0;
+
+    case WM_EXITSIZEMOVE: {
+        // 拖动/尺寸调整结束：位置立即写 cfg 并落盘——缺陷①（M5/A1）治本，
+        // 不等 30s 节流（拖动结束即写 settings.json，微秒级无压力）
+        RECT rc;
+        if (GetWindowRect(m_hwnd, &rc)) {
+            m_cfg.x = rc.left;
+            m_cfg.y = rc.top;
+        }
+        WindowManager::Instance().OnWindowMoveEnded(m_index);
+        return 0;
+    }
+
     case WM_DPICHANGED: {
         RECT* prc = (RECT*)lp;
         if (prc && !m_dpi_inited) UpdateDpiScale();
@@ -449,8 +486,22 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             if (sel >= 0 && sel < 5) SetKind(kinds[sel]);
         } else if (id >= 200 && id <= 202) {
             m_io_view = id - 200;
+            m_cfg.io_view = m_io_view;
             InvalidateRect(m_hwnd, nullptr, FALSE);
-            // io_view 落盘由 plugin_main 在销毁时统一读走
+            CProcessTopPlugin::Instance().m_settings_dirty = true;
+        } else if (id >= 600 && id <= 602) {
+            // 行数（每窗独立，方案 §2.4）：600/601/602 → 5/10/15
+            m_cfg.topn = 5 * (id - 599);
+            m_topn = m_cfg.topn;
+            RecalcAndRepaint(true);
+            CProcessTopPlugin::Instance().m_settings_dirty = true;
+        } else if (id == 310) {
+            // 新建悬浮窗：复制当前窗 cfg 作起点，位置改级联（方案 §4）
+            WindowCfg c = m_cfg;
+            c.x = INT_MIN;
+            c.y = INT_MIN;
+            WindowManager::Instance().AddWindow(c);
+            CProcessTopPlugin::Instance().m_settings_dirty = true;
         } else if (id == 300) {
             PostMessage(m_hwnd, WM_CLOSE, 0, 0);
         }
@@ -474,9 +525,11 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
 void CTopListWindow::SetKind(MetricKind k) {
     if (k == m_kind) return;
     m_kind = k;
-    // 绑定指标变化 → tick 线程按需启停采集维度（GPU: PDH 零残留关停，
-    // 方案 §4 设计决策 2）
-    CProcessTopPlugin::Instance().NotifyBoundMetric(k);
+    m_cfg.kind = (int)k;
+    // 绑定指标变化 → 重算绑定位集（tick 线程据此按需启停 GPU 采集，
+    // 方案 §3.3；cfg 即配置本体，标脏走节流落盘）
+    WindowManager::Instance().RecomputeBoundMask();
+    CProcessTopPlugin::Instance().m_settings_dirty = true;
     RecalcAndRepaint(true);
 }
 
@@ -540,7 +593,29 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"GPU 口径"));
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
+        // 行数（每窗独立）+ 新建悬浮窗（多窗模式，方案 §4）
+        {
+            HMENU sub_rows = CreatePopupMenu();
+            const int rows_n[3] = { 5, 10, 15 };
+            for (int i = 0; i < 3; i++) {
+                wchar_t lab[16];
+                swprintf_s(lab, 16, L"%d \x884c", rows_n[i]);
+                UINT flags = MF_STRING;
+                if (m_cfg.topn == rows_n[i]) flags |= MF_CHECKED;
+                AppendMenuW(sub_rows, flags, 600 + i, TR(lab));
+            }
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub_rows, TR(L"行数"));
+        }
+        {
+            auto& mgr = WindowManager::Instance();
+            AppendMenuW(menu, MF_STRING | (mgr.Count() >= CTopListWindow::MAX_WINDOWS
+                                               ? MF_GRAYED : 0),
+                        310, TR(L"新建悬浮窗"));
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, 300, TR(L"关闭"));
+        // 「关闭」任何窗数可用：最后一窗 × = 退出悬浮窗模式（item 保留），
+        // 单窗/多窗同一语义（方案 §3.2 关闭语义表）
         SetForegroundWindow(m_hwnd);
         int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                                  pt.x, pt.y, 0, m_hwnd, nullptr);
@@ -586,7 +661,7 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
 // ============================================================
 
 void CTopListWindow::ApplyBackdrop(int effect, int opacity) {
-    if (!m_hwnd) return;
+    if (!m_hwnd || !IsWindow(m_hwnd)) return;   // 死句柄（Destroy 后待收尸）
     if (opacity < 10) opacity = 10;
     if (opacity > 100) opacity = 100;
     if (effect < 0 || effect > 3) effect = 0;
@@ -1108,6 +1183,8 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
     default: view = &snap.cpu; break;
     }
     m_rows = view->rows;
+    // 每窗行数：视图按最大 15 行供数（多窗共享快照），本窗按 cfg.topn 截断
+    if ((int)m_rows.size() > m_topn) m_rows.resize(m_topn);
     m_rows_has_value = view->has_value;
     switch (m_kind) {
     case MetricKind::Mem: m_summary_value = (double)m_mem_used; break;
@@ -1137,9 +1214,10 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
     m_dirty_sig = std::move(sig);
 
     if (!m_visible) {
-        RecalcAndRepaint(true);
+        RecalcAndRepaint(true);   // 首显：摆位 + 干净截屏后上屏
         return;
     }
+    if (!IsVisible()) return;     // 隐藏窗：跳过灌数据（ShowAll 时立即补灌）
     if (changed) {
         RecalcAndRepaint(false);
         return;
@@ -1179,7 +1257,7 @@ void CTopListWindow::RecalcAndRepaint(bool reposition) {
 }
 
 void CTopListWindow::Reposition() {
-    if (!m_hwnd) return;
+    if (!m_hwnd || !IsWindow(m_hwnd)) return;
     HDC hdc = GetDC(m_hwnd);
     int pw = 0, ph = 0;
     CalcLayout(hdc, pw, ph);
@@ -1323,6 +1401,7 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_small);
     RECT rc = { PADDING, y, w - PADDING, y + SUMMARY_H };
     DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
     SelectObject(hdc, hOld);
 }
 

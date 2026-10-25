@@ -392,17 +392,29 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     // high-frequency refresh timer (independent of TM's 1s tick)
     StartRefreshTimer();
 
-    // ranking window: crash guards are in place, safe to create now.
-    // 默认独立浮动，直接可见（首版核心交付物）
-    CreateTopListWindow();
+    // ranking windows: crash guards are in place, safe to create now.
+    // RestoreAll 按 windows[] 恢复；全新用户默认一扇 CPU 窗（与 M1/M2 行为
+    // 一致）；首显经 TopListRefreshFromSnapshot 的首显路径（方案 §3.6）
+    WindowManager::Instance().RestoreAll(m_settings.windows);
+    if (WindowManager::Instance().Count() == 0) {
+        WindowCfg def;
+        def.kind = 0;
+        def.topn = m_settings.topn;
+        def.io_view = m_settings.io_view;
+        WindowManager::Instance().AddWindow(def);
+    }
+    TopListRefreshFromSnapshot();
 }
 
 void CProcessTopPlugin::ApplySettingsToCollectors() {
     m_metrics.SetMemBasisWorkingSet(m_settings.memory_basis == 1);
     m_gpu.Configure(m_settings.GpuScope());
-    if (m_wnd)
-        m_wnd->SetAppearance(m_settings.color_mode, m_settings.popup_effect,
-                             m_settings.popup_opacity);
+    // 外观三件套是全局设置：应用到全部窗口（M3-1 方案 §3.4）
+    WindowManager::Instance().ForEach([](CTopListWindow& w, int) {
+        w.SetAppearance(CProcessTopPlugin::Instance().m_settings.color_mode,
+                        CProcessTopPlugin::Instance().m_settings.popup_effect,
+                        CProcessTopPlugin::Instance().m_settings.popup_opacity);
+    });
 }
 
 void CProcessTopPlugin::ApplyGpuScope(const GpuScopeConfig& cfg) {
@@ -423,54 +435,12 @@ void CProcessTopPlugin::ApplyGpuScope(const GpuScopeConfig& cfg) {
     m_gpu.Configure(cfg);
 }
 
-void CProcessTopPlugin::CreateTopListWindow() {
-    if (m_wnd) return;
-    HINSTANCE hInst = s_dll_hinst ? s_dll_hinst : (HINSTANCE)GetModuleHandleW(nullptr);
-    auto wnd = std::make_unique<CTopListWindow>();
-    POINT pos;
-    if (m_settings.win_x != INT_MIN) { pos.x = m_settings.win_x; pos.y = m_settings.win_y; }
-    else { pos.x = INT_MIN; pos.y = INT_MIN; }
-    if (!wnd->Create(pos.x != INT_MIN ? &pos : nullptr)) return;
-    wnd->SetKind(m_settings.Kind());
-    wnd->SetAppearance(m_settings.color_mode, m_settings.popup_effect, m_settings.popup_opacity);
-    m_wnd = std::move(wnd);
-    m_wnd_shown = true;
-    // 立即灌一次快照（窗口创建后首个 tick 前 UI 不是空白等待态）
-    TopListRefreshFromSnapshot();
-}
-
 void CProcessTopPlugin::ToggleTopListWindow(HWND parent) {
     (void)parent;
-    PollWindowAlive();
-    if (m_wnd && m_wnd->IsVisible()) {
-        // hide: position is kept for next show
-        ShowWindow(m_wnd->GetHwnd(), SW_HIDE);
-        m_wnd_shown = false;
-    } else {
-        if (!m_wnd) CreateTopListWindow();
-        if (m_wnd) {
-            ShowWindow(m_wnd->GetHwnd(), SW_SHOW);
-            m_wnd_shown = true;
-            TopListRefreshFromSnapshot();
-        }
-    }
-}
-
-void CProcessTopPlugin::PollWindowAlive() {
-    // the [×] button / context menu destroys the HWND; reclaim the object
-    if (m_wnd && m_wnd->GetHwnd() && !IsWindow(m_wnd->GetHwnd())) {
-        // persist position before the object is gone
-        POINT pt;
-        m_wnd->GetWindowPos(pt);
-        if (pt.x != INT_MIN) {
-            m_settings.win_x = pt.x;
-            m_settings.win_y = pt.y;
-            m_settings_dirty = true;
-        }
-        m_wnd.reset();   // destructor frees ULW surfaces / icon cache
-        m_wnd_shown = false;
-        ClearBoundMetric();   // 无窗口 → GPU 维度下拍停采
-    }
+    // item toggle：全部可见 → 全部隐藏（配置保留）；有隐藏/空 → 显示/建默认
+    // 窗。两个心智模型分开：暂时收起用 item，「永久关」用窗 ×（方案 §3.2）
+    WindowManager::Instance().ToggleAll();
+    if (WindowManager::Instance().AnyVisible()) TopListRefreshFromSnapshot();
 }
 
 void CProcessTopPlugin::SaveSettingsIfDirty() {
@@ -478,13 +448,15 @@ void CProcessTopPlugin::SaveSettingsIfDirty() {
     if (now - m_last_save_tick < 30000 && !m_settings_dirty) return;
     m_last_save_tick = now;
     if (!m_settings_dirty) return;
-    if (m_wnd && m_wnd->GetHwnd() && IsWindow(m_wnd->GetHwnd())) {
-        POINT pt;
-        m_wnd->GetWindowPos(pt);
-        if (pt.x != INT_MIN) { m_settings.win_x = pt.x; m_settings.win_y = pt.y; }
-    }
-    PtSaveSettings(m_config_dir, m_settings);
+    SaveWindowConfigsNow();
     m_settings_dirty = false;
+}
+
+void CProcessTopPlugin::SaveWindowConfigsNow() {
+    // 窗口配置（含位置，拖动结束时已写进各自 cfg）全量收走落盘——
+    // 缺陷①（M5/A1）的治本路径：不等 30s 节流
+    m_settings.windows = WindowManager::Instance().CollectConfigs();
+    PtSaveSettings(m_config_dir, m_settings);
 }
 
 // ---- tooltip (double-buffered publish, PNM discipline) ----
@@ -559,10 +531,11 @@ void CProcessTopPlugin::RefreshTick() {
         have_etw = io_delta.valid;
     }
 
-    // 2b) GPU 按需启停（绑定指标不含 GPU/显存 → PDH 全关，方案 §4）。
+    // 2b) GPU 按需启停（绑定位集不含 GPU/显存 → PDH 全关，方案 §3.3）。
     // 关停时同步清空缓存结果，重开后的首拍不会拿旧数据冒充。
-    int bound = m_bound_metric.load();
-    bool gpu_bound = (bound == (int)MetricKind::Gpu || bound == (int)MetricKind::Vram);
+    // 位集来自可见窗口的绑定指标并集（隐藏窗不算——HideAll 停采/ShowAll 恢复）
+    int mask = WindowManager::Instance().BoundMask();
+    bool gpu_bound = mask & (PtKindMask(MetricKind::Gpu) | PtKindMask(MetricKind::Vram));
     if (gpu_bound) {
         m_gpu.EnsureStarted();
     } else {
@@ -579,7 +552,9 @@ void CProcessTopPlugin::RefreshTick() {
 
     // 3) aggregate: merge + sort + TopN
     AggregateSettings agg;
-    agg.topn = m_settings.topn;
+    // 多窗模式：快照视图按最大行数（15）供数，各窗在自己的
+    // UpdateFromSnapshot 里按 cfg.topn 截断——全局 topn 只是新窗默认值
+    agg.topn = 15;
     agg.vram_with_shared = (m_settings.vram_basis == 1);
     // GPU 采集单独降频（每 2 拍 ≈1s，方案 §2.4）。非采集拍沿用上一次结果
     // （GPU 数据本就是 1s 档口径），否则快照 valid 位逐拍闪烁。
@@ -627,12 +602,13 @@ void CProcessTopPlugin::RefreshTick() {
     BuildTooltip();
 
     // 5) window refresh (posted: window pulls the snapshot on ITS OWN thread)
-    PollWindowAlive();
-    if (m_wnd && m_wnd->IsVisible())
-        PostMessage(m_wnd->GetHwnd(), WM_PTM_REFRESH, 0, 0);
+    WindowManager::Instance().ReclaimDead();   // × 钮销毁的窗口对象回收
+    WindowManager::Instance().PostToAll(WM_PTM_REFRESH, 0, 0);
 
-    // 6) throttled settings persistence + debug-log sync
-    if (++m_tick_count % 60 == 0) {
+    // 6) throttled settings persistence + debug-log sync。
+    // 墙钟 30s 节流（原 tick 计数 %60 在负载下 tick 走得慢，首槽实测
+    // ~62s——cfg 变更落盘窗口不可控；墙钟才是「30s 节流」的诚实实现）
+    if (now - m_last_save_tick >= 30000) {
         SaveSettingsIfDirty();
         EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
     }
@@ -664,15 +640,26 @@ void CProcessTopPlugin::CheckLanguageChange() {
     const wchar_t* bcp = (m_app ? m_app->GetStringRes(L"BCP_47", L"general") : nullptr);
     std::wstring tm = bcp && bcp[0] ? bcp : L"zh-CN";
     if (I18n::CheckAndReload(tm)) {
-        if (m_wnd && m_wnd->GetHwnd())
-            PostMessage(m_wnd->GetHwnd(), WM_PTM_LANG_CHANGED, 0, 0);
+        WindowManager::Instance().PostToAll(WM_PTM_LANG_CHANGED, 0, 0);
     }
+}
+
+void CProcessTopPlugin::ApplyLanguageNow() {
+    // M4 选项对话框「确定」路径：手动语言切换即时生效
+    I18n::SetLang(m_settings.lang);
+    I18n::Reload();
+    WindowManager::Instance().PostToAll(WM_PTM_LANG_CHANGED, 0, 0);
+}
+
+void CProcessTopPlugin::RestartRefreshTimer() {
+    StartRefreshTimer();
 }
 
 // ---- UI-thread entry points ----
 
 void CProcessTopPlugin::TopListRefreshFromSnapshot() {
-    if (!m_wnd || !m_wnd->GetHwnd() || !IsWindow(m_wnd->GetHwnd())) return;
+    // 锁内拷一次快照 → 逐窗灌数据（每窗 kind/io_view/topn 来自各自 cfg，
+    // 不再回写全局 settings——cfg 即配置本体，方案 §3.4）
     MetricsSnapshot snap;
     bool valid;
     {
@@ -681,21 +668,7 @@ void CProcessTopPlugin::TopListRefreshFromSnapshot() {
         valid = m_snapshot_valid;
         LeaveCriticalSection(&m_data_lock);
     }
-    // first_tick: true while we have no delta yet — the window shows "--"
-    // instead of misleading zeros
-    m_wnd->UpdateFromSnapshot(snap, m_wnd->GetKind(), m_settings.topn,
-                              m_settings.io_view, !valid || snap.cpu_total_pct < 0);
-    // io_view 菜单切换经由窗口回写（500ms 内下一次 tick 纠正显示口径）
-    if (m_settings.io_view != m_wnd->GetIoView()) {
-        m_settings.io_view = m_wnd->GetIoView();
-        m_settings_dirty = true;
-    }
-    // 指标切换（滚轮/菜单）同样回写持久化（M2：Gpu/Vram 也走这里）
-    MetricKind wk = m_wnd->GetKind();
-    if (m_settings.Kind() != wk) {
-        m_settings.SetKind(wk);
-        m_settings_dirty = true;
-    }
+    WindowManager::Instance().RefreshAll(snap, valid, m_settings.topn);
 }
 
 ITMPlugin::OptionReturn CProcessTopPlugin::ShowOptionsDialog(void* hParent) {

@@ -58,9 +58,17 @@ public:
     void SetKind(MetricKind k);
     MetricKind GetKind() const { return m_kind; }
 
-    bool IsVisible() const { return m_visible; }
+    bool IsVisible() const { return m_hwnd && IsWindowVisible(m_hwnd) != FALSE; }
+    // 首显判定（内部 ULW 首显干净截屏路径用；隐藏≠未首显）
+    bool WasShownOnce() const { return m_visible; }
     HWND GetHwnd() const { return m_hwnd; }
     void GetWindowPos(POINT& pt) const;   // settings persistence
+
+    // 每窗持久化配置（UI 线程读写；创建时由 WindowManager 注入，
+    // 菜单命令就地修改，CollectConfigs 收走落盘——配置本体就在这）
+    WindowCfg m_cfg;
+    void ApplyCfg(const WindowCfg& c);    // kind/io_view/topn 变更入口
+    int  Index() const { return m_index; }   // manager 槽位（菜单命令用）
 
     // settings pass-through for draw-time reads (effect/opacity/color mode)
     void SetAppearance(int color_mode, int effect, int opacity) {
@@ -118,6 +126,10 @@ private:
     LRESULT HandleMessage(UINT msg, WPARAM wp, LPARAM lp);
     static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     static CTopListWindow* FromHwnd(HWND hwnd);
+    void UnregisterDispatch();   // UI 线程：HWND 销毁后立即摘除派发表项
+
+    friend class WindowManager;   // m_index 槽位注入
+    int m_index = -1;
 
     // ---- state ----
     HWND m_hwnd = nullptr;

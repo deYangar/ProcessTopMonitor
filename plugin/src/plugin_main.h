@@ -5,6 +5,7 @@
 #include "etw_file_collector.h"
 #include "top_aggregator.h"
 #include "top_list_window.h"
+#include "window_manager.h"
 #include "settings.h"
 #include "i18n.h"
 #include <atomic>
@@ -62,11 +63,10 @@ public:
     void ToggleTopListWindow(HWND parent);
     void SaveSettingsIfDirty();
     void ApplySettingsToCollectors();    // memory basis / GPU scope / debug logs
-
-    // 窗口在 UI 线程通知「当前绑定的指标」（滚轮/菜单切换/关闭）——
-    // tick 线程据此按需启停 GPU 采集（方案 §4 设计决策 2）
-    void NotifyBoundMetric(MetricKind k) { m_bound_metric.store((int)k); }
-    void ClearBoundMetric() { m_bound_metric.store(-1); }
+    void SaveWindowConfigsNow();         // 拖动结束等即时落盘路径（缺陷①修复）
+    // M4 选项对话框生效管线用的接缝（刷新率重启/语言切换/立即落盘）
+    void RestartRefreshTimer();
+    void ApplyLanguageNow();
 
     // GPU 口径（窗口口径菜单读写，均 UI 线程）
     GpuScopeConfig GpuScope() const { return m_settings.GpuScope(); }
@@ -89,13 +89,11 @@ private:
     MetricsSnapshot m_snapshot;          // guarded by m_data_lock
     bool m_snapshot_valid = false;
 
-    std::unique_ptr<CTopListWindow> m_wnd;
-    bool m_wnd_shown = false;            // 用户 intent（点击 item 切换）
-
     // 宿主整机 GPU 利用率（OnMonitorInfo 回调缓存；G3 摘要兜底）
     std::atomic<int> m_tm_gpu_usage{ -1 };
-    // 当前绑定指标（窗口 UI 线程写，tick 读；-1=无窗口）
-    std::atomic<int> m_bound_metric{ -1 };
+    // 窗口实例集合（多窗模式，M3-1）：WindowManager 单例持有，plugin 经
+    // WindowManager::Instance() 访问——窗口侧也要直达，成员+单例二选一
+    // 取单例（方案 §2.1 Instance 与 §6 m_wmgr 的矛盾在此定案：单例）
 
     CRITICAL_SECTION m_data_lock;
     bool m_lock_inited = false;
@@ -117,8 +115,6 @@ private:
     void StartRefreshTimer();
     void StopRefreshTimer();
     void CheckLanguageChange();
-    void CreateTopListWindow();
-    void PollWindowAlive();              // 关闭钮销毁窗口后回收对象
     void BuildTooltip();                 // 双缓冲 tooltip 文本
     wchar_t m_tooltip[2][2048] = { L"", L"" };
     std::atomic<int> m_tooltip_cur{ 0 };

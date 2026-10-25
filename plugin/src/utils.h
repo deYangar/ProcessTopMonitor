@@ -42,6 +42,9 @@ inline bool PTM_GetDebugDir(wchar_t* buf, size_t cap) {
 // members (std::vector etc.) from another thread (heap corruption risk).
 #define WM_PTM_REFRESH (WM_APP + 1)
 #define WM_PTM_LANG_CHANGED (WM_APP + 6)
+// Posted (possibly from the tick thread) to a live window: run WindowManager
+// dead-window reclamation on the UI thread (vector mutation is UI-only)
+#define WM_PTM_RECLAIM (WM_APP + 7)
 
 // Measure text width (pixels) with a given font. DPI-native by definition.
 inline int PTM_MeasureText(HDC hdc, HFONT hFont, const wchar_t* text) {
