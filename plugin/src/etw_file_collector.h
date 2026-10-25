@@ -122,5 +122,12 @@ private:
 
     // diagnostics
     uint64_t m_ev_seen = 0, m_ev_kept = 0, m_ev_short = 0;
+    uint64_t m_op_hist[256] = {};      // TEMP diag opcode histogram
+    ULONGLONG m_last_diag = 0;
+    unsigned long m_prov76_last = 0;   // TEMP diag
+    uint64_t m_ulen_hist[80] = {};     // TEMP diag: op76 payload length histogram
+    unsigned m_diag_samples[3] = {};   // TEMP diag: op64/65/66 payload dumps
+    unsigned char m_tdh_done[256] = {};  // TEMP diag: TDH name resolved per opcode
+    unsigned m_prov76_count = 0;
     ULONGLONG m_last_log_tick = 0;
 };
