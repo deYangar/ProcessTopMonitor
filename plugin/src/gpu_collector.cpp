@@ -413,8 +413,10 @@ bool GpuCollector::TickG2(GpuTickData& out,
         }
         if (pid_util_ok) {
             if (util_pct < 0) util_pct = 0;
-            out.util_by_pid[pid] += util_pct;
-            out.total_util_pct += util_pct;
+            // 与 G1 同口径：多适配器/多节点取 max，不做跨适配器相加
+            double& slot = out.util_by_pid[pid];
+            if (util_pct > slot) slot = util_pct;
+            if (util_pct > out.total_util_pct) out.total_util_pct = util_pct;
             util_any = true;
         }
         if (pid_mem_ok) {
@@ -451,6 +453,15 @@ bool GpuCollector::TickG2(GpuTickData& out,
 
 void GpuCollector::Tick(GpuTickData& out,
                         const std::vector<DWORD>& pid_candidates) {
+    // 关键：out 是调用方复用的 m_gpu_last。每拍必须先清零，否则
+    // util_by_pid/sys_dedicated 会跨拍累加（实测症状：GPU 占用率逐拍
+    // 涨到 100% 封顶、显存总量无上限上涨——2026-10-26 用户反馈修复）
+    out.util_by_pid.clear();
+    out.mem_by_pid.clear();
+    out.total_util_pct = 0;
+    out.sys_dedicated = 0;
+    out.sys_shared = 0;
+    out.known_engtypes.clear();
     out.grade = m_grade;
     out.unsupported_reason = m_grade_reason;
     out.util_valid = out.mem_valid = out.sys_mem_valid = false;
@@ -508,8 +519,13 @@ void GpuCollector::Tick(GpuTickData& out,
             if (!in_scope(eng)) continue;
             double v = it.FmtValue.doubleValue;
             if (v < 0) v = 0;
-            out.util_by_pid[pid] += v;
-            out.total_util_pct += v;
+            // 口径（2026-10-26 用户反馈修正）：任务管理器 GPU 列是「该进程
+            // 最忙引擎」的利用率，不是各引擎相加。求和会把 3D+Copy+Video
+            // 并发引擎叠成 >100%，再被截断成 100%——WorkBuddy 等 Electron
+            // 应用因此长期顶格。改为逐进程取 max；系统总量同样取 max。
+            double& slot = out.util_by_pid[pid];
+            if (v > slot) slot = v;
+            if (v > out.total_util_pct) out.total_util_pct = v;
         }
         for (auto& kv : out.util_by_pid) kv.second = cap(kv.second);
         out.total_util_pct = cap(out.total_util_pct);

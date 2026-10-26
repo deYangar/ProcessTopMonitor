@@ -27,7 +27,6 @@ enum {
     IDC_PRESET_ALL = 1040,    // 预设：全部引擎
     IDC_PRESET_D3D,           // 预设：3D
     IDC_PRESET_COMPUTE,       // 预设：计算
-    IDC_CAP_CHK,              // >100% 截断
     IDC_IO_STATUS = 1050,     // IO 档位状态行
     IDC_IO_RETRY,             // IO 重试按钮
     IDC_EFFECT_CBO = 1060,    // 效果
@@ -107,10 +106,8 @@ void PtFillEngines(HWND dlg, bool enable) {
         SendMessageW(chk, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     HWND buttons[] = { GetDlgItem(dlg, IDC_PRESET_ALL), GetDlgItem(dlg, IDC_PRESET_D3D),
-                       GetDlgItem(dlg, IDC_PRESET_COMPUTE), GetDlgItem(dlg, IDC_CAP_CHK) };
+                       GetDlgItem(dlg, IDC_PRESET_COMPUTE) };
     for (HWND b : buttons) if (b) EnableWindow(b, enable);
-    SendMessageW(GetDlgItem(dlg, IDC_CAP_CHK), BM_SETCHECK,
-                 scope.cap_100 ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 void PtPresetEngines(HWND dlg, int preset) {
@@ -267,10 +264,12 @@ void PtCreateControls(HWND hwnd) {
                 M + GW - Sc(120), y + Sc(24), Sc(84), Sc(24), hwnd,
                 (HMENU)(INT_PTR)IDC_PRESET_COMPUTE, nullptr, nullptr);
             PtFont(p1); PtFont(p2); PtFont(p3);
-            HWND cap = CreateWindowW(L"BUTTON", TR(L"引擎求和超过 100% 截断"),
-                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
-                M + Sc(12), y + gpu_h - Sc(28), Sc(300), Sc(20), hwnd,
-                (HMENU)(INT_PTR)IDC_CAP_CHK, nullptr, nullptr);
+            // 口径说明（2026-10-26 用户反馈修正：求和会叠成 100%，改为
+            // 每进程取最忙引擎，与任务管理器一致；不再提供截断开关）
+            HWND cap = CreateWindowW(L"STATIC", TR(L"口径：每个进程取最忙引擎（与任务管理器一致）"),
+                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                M + Sc(12), y + gpu_h - Sc(28), Sc(380), Sc(20), hwnd,
+                nullptr, nullptr, nullptr);
             PtFont(cap);
             PtFillEngines(hwnd, ggrade != GpuGrade::G2);
         }
@@ -412,7 +411,6 @@ void PtOnOk(HWND hwnd) {
 
     // GPU scope：勾选集 → gpu_engines（空集回 all，方案 §4）
     GpuScopeConfig scope = st.GpuScope();
-    scope.cap_100 = SendMessageW(GetDlgItem(hwnd, IDC_CAP_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     scope.vram_with_shared = (st.vram_basis == 1);
     {
         std::vector<std::wstring> sel;

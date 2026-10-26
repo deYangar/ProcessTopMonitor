@@ -605,8 +605,10 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
                 AppendMenuW(sub, flags, 410 + (UINT)i, m_gpu_engtypes[i].c_str());
             }
             AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
-            UINT flags_cap = MF_STRING | (scope.cap_100 ? MF_CHECKED : 0);
-            AppendMenuW(sub, flags_cap, 500, TR(L"超过 100% 截断"));
+            // 口径说明（2026-10-26 用户反馈修正：求和会把并发引擎叠成
+            // 100%，改为每进程取最忙引擎；截断开关随之取消）
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0,
+                        TR(L"口径：每个进程取最忙引擎"));
             AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"GPU 口径"));
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
@@ -652,15 +654,13 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
         DestroyMenu(menu);
         if (cmd) {
             auto& plugin = CProcessTopPlugin::Instance();
-            if (cmd == 400 || cmd == 500 ||
+            if (cmd == 400 ||
                 (cmd >= 410 && cmd < 410 + (int)m_gpu_engtypes.size())) {
                 // GPU 口径 toggle：改 settings + 通知采集器，重开菜单
                 GpuScopeConfig scope = plugin.GpuScope();
                 if (cmd == 400) {
                     scope.all_engines = true;
                     scope.engines.clear();
-                } else if (cmd == 500) {
-                    scope.cap_100 = !scope.cap_100;
                 } else {
                     const std::wstring& eng = m_gpu_engtypes[cmd - 410];
                     size_t at = scope.engines.size();
@@ -1456,8 +1456,9 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             if (m_tm_cpu_freq > 0) {
                 if (sensor[0]) wcscat_s(sensor, 48, L" ");
                 if (m_tm_cpu_freq >= 1000) {
-                    swprintf_s(seg, 32, L"%d.%dGHz", m_tm_cpu_freq / 1000,
-                               (m_tm_cpu_freq % 1000 + 50) / 100);
+                    // 一位小数（四舍五入到 0.1GHz；4950 → 5.0 而非 4.10）
+                    int tenths = (m_tm_cpu_freq + 50) / 100;
+                    swprintf_s(seg, 32, L"%d.%dGHz", tenths / 10, tenths % 10);
                 } else {
                     swprintf_s(seg, 32, L"%dMHz", m_tm_cpu_freq);
                 }

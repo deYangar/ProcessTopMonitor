@@ -90,7 +90,10 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             a.mem += p.mem;
             a.io_r += io_r;
             a.io_w += io_w;
-            a.gpu += gpu_pct;
+            // GPU 利用率取 max（同名多进程 = 同一应用，任务管理器口径是
+            // 「最忙的那个进程/引擎」；相加会把 11 个 Electron 子进程叠成
+            // 100%——2026-10-26 用户反馈修复）
+            if (gpu_pct > a.gpu) a.gpu = gpu_pct;
             a.vram_ded += vram_d;
             a.vram_shared += vram_s;
             // representative = biggest live contributor by CPU (stable pick)

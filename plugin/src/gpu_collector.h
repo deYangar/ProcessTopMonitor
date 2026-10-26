@@ -19,9 +19,11 @@
 //   GPU Adapter Memory:  luid_0x..._phys_0 (system-wide, summary line)
 // Parsing is loose (pid_/engtype_ anchors, rest ignored — 方案 §10 风险 8).
 //
-// Scope (方案 §2.4 已拍板): engines selectable by engtype (dynamic list from
-// live instances, "all" = sum of everything); sum across engines/instances
-// may exceed 100% -> optional clamp (gpu_cap_100, default on).
+// Scope (方案 §2.4，2026-10-26 修正): engines selectable by engtype (dynamic
+// list from live instances, "all" = consider every engine); per-process
+// utilization = the busiest selected engine (Task Manager semantics).
+// 早期实现按引擎求和再截断，会把并发引擎叠成 100%（用户实测 WorkBuddy
+// 长期顶格），已废弃；gpu_cap_100 字段保留但不再影响口径。
 //
 // Threads: PDH query handles live on the tick thread only (EnsureStarted /
 // Tick / EnsureStopped all called there). Configure() may be called from the

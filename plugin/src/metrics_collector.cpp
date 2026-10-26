@@ -1,9 +1,73 @@
 // metrics_collector.cpp — snapshot collection via NtQuerySystemInformation
 #include "metrics_collector.h"
 #include <cstdio>
+#include <pdh.h>
+#include <powerbase.h>
+
+#pragma comment(lib, "powrprof.lib")
 
 typedef LONG(NTAPI* PFN_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
 constexpr ULONG SystemProcessInformation = 5;
+
+// PROCESSOR_POWER_INFORMATION：SDK 的 powrprof.h 不导出该结构（TM 同款手抄）
+typedef struct _PTM_PROCESSOR_POWER_INFORMATION {
+    ULONG Number;
+    ULONG MaxMhz;
+    ULONG CurrentMhz;
+    ULONG MhzLimit;
+    ULONG MaxIdleState;
+    ULONG CurrentIdleState;
+} PTM_PROCESSOR_POWER_INFORMATION;
+
+int MetricsCollector::QueryCpuFreqMhz() {
+    if (!m_freq_query) {
+        PDH_HQUERY q = nullptr;
+        if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) return 0;
+        PDH_HCOUNTER c = nullptr;
+        // English counter path：免本地化（与 gpu_collector 同款约定）
+        if (PdhAddEnglishCounterW(q, L"\\Processor Information(_Total)\\% Processor Performance",
+                                  0, &c) != ERROR_SUCCESS) {
+            PdhCloseQuery(q);
+            return 0;
+        }
+        m_freq_query = q;
+        m_freq_counter = c;
+
+        SYSTEM_INFO si = {};
+        GetSystemInfo(&si);
+        ULONG n = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+        std::vector<PTM_PROCESSOR_POWER_INFORMATION> pp(n);
+        if (CallNtPowerInformation(ProcessorInformation, nullptr, 0, pp.data(),
+                                   (ULONG)(pp.size() * sizeof(pp[0]))) == 0) {
+            ULONG max_mhz = 0;
+            for (auto& p : pp) if (p.MaxMhz > max_mhz) max_mhz = p.MaxMhz;
+            m_freq_max_ghz = max_mhz / 1000.0;
+        }
+        if (m_freq_max_ghz <= 0.1) {
+            // 兜底：注册表基准频率（无 turbo，仅保证不显示 0）
+            HKEY hk = nullptr;
+            DWORD mhz = 0, sz = sizeof(mhz);
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                              L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                              0, KEY_READ, &hk) == ERROR_SUCCESS) {
+                RegQueryValueExW(hk, L"~MHz", nullptr, nullptr, (LPBYTE)&mhz, &sz);
+                RegCloseKey(hk);
+            }
+            m_freq_max_ghz = mhz / 1000.0;
+        }
+    }
+    if (PdhCollectQueryData((PDH_HQUERY)m_freq_query) != ERROR_SUCCESS)
+        return m_freq_mhz;
+    if (++m_freq_collections < 2) return 0;   // 首拍无 delta
+    PDH_FMT_COUNTERVALUE v = {};
+    if (PdhGetFormattedCounterValue((PDH_HCOUNTER)m_freq_counter, PDH_FMT_DOUBLE,
+                                    nullptr, &v) == ERROR_SUCCESS &&
+        v.CStatus == 0 /* PDH_CSTATUS_VALID_DATA */) {
+        double ghz = v.doubleValue / 100.0 * m_freq_max_ghz;
+        if (ghz > 0.1 && ghz < 20.0) m_freq_mhz = (int)(ghz * 1000.0 + 0.5);
+    }
+    return m_freq_mhz;
+}
 
 void MetricsCollector::Remember(DWORD pid, const std::wstring& name) {
     if (name.empty()) return;
@@ -115,6 +179,10 @@ void MetricsCollector::Tick(CpuMemIoMetrics& out) {
         out.mem_total = ms.ullTotalPhys;
         out.mem_used = ms.ullTotalPhys - ms.ullAvailPhys;
     }
+
+    // CPU 当前频率：每 2 拍（≈1s）更新一次，PDH 需要两拍 delta
+    if ((m_freq_div++ & 1) == 0) out.cpu_freq_mhz = QueryCpuFreqMhz();
+    else out.cpu_freq_mhz = m_freq_mhz;
 
     // 当前拍每进程原始值
     struct Raw {

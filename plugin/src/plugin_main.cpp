@@ -598,7 +598,10 @@ void CProcessTopPlugin::RefreshTick() {
     // 宿主传感器（M3-3）：进快照供窗口摘要行取用（0 = 未采集）
     snap.tm_cpu_temp = m_tm_cpu_temp.load();
     snap.tm_gpu_temp = m_tm_gpu_temp.load();
-    snap.tm_cpu_freq = m_tm_cpu_freq.load();
+    // 频率优先用自测值（MHz，能出 4.9GHz 一位小数）；宿主 cpu_freq 是
+    // 整数 GHz（float 截断），只在自测不可用时兜底 ×1000
+    snap.tm_cpu_freq = (m.cpu_freq_mhz > 0) ? m.cpu_freq_mhz
+                                            : m_tm_cpu_freq.load() * 1000;
 
     // 4) publish + taskbar item text (lock)
     {

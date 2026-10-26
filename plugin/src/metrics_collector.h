@@ -43,6 +43,10 @@ struct CpuMemIoMetrics {
     uint64_t mem_total = 0;
     uint64_t mem_used = 0;
     bool first = true;
+    // 当前 CPU 频率（MHz，整数；PDH % Processor Performance × MaxMhz）。
+    // 宿主 MonitorInfo.cpu_freq 只有整数 GHz（float 截断），拿不到小数位，
+    // 摘要行要 "4.9GHz" 必须自测（M5 用户反馈修复）。
+    int cpu_freq_mhz = 0;
     std::vector<ProcMetric> procs;     // idle/system excluded, all others
 };
 
@@ -117,6 +121,15 @@ private:
 
     bool Snapshot();                   // fills m_raw / returns false on failure
     void Remember(DWORD pid, const std::wstring& name);
+    int QueryCpuFreqMhz();             // tick thread; PDH 当前频率（MHz）
+
+    // CPU 频率自测（tick thread only）
+    void* m_freq_query = nullptr;      // PDH_HQUERY
+    void* m_freq_counter = nullptr;    // PDH_HCOUNTER
+    double m_freq_max_ghz = 0;         // MaxMhz / 1000
+    int m_freq_collections = 0;
+    int m_freq_div = 0;
+    int m_freq_mhz = 0;
 
     // NtQuerySystemInformation, resolved once
     void* m_ntqsi = nullptr;
