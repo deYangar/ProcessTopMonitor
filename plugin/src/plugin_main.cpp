@@ -390,9 +390,9 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
         }
     }
 
-    // ETW FileIo session (grade A/B attempt; C-grade fallback is automatic
-    // and visible — Start returns the achieved grade and never blocks long)
-    m_etw.Start();
+    // ETW FileIo 会话按需启停（方案 §4.2/§8.3）：InitOnce 不预先开会话，
+    // 由 RefreshTick 按可见窗口绑定位集决定——无磁盘 IO 窗口时零内核开销
+    // （会话建立 ~10ms，首次切到 IO 视图时启动，可接受）
 
     // high-frequency refresh timer (independent of TM's 1s tick)
     StartRefreshTimer();
@@ -551,6 +551,16 @@ void CProcessTopPlugin::RefreshTick() {
         m_gpu_last = GpuTickData{};
     }
 
+    // 2c) ETW 按需启停（方案 §4.2/§8.3）：无可见磁盘 IO 窗口 → 停会话，
+    // 内核侧零开销；首次出现 IO 窗口时启动（A/B 尝试，失败落 C 并如实
+    // 标注）。只在绑定状态变化时动作，避免 C 档每拍重试。
+    bool io_bound = (mask & PtKindMask(MetricKind::DiskIo)) != 0;
+    if (io_bound != m_io_bound_prev) {
+        if (io_bound) m_etw.Start();
+        else m_etw.Stop();
+        m_io_bound_prev = io_bound;
+    }
+
     ULONGLONG now = GetTickCount64();
     static ULONGLONG prev_wall = 0;   // tick-thread only (CAS-guarded)
     double dt = prev_wall ? (double)(now - prev_wall) / 1000.0 : 0.0;
@@ -624,6 +634,10 @@ void CProcessTopPlugin::RefreshTick() {
         SaveSettingsIfDirty();
         EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
     }
+    // 全部窗口隐藏/关闭 → 定时器停（方案 §4.2/§8.3）：CPU 归零，任务栏
+    // item 退化为 TM tick 惰性读缓存；ShowAll/新建窗时由 WindowManager
+    // 重新拉起定时器（RestartRefreshTimer）
+    if (mask == 0) StopRefreshTimer();
     m_refresh_busy.store(false);
 }
 

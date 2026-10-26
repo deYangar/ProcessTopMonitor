@@ -54,6 +54,8 @@ int WindowManager::AddWindow(const WindowCfg& cfg) {
     }
     m_windows.push_back(std::move(wnd));
     RecomputeBoundMask();
+    // 从「零窗」恢复时重启定时器（全部隐藏/关闭后定时器已停，方案 §8.3）
+    if (Count() == 1) CProcessTopPlugin::Instance().RestartRefreshTimer();
     return (int)m_windows.size() - 1;
 }
 
@@ -82,6 +84,8 @@ void WindowManager::ShowAll() {
         if (w->GetHwnd()) ShowWindow(w->GetHwnd(), SW_SHOW);
     }
     RecomputeBoundMask();
+    // 隐藏期间定时器已停（方案 §8.3），恢复显示必须重新拉起
+    CProcessTopPlugin::Instance().RestartRefreshTimer();
     // 隐藏窗恢复后立即灌一次快照（方案 §3.6/边界 5）
     CProcessTopPlugin::Instance().TopListRefreshFromSnapshot();
 }

@@ -119,6 +119,7 @@ private:
     bool m_refresh_timer_ok = false;
     int m_tick_count = 0;
     int m_gpu_tick_div = 0;              // GPU 采集分频（每 2 拍 ≈1s）
+    bool m_io_bound_prev = false;        // ETW 按需启停：上一拍是否有可见 IO 窗
     ULONGLONG m_last_save_tick = 0;
 
     std::wstring m_tm_config_dir;
