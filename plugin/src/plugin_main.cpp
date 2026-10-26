@@ -640,7 +640,7 @@ void CProcessTopPlugin::RefreshTick() {
     // 全部窗口隐藏/关闭 → 定时器停（方案 §4.2/§8.3）：CPU 归零，任务栏
     // item 退化为 TM tick 惰性读缓存；ShowAll/新建窗时由 WindowManager
     // 重新拉起定时器（RestartRefreshTimer）
-    if (mask == 0) StopRefreshTimer();
+    if (mask == 0) StopRefreshTimer(false);   // 回调内自停：不能等待自己
     m_refresh_busy.store(false);
 }
 
@@ -657,9 +657,13 @@ void CProcessTopPlugin::StartRefreshTimer() {
     }
 }
 
-void CProcessTopPlugin::StopRefreshTimer() {
+void CProcessTopPlugin::StopRefreshTimer(bool wait) {
     if (m_refresh_timer) {
-        DeleteTimerQueueTimer(nullptr, m_refresh_timer, INVALID_HANDLE_VALUE);
+        // wait=true：DeleteTimerQueueTimer 传 INVALID_HANDLE_VALUE 会等待
+        // 正在执行的回调结束——从回调内部（RefreshTick 的「全部隐藏」路径）
+        // 调用会等自己，死锁。回调内必须传 nullptr（异步删除）。
+        DeleteTimerQueueTimer(nullptr, m_refresh_timer,
+                              wait ? INVALID_HANDLE_VALUE : nullptr);
         m_refresh_timer = nullptr;
     }
     m_refresh_timer_ok = false;

@@ -130,7 +130,7 @@ private:
     void RefreshTick();
     static void CALLBACK RefreshTimerProc(void* param, BOOLEAN timer_or_wait);
     void StartRefreshTimer();
-    void StopRefreshTimer();
+    void StopRefreshTimer(bool wait = true);   // wait=false：定时器回调内自停（防自死锁）
     void CheckLanguageChange();
     void BuildTooltip();                 // 双缓冲 tooltip 文本
     wchar_t m_tooltip[2][2048] = { L"", L"" };
