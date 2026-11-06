@@ -366,10 +366,13 @@ void WindowManager::LayoutGroup(const RECT& anchor) {
 void WindowManager::PnmOrderReconcile() {
     // 问题④兜底轮询（消息丢失/时序错乱的收敛网，HoverTick 每 ≥500ms
     // 调）：不对称秩序——PNM 恒占方位公式正位（PNM 侧已移除对 PTM 的
-    // 避让），PTM 以 PNM 矩形为参照让到旁边；PNM 不在场时 PTM 占正位。
-    // 判定用「组长是否在理论落点」而不是裸「是否相交」：让开之后即使
-    // 包围盒仍与 PNM 相邻近也不重排，杜绝抖动循环。pin/常驻 = 用户手
-    // 放位置，永不参与
+    // 避让），PTM 以 PNM 矩形为参照让到旁边。判定用「组长是否在理论
+    // 落点」而不是裸「是否相交」：让开之后即使包围盒仍与 PNM 相邻近
+    // 也不重排，杜绝抖动循环。pin/常驻 = 用户手放位置，永不参与。
+    // PNM 收起时本函数不归位（2026-11-06 反馈）：归位会让组在鼠标
+    // 半路上跳走——去点让位处的 PTM 时鼠标离开 TM → PNM 先消失 → 组
+    // 若跳回正位就脱离光标 → 300ms 宽限后连锁收起。让位处就地不动，
+    // 收起后下次弹出 LayoutGroup 自然落回正位（PNM 不在场无窗可避）
     if (m_windows.empty()) return;
     auto& plugin = CProcessTopPlugin::Instance();
     if (plugin.m_settings.popup_mode == 1 || plugin.GroupPinned()) return;
@@ -410,11 +413,9 @@ void WindowManager::PnmOrderReconcile() {
             // AvoidPNMPopups 枚举到 PNM 窗自然让开；幂等）
             LayoutGroup(m_popup_anchor);
         }
-    } else if (!at_theoretical) {
-        // PNM 全部收起且 PTM 还让在旁边：重排归位（无 PNM 窗可避，
-        // LayoutGroup 回理论落点；幂等）
-        LayoutGroup(m_popup_anchor);
     }
+    // PNM 全部收起：不归位（见函数头 2026-11-06 注释），本次显示会话
+    // 停在让位处；组收起后下次弹出走理论落点自然回正位
 }
 
 void WindowManager::GroupDeltaMove(int dx, int dy) {

@@ -1590,7 +1590,8 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             wchar_t r[32], wr[32];
             FormatSpeed(m_io_read_total, r, 32);
             FormatSpeed(m_io_write_total, wr, 32);
-            swprintf_s(text, 160, L"\u2193%s \u2191%s", r, wr);
+            // 读/写文字前缀（2026-11-06 反馈：↓↑ 分不清哪边是读）
+            swprintf_s(text, 160, L"%s%s %s%s", TR(L"读"), r, TR(L"写"), wr);
         } else {
             FormatSpeed(m_summary_value, v, 48);
             swprintf_s(text, 160, L"%s", v);
@@ -1704,16 +1705,17 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
     RECT rc_name = { x, y, x + max_name_w, y + ROW_HEIGHT };
     DrawTextW(hdc, name.c_str(), -1, &rc_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    // 4) 数值（右对齐 accent；合计视图双列 ↓读 ↑写——问题③，箭头符号
-    //    沿用摘要行现款 \u2193/\u2191，各自 FormatSpeed 单位换算）
+    // 4) 数值（右对齐 accent；合计视图双列 读/写 文字前缀——问题③，
+    //    2026-11-06 反馈箭头 ↓↑ 分不清方向，各自 FormatSpeed 单位换算；
+    //    TR 单字键英文缩写 R/W，宽度 90px 列内实测富余）
     SetTextColor(hdc, GetAccentColor());
     if (m_rows_has_value && m_kind == MetricKind::DiskIo && m_io_view == 0) {
         wchar_t rv[32], wv[32];
         FormatSpeed(row.io_read_bps, rv, 32);
         FormatSpeed(row.io_write_bps, wv, 32);
         wchar_t rd[48], wd[48];
-        swprintf_s(rd, 48, L"\u2193%s", rv);
-        swprintf_s(wd, 48, L"\u2191%s", wv);
+        swprintf_s(rd, 48, L"%s%s", TR(L"读"), rv);
+        swprintf_s(wd, 48, L"%s%s", TR(L"写"), wv);
         int col_gap = (int)(8 * m_dpi_scale);
         RECT rc_write = { w - PADDING - VALUE_AREA_W, y, w - PADDING, y + ROW_HEIGHT };
         DrawTextW(hdc, wd, -1, &rc_write, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
