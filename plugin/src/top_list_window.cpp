@@ -382,16 +382,32 @@ void CTopListWindow::RecreateScaledResources() {
 // ============================================================
 
 LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
-    // 预览实例（LoadDemoSnapshot 置位）：纯展示，交互全短路——拖动/
-    // 点击切换/滚轮/右键菜单/命令/timer/刷新广播一概不响应（不在
+    // 预览实例（LoadDemoSnapshot 置位）：展示窗 + PNM COpacityPreview
+    // 同款行为——整窗可拖（挪到一边对照调）、2s 无滑动自动收起、拖动
+    // 期间不收起；指标切换/滚轮/右键菜单/命令/刷新广播仍全短路（不在
     // WindowManager 册上理论收不到广播，此为双保险）
     if (m_preview) {
         switch (msg) {
-        case WM_NCHITTEST:
-            return HTCLIENT;   // 恒不可拖（HTCAPTION 会被系统托管拖动）
+        case WM_NCHITTEST: {
+            // 可拖（PNM 预览同款）：DefWindowProc 先过 ULW 透明像素判定，
+            // 实心区 HTCLIENT 升级 HTCAPTION——点下即进系统移动循环；
+            // 全透明像素不劫持
+            LRESULT ht = DefWindowProcW(m_hwnd, msg, wp, lp);
+            return (ht == HTCLIENT) ? HTCAPTION : ht;
+        }
         case WM_TIMER:
+            if (wp == PREVIEW_AUTOHIDE_TIMER) {
+                KillTimer(m_hwnd, PREVIEW_AUTOHIDE_TIMER);   // 到期即收（周期重复触发无意义）
+                Hide();
+            }
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            KillTimer(m_hwnd, PREVIEW_AUTOHIDE_TIMER);   // 拖预览期间不收起
+            return 0;
+        case WM_EXITSIZEMOVE:
+            SetTimer(m_hwnd, PREVIEW_AUTOHIDE_TIMER, 2000, NULL);   // 松手重计 2s
+            return 0;
         case WM_LBUTTONDOWN:
-        case WM_NCLBUTTONDOWN:
         case WM_RBUTTONDOWN:
         case WM_NCRBUTTONUP:
         case WM_CONTEXTMENU:
@@ -518,8 +534,10 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
                     RefreshBackdrop(cur);
                     m_last_snap_rect = cur;   // 拖动基准同步，静止期衔接
                     if (m_text_dark != d0 || m_text_adaptive != a0
-                        || m_accent_flip != f0)
+                        || m_accent_flip != f0) {
+                        m_cov_dirty = true;   // 翻转改变文字/面板色=双底内容变化
                         InvalidateRect(m_hwnd, nullptr, FALSE);
+                    }
                 }
             }
         }
@@ -872,6 +890,8 @@ void CTopListWindow::ApplyBackdrop(int effect, int opacity) {
     bool want_layered = (effect != 3);
     int target = want_layered ? 1 : 0;
     bool dark = IsDarkMode();
+    int prev_mode = m_backdrop_mode, prev_effect = m_backdrop_effect;
+    bool prev_acrylic_dark = m_acrylic_dark;
     if (target == m_backdrop_mode &&
         (target != 1 || (effect == m_backdrop_effect &&
                          dark == m_acrylic_dark &&
@@ -890,8 +910,23 @@ void CTopListWindow::ApplyBackdrop(int effect, int opacity) {
         LONG_PTR ex = GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
         m_noise_acrylic = (effect == 0);
-        if (effect == 0 || effect == 2) EnsureBlurLayer();
-        else DestroyBlurLayer();
+        if (effect == 0 || effect == 2) {
+            EnsureBlurLayer();
+            // 可见窗效果热切换（选项对话框即时预览/预览实例会话内翻档）：
+            // blur 层新建默认不可见，上屏本由 ShowAt 成对负责——但窗口
+            // 已可见时不走 ShowAt，必须在此立即同 rect 显示，否则磨砂档
+            // 无模糊层（存量缺陷，2026-11-07 顺修）。insert-after 本窗
+            // 保 Z 序（HWND_TOPMOST 会把 blur 提到内容层之上反序——PNM
+            // 预览窗实测同坑）
+            if (m_blur_hwnd && IsWindowVisible(m_hwnd)) {
+                RECT rc;
+                GetWindowRect(m_hwnd, &rc);
+                SetWindowPos(m_blur_hwnd, m_hwnd, rc.left, rc.top, 0, 0,
+                             SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+        } else {
+            DestroyBlurLayer();
+        }
         m_acrylic_active = true;
         m_acrylic_dark = dark;
     } else {
@@ -906,6 +941,11 @@ void CTopListWindow::ApplyBackdrop(int effect, int opacity) {
     m_backdrop_mode = target;
     m_backdrop_effect = effect;
     m_backdrop_opacity = opacity;
+    // 预览缓存置脏：仅双底内容相关输入（mode/主题/效果档）变化才置
+    // ——opacity-only 变化（拖滑条 60Hz）只影响合成 pass，双底缓存有效
+    bool content_change = (target != prev_mode || dark != prev_acrylic_dark ||
+                           effect != prev_effect);
+    if (content_change) m_cov_dirty = true;
     m_last_snap_rect = {};
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -964,6 +1004,7 @@ bool CTopListWindow::EnsureLayeredSurface(int w, int h) {
     if (m_ulw_dc && m_ulw_bmp && m_cov_a_dc && m_cov_c_dc && m_snap_dc &&
         w == m_ulw_w_cache && h == m_ulw_h_cache)
         return true;
+    m_cov_dirty = true;   // 表面重建（尺寸/DPI 变化）：双底缓存随之作废
 
     struct { HDC* dc; HBITMAP* bmp; void** bits; int bw, bh; } surfs[4] = {
         { &m_cov_a_dc, &m_cov_a_bmp, &m_cov_a_bits, w, h },
@@ -1592,6 +1633,7 @@ void CTopListWindow::ShowAt(int x, int y) {
         RefreshBackdrop(will);
         m_last_snap_rect = will;
         m_last_refresh_tick = GetTickCount64();
+        m_cov_dirty = true;   // 首显判定结果（翻转/面板观感）影响双底内容
     }
 
     if (m_blur_hwnd)
@@ -1996,17 +2038,24 @@ void CTopListWindow::OnPaint() {
     int h = client.bottom - client.top;
 
     if (m_acrylic_active) {
-        // ULW：内容在白底/黑底各画一遍解覆盖率，合成后 UpdateLayeredWindow
+        // ULW：内容在白底/黑底各画一遍解覆盖率，合成后 UpdateLayeredWindow。
+        // 预览实例双底缓存（PNM COpacityPreview m_cov_dirty 同款）：内容
+        // 恒定（示例数据），拖滑条 60Hz 只变浓度——双底仅脏时重画，合成
+        // pass 每次全量（浓度/噪声/翻转只影响合成段）。真窗口不缓存
+        //（数据每拍变，双底必然重画，缓存无收益）
         if (EnsureLayeredSurface(w, h)) {
-            RECT rc_all = { 0, 0, w, h };
-            HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
-            FillRect(m_cov_a_dc, &rc_all, white);
-            DeleteObject(white);
-            HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(m_cov_c_dc, &rc_all, black);
-            DeleteObject(black);
-            DrawContent(m_cov_a_dc, w, h, true);
-            DrawContent(m_cov_c_dc, w, h, true);
+            if (!m_preview || m_cov_dirty) {
+                RECT rc_all = { 0, 0, w, h };
+                HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
+                FillRect(m_cov_a_dc, &rc_all, white);
+                DeleteObject(white);
+                HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+                FillRect(m_cov_c_dc, &rc_all, black);
+                DeleteObject(black);
+                DrawContent(m_cov_a_dc, w, h, true);
+                DrawContent(m_cov_c_dc, w, h, true);
+                m_cov_dirty = false;
+            }
             ComposeLayeredSurface(w, h);
         }
         EndPaint(m_hwnd, &ps);

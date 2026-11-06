@@ -31,6 +31,7 @@ enum {
     IDC_EFFECT_CBO = 1060,    // 效果
     IDC_OPACITY_TRK,          // 不透明度滑条
     IDC_OPACITY_VAL,          // 不透明度数值
+    IDC_OPACITY_LBL,          // 不透明度标签（不透明档随滑条置灰）
     IDC_COLOR_CBO,            // 颜色模式
     IDC_SENSOR_CHK,           // 传感器摘要
     IDC_DEBUG_CHK,            // 调试日志
@@ -50,6 +51,7 @@ struct PtDlgState {
     std::vector<I18n::LangInfo> langs;      // 语言列表副本（CB_SETITEMDATA 存其元素指针，模态期内稳定）
     // 外观三项打开时快照：取消还原用（方案 §6 定案）
     int snap_color_mode = 0, snap_effect = 0, snap_opacity = 100;
+    int preview_color = -1;   // 预览实例当前颜色模式（变化时置双底脏）
     bool changed = false;
 } g_st;
 
@@ -61,6 +63,15 @@ int Sc(int v) { return (int)(v * g_st.dpi); }
 int PtClampEffectForOS(int eff) {
     if ((eff == 0 || eff == 2) && !PTM_IsAccentBlurSupported()) return 1;
     return eff;
+}
+
+// 不透明档无浓度概念：滑条行整体置灰（PNM OptionsUpdateOpacityEnabled
+// 同款——拖了无效的控件不如禁用，状态可见）
+void PtUpdateOpacityEnabled(HWND hwnd, int eff) {
+    BOOL enable = (eff != 3);
+    EnableWindow(GetDlgItem(hwnd, IDC_OPACITY_TRK), enable);
+    EnableWindow(GetDlgItem(hwnd, IDC_OPACITY_VAL), enable);
+    EnableWindow(GetDlgItem(hwnd, IDC_OPACITY_LBL), enable);
 }
 
 // ---- 预览实例（无可见悬浮窗时的外观反馈，PNM COpacityPreview 的 PTM
@@ -85,21 +96,44 @@ void PtPreviewEnsure(HWND hDlg, int color_mode, int effect, int opacity) {
         }
         g_preview->LoadDemoSnapshot(plugin.m_settings.default_metric);
     }
-    g_preview->SetAppearance(color_mode, effect, opacity);
-    // 已可见时的外观变化：SetAppearance→ApplyBackdrop 在效果/浓度/主题
-    // 任一变化时自带重建 + InvalidateRect，幂等早退时无需重画——不必
-    // 显式重绘
-    if (!g_preview->IsVisible()) {
-        // 对话框右侧并排（放不下→左侧）；越界兜底交给 ShowAt 工作区 clamp
-        RECT rd, wa;
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-        GetWindowRect(hDlg, &rd);
-        int pw = (int)(300 * g_st.dpi);   // 粗算宽度（IO 合计双列略宽，clamp 兜住）
-        int gap = Sc(16);
-        int px = rd.right + gap;
-        if (px + pw > wa.right) px = rd.left - gap - pw;
-        g_preview->ShowAt(px, rd.top);
+    // 颜色模式变化 → 面板/文字色变 = 双底内容变化，置脏（浓度/效果档
+    // 由 ApplyBackdrop 自己置）
+    if (g_st.preview_color != color_mode) {
+        g_st.preview_color = color_mode;
+        g_preview->MarkContentDirty();
     }
+    g_preview->SetAppearance(color_mode, effect, opacity);
+    if (!g_preview->IsVisible()) {
+        // 定位（PNM 预览同款）：对话框右侧、与滑条行同水平线；右侧放不
+        // 下退左侧，越界兜底交给 ShowAt 工作区 clamp。仅本次显示会话首
+        // 帧定位——2s 自灭后重建重新定位，会话内（连续滑动/被拖走）不
+        // 重定位，用户拖放的位置保持到本会话结束
+        RECT rd, rt;
+        GetWindowRect(hDlg, &rd);
+        int line_cy = rd.top + (rd.bottom - rd.top) / 2;
+        HWND hTrack = GetDlgItem(hDlg, IDC_OPACITY_TRK);
+        if (hTrack && GetWindowRect(hTrack, &rt))
+            line_cy = (rt.top + rt.bottom) / 2;
+        int pw = (int)(300 * g_st.dpi);   // 粗算宽（IO 双列略宽，clamp 兜住）
+        int ph = (int)(316 * g_st.dpi);   // demo 8 行固定高的 96-DPI 基准
+        int gap = Sc(12);
+        int px = rd.right + gap;
+        int py = line_cy - ph / 2;
+        HMONITOR mon = MonitorFromWindow(hDlg, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfoW(mon, &mi)) {
+            const RECT& wa = mi.rcWork;
+            if (px + pw > wa.right) px = rd.left - gap - pw;
+            if (py + ph > wa.bottom) py = wa.bottom - ph;
+            if (py < wa.top) py = wa.top;
+            if (px < wa.left) px = wa.left;   // 两侧都放不下：贴左，宽交给 ShowAt clamp
+        }
+        g_preview->ShowAt(px, py);
+    }
+    // 每次滑动续 2s 自动收起（PNM TIMER_AUTOHIDE 同款语义；收起动作由
+    // 预览窗自己的 WM_TIMER 执行，拖动期间 KillTimer 也在窗口侧）
+    SetTimer(g_preview->GetHwnd(), CTopListWindow::PREVIEW_AUTOHIDE_TIMER,
+             2000, NULL);
 }
 
 void PtApplyAppearanceToAll(int color_mode, int effect, int opacity) {
@@ -392,7 +426,8 @@ void PtCreateControls(HWND hwnd) {
             if (st.popup_effect == i) SendMessageW(c5, CB_SETCURSEL, i, 0);
         }
         PtFont(c5);
-        PtFont(PtLabel(hwnd, TR(L"不透明度"), M + Sc(190), iy + Sc(4), Sc(56), Sc(20)));
+        HWND olbl = PtLabel(hwnd, TR(L"不透明度"), M + Sc(190), iy + Sc(4), Sc(56), Sc(20));
+        SetWindowLongPtrW(olbl, GWL_ID, IDC_OPACITY_LBL);   // 不透明档随滑条置灰
         HWND trk = CreateWindowW(TRACKBAR_CLASSW, L"",
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
             M + Sc(250), iy - Sc(2), Sc(160), Sc(26), hwnd,
@@ -431,6 +466,9 @@ void PtCreateControls(HWND hwnd) {
     }
     y += Sc(118) + Sc(16);
 
+    // 初始滑条行状态：不透明档无浓度概念，整行置灰（PNM 同款）
+    PtUpdateOpacityEnabled(hwnd, st.popup_effect);
+
     // ---- 确定 / 取消 ----
     HWND bok = CreateWindowW(L"BUTTON", TR(L"确定"),
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
@@ -455,6 +493,13 @@ void PtPreviewAppearance(HWND hwnd) {
     if (effect < 0) effect = g_st.snap_effect;
     if (color < 0) color = g_st.snap_color_mode;
     if (opacity < 10) opacity = g_st.snap_opacity;
+    // 不透明档：滑条行置灰 + 预览收起（无浓度可预览，PNM 同款）
+    PtUpdateOpacityEnabled(hwnd, effect);
+    if (effect == 3) {
+        if (g_preview) PtPreviewHide();
+        PtApplyAppearanceToAll(color, effect, opacity);   // 真窗口照常热切
+        return;
+    }
     if (WindowManager::Instance().GroupVisible()) {
         PtApplyAppearanceToAll(color, effect, opacity);
         if (g_preview) PtPreviewHide();   // 真窗口接管反馈，预览实例退场

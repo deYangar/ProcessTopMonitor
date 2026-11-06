@@ -92,6 +92,10 @@ public:
     // 上屏。不注册进 WindowManager——不占槽位/不进组布局/收不到刷新
     // 广播/不被收尸，生命周期归创建方（options_dialog）管
     void LoadDemoSnapshot(int kind);
+    // 预览双底缓存置脏（内容相关输入变化时由驱动方调；仅预览实例读）
+    void MarkContentDirty() { m_cov_dirty = true; }
+    // 预览 2s 自动收起 timer id（WM_TIMER wp；options_dialog 续期用）
+    static constexpr UINT_PTR PREVIEW_AUTOHIDE_TIMER = 3;
 
 private:
     // 快照 → 本窗显示数据的全套灌装（kind/io_view/topn 取本窗当前状态，
@@ -242,6 +246,7 @@ private:
     bool m_tracking = false;
     bool m_hovering = false;           // 光标在窗内（HoverTick over_group 信号）
     bool m_preview = false;            // 预览实例（LoadDemoSnapshot 置位）：交互全短路
+    bool m_cov_dirty = true;           // 预览双底缓存脏标志：内容恒定，仅主题/翻转/效果档切换置脏
     RECT m_rc_header = {};             // 头部条（拖动柄 + 命中测试）
     RECT m_rc_metric = {};             // 指标区（点击切换；单窗模式可点）
 
