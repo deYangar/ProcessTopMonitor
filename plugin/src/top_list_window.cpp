@@ -1450,6 +1450,12 @@ void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
         out[count++] = ToneGpuHidden;
 }
 
+int CTopListWindow::ValueAreaWidth() const {
+    if (m_kind == MetricKind::DiskIo && m_io_view == 0)
+        return VALUE_AREA_W * 2 + (int)(8 * m_dpi_scale);
+    return VALUE_AREA_W;
+}
+
 void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
     int rows = m_rows_has_value ? (int)m_rows.size() : 1;
@@ -1460,6 +1466,10 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     SelectObject(hdc, hOld);
 
     out_w = (int)(BASE_WIDTH * m_dpi_scale);
+    // 窗宽自适应（问题③）：合计视图双列值区加宽，名字列宽度不缩——
+    // 若值区吃名字列（300px 窗只剩 ~40px）进程名不可读
+    if (m_kind == MetricKind::DiskIo && m_io_view == 0)
+        out_w += VALUE_AREA_W + (int)(8 * m_dpi_scale);
     out_h = PADDING + HEADER_H + SUMMARY_H
             + status_lines * STATUS_H
             + rows * ROW_HEIGHT
@@ -1660,7 +1670,7 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
         swprintf_s(cnt, 16, L" \u00d7%d", row.count);
         name += cnt;
     }
-    int value_w = VALUE_AREA_W;
+    int value_w = ValueAreaWidth();
     int max_name_w = w - PADDING - value_w - x;
     SetTextColor(hdc, GetTextColor());
     SIZE sz;
@@ -1675,27 +1685,43 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
     RECT rc_name = { x, y, x + max_name_w, y + ROW_HEIGHT };
     DrawTextW(hdc, name.c_str(), -1, &rc_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    // 4) 数值（右对齐 accent）
-    wchar_t val[64] = L"--";
-    if (m_rows_has_value) {
-        switch (m_kind) {
-        case MetricKind::Mem:
-            FormatMem((uint64_t)row.value, val, 64);
-            break;
-        case MetricKind::DiskIo:
-            FormatSpeed(row.value, val, 64);
-            break;
-        case MetricKind::Vram:
-            FormatMem((uint64_t)row.value, val, 64);
-            break;
-        default:
-            swprintf_s(val, 64, L"%.1f%%", row.value);
-            break;
-        }
-    }
+    // 4) 数值（右对齐 accent；合计视图双列 ↓读 ↑写——问题③，箭头符号
+    //    沿用摘要行现款 \u2193/\u2191，各自 FormatSpeed 单位换算）
     SetTextColor(hdc, GetAccentColor());
-    RECT rc_val = { w - PADDING - value_w, y, w - PADDING, y + ROW_HEIGHT };
-    DrawTextW(hdc, val, -1, &rc_val, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    if (m_rows_has_value && m_kind == MetricKind::DiskIo && m_io_view == 0) {
+        wchar_t rv[32], wv[32];
+        FormatSpeed(row.io_read_bps, rv, 32);
+        FormatSpeed(row.io_write_bps, wv, 32);
+        wchar_t rd[48], wd[48];
+        swprintf_s(rd, 48, L"\u2193%s", rv);
+        swprintf_s(wd, 48, L"\u2191%s", wv);
+        int col_gap = (int)(8 * m_dpi_scale);
+        RECT rc_write = { w - PADDING - VALUE_AREA_W, y, w - PADDING, y + ROW_HEIGHT };
+        DrawTextW(hdc, wd, -1, &rc_write, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        RECT rc_read = { rc_write.left - col_gap - VALUE_AREA_W, y,
+                         rc_write.left - col_gap, y + ROW_HEIGHT };
+        DrawTextW(hdc, rd, -1, &rc_read, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    } else {
+        wchar_t val[64] = L"--";
+        if (m_rows_has_value) {
+            switch (m_kind) {
+            case MetricKind::Mem:
+                FormatMem((uint64_t)row.value, val, 64);
+                break;
+            case MetricKind::DiskIo:
+                FormatSpeed(row.value, val, 64);
+                break;
+            case MetricKind::Vram:
+                FormatMem((uint64_t)row.value, val, 64);
+                break;
+            default:
+                swprintf_s(val, 64, L"%.1f%%", row.value);
+                break;
+            }
+        }
+        RECT rc_val = { w - PADDING - value_w, y, w - PADDING, y + ROW_HEIGHT };
+        DrawTextW(hdc, val, -1, &rc_val, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    }
 
     // 5) 分隔线
     HPEN hOldPen = (HPEN)SelectObject(hdc, m_pen_separator);

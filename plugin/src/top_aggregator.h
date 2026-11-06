@@ -22,6 +22,11 @@ struct TopRow {
     DWORD pid = 0;           // representative pid (largest contributor)
     int count = 1;           // merged process count (chrome.exe × 12 etc.)
     double value = 0;
+    // DiskIo 行的读/写速率拆分（问题③合计视图双列显示用；数据层
+    // per_pid 本就 {read,write} 独立累计，这里只是 passthrough。
+    // 其他维度恒 0；io 合计视图 value = max(read,write)（排序键））
+    double io_read_bps = 0;
+    double io_write_bps = 0;
 };
 
 struct MetricView {

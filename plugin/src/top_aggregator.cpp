@@ -143,7 +143,7 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     if (n < 3) n = 3;
     if (n > 15) n = 15;
 
-    auto fill = [&](MetricView& v, auto getter, bool has_value) {
+    auto fill = [&](MetricView& v, auto getter, bool has_value, auto aux) {
         v.has_value = has_value;
         if (!has_value) return;
         std::vector<const Acc*> list;
@@ -162,23 +162,33 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             r.pid = list[i]->main_pid;
             r.count = list[i]->count;
             r.value = getter(list[i]);
+            aux(list[i], r);
             v.rows.push_back(std::move(r));
         }
     };
+    auto no_aux = [](const Acc*, TopRow&) {};
 
     bool has_delta = !m.first;
-    fill(out.cpu, [](const Acc* a) { return a->cpu; }, has_delta);
-    fill(out.mem, [](const Acc* a) { return (double)a->mem; }, true);
-    fill(out.io, [](const Acc* a) { return a->io_r + a->io_w; }, has_delta);
-    fill(out.io_read, [](const Acc* a) { return a->io_r; }, has_delta);
-    fill(out.io_write, [](const Acc* a) { return a->io_w; }, has_delta);
+    fill(out.cpu, [](const Acc* a) { return a->cpu; }, has_delta, no_aux);
+    fill(out.mem, [](const Acc* a) { return (double)a->mem; }, true, no_aux);
+    // 合计视图（问题③）：排序键 = max(read, write)——纯读/纯写大户不被
+    // 双边合计淹没，与「读写分开显示」的意图自洽；r/w 拆分随行带出供
+    // 双列显示（仅读/仅写子视图维持单列，排序键照旧单边）
+    fill(out.io, [](const Acc* a) { return std::max(a->io_r, a->io_w); },
+         has_delta,
+         [](const Acc* a, TopRow& r) {
+             r.io_read_bps = a->io_r;
+             r.io_write_bps = a->io_w;
+         });
+    fill(out.io_read, [](const Acc* a) { return a->io_r; }, has_delta, no_aux);
+    fill(out.io_write, [](const Acc* a) { return a->io_w; }, has_delta, no_aux);
     bool gpu_ok = gpu && gpu->util_valid;
     bool vram_ok = gpu && gpu->mem_valid;
-    fill(out.gpu, [](const Acc* a) { return a->gpu; }, gpu_ok);
+    fill(out.gpu, [](const Acc* a) { return a->gpu; }, gpu_ok, no_aux);
     fill(out.vram, [&](const Acc* a) {
         return (double)(cfg.vram_with_shared ? a->vram_ded + a->vram_shared
                                              : a->vram_ded);
-    }, vram_ok);
+    }, vram_ok, no_aux);
 
     // totals for the summary line
     if (etw_exact) {

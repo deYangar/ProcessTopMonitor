@@ -119,6 +119,10 @@ private:
     void DrawStatusLine(HDC hdc, int w, int y, StatusTone tone);
     // 当前实际显示的状态行清单（布局/绘制/菜单判定共用，保持一致）
     void ActiveStatusLines(StatusTone out[4], int& count) const;
+    // 值区宽（问题③）：磁盘 IO 合计视图双列（↓读 ↑写）= 2×单列 + 8×DPI
+    // 列间距；其余视图单列。DrawRow 名字列缩减与 CalcLayout 窗宽联动
+    // 都以此为单一事实源
+    int ValueAreaWidth() const;
     void Reposition();                       // clamp to work area, show
     void OnPaint();
 
