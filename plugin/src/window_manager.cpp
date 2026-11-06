@@ -371,6 +371,55 @@ void WindowManager::EnsureHoverTimer() {
     if (m_windows.empty()) return;
     HWND h = m_windows[0]->GetHwnd();
     if (h && IsWindow(h)) SetTimer(h, 2, 100, nullptr);   // 幂等：同 id 重设
+    EnsureWatchdog();
+}
+
+// ---- 子类化看门狗（M6 §4.3.4，照抄 PNM :572-587 + :87-95）----
+
+void WindowManager::EnsureWatchdog() {
+    // message-only 窗（HWND_MESSAGE）+ 原生注册 proc（不经 GWLP_WNDPROC
+    // 安装，EnumWindows 注入器扫描不可见）+ 1s timer。与组长窗同线程
+    // 创建：WM_TIMER 及修复都跑在属主线程——从属主线程修复子类化是
+    // 文档安全路径
+    if (m_watchdog_hwnd) return;
+    HINSTANCE inst = s_dll_hinst ? s_dll_hinst : (HINSTANCE)GetModuleHandleW(nullptr);
+    wchar_t cls[64];
+    swprintf_s(cls, 64, L"PTMWatchdog_%p", inst);
+    WNDCLASSEXW wcExist = {};
+    wcExist.cbSize = sizeof(wcExist);
+    if (!GetClassInfoExW(inst, cls, &wcExist)) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = WatchdogProc;
+        wc.hInstance = inst;
+        wc.lpszClassName = cls;
+        RegisterClassExW(&wc);
+    }
+    m_watchdog_hwnd = CreateWindowExW(0, cls, L"", WS_OVERLAPPED,
+                                      0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
+    if (m_watchdog_hwnd) SetTimer(m_watchdog_hwnd, 3, 1000, nullptr);
+}
+
+LRESULT CALLBACK WindowManager::WatchdogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TIMER && wp == 3) {
+        if (g_shutting_down) return 0;   // DLL 卸载期跳过修复
+        auto& mgr = Instance();
+        if (!mgr.m_windows.empty()) {
+            HWND leader = mgr.m_windows[0]->GetHwnd();
+            if (leader && IsWindow(leader) &&
+                GetWindowLongPtrW(leader, GWLP_WNDPROC) !=
+                    (LONG_PTR)CTopListWindow::StaticWndProc) {
+                // 子类化被外部注入器剥掉：hover WM_TIMER 正被派发到
+                // DefWindowProc（或注入器 proc），HoverTick 已死——重装
+                // proc + timer（弹窗永不消失的隐患治本）
+                SetWindowLongPtrW(leader, GWLP_WNDPROC,
+                                  (LONG_PTR)CTopListWindow::StaticWndProc);
+                SetTimer(leader, 2, 100, nullptr);
+            }
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 // ============================================================

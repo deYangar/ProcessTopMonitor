@@ -262,12 +262,57 @@ void CTopItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode) {
 }
 
 int CTopItem::OnMouseEvent(MouseEventType type, int x, int y, void* hWnd, int flag) {
-    (void)x; (void)y; (void)flag;
-    if (type == MT_LCLICKED) {
-        CProcessTopPlugin::Instance().ToggleTopListWindow((HWND)hWnd);
+    // M6 §4.3.3（抄 PNM :373-412）：任务栏点击 = pin/unpin；主悬浮窗点击 =
+    // hover 态手动切换
+    if (type != MT_LCLICKED) return 0;
+    CProcessTopPlugin& plugin = CProcessTopPlugin::Instance();
+    auto& mgr = WindowManager::Instance();
+    bool is_taskbar = (flag & MF_TASKBAR_WND) != 0;
+
+    if (is_taskbar) {
+        if (plugin.m_settings.popup_mode == 1) {
+            // 常驻模式：点任务栏 item = 临时取消常驻（HideGroup），再点
+            // 恢复——语义与 hover 模式的 pin 对称（M6 §4.3.3）
+            if (mgr.GroupVisible()) {
+                mgr.HideGroup();
+            } else {
+                if (mgr.Count() == 0) plugin.RebuildDefaultWindow();
+                mgr.ShowGroupAt(plugin.GetStartupAnchor());
+            }
+            return 1;
+        }
+        if (mgr.GroupVisible() && plugin.m_group_pinned) {
+            // 再点 = 取消 pin + 收回（回 hover 态）
+            plugin.m_group_pinned = false;
+            mgr.HideGroup();
+        } else {
+            if (mgr.Count() == 0) plugin.RebuildDefaultWindow();
+            // 锚 = 点击点 ±60px 带（ClientToScreen + GetWindowRect 钳位，
+            // PNM :389-397 写法照抄）
+            POINT pt = { x, y };
+            ClientToScreen((HWND)hWnd, &pt);
+            RECT wr;
+            GetWindowRect((HWND)hWnd, &wr);
+            int half = 60;
+            RECT anchor = { pt.x - half, wr.top, pt.x + half, wr.bottom };
+            if (anchor.left < wr.left) { anchor.left = wr.left; anchor.right = wr.left + 2 * half; }
+            if (anchor.right > wr.right) { anchor.right = wr.right; anchor.left = wr.right - 2 * half; }
+            plugin.m_group_pinned = true;
+            mgr.ShowGroupAt(anchor);   // pin 态不挂锚跟随、宽限逻辑跳过
+        }
         return 1;
     }
-    return 0;
+    // 主悬浮窗：hover 态手动切换（GroupVisible ? Hide : Show；M6 §4.3.3）
+    plugin.m_group_pinned = false;
+    if (mgr.GroupVisible()) {
+        mgr.HideGroup();
+    } else {
+        if (mgr.Count() == 0) plugin.RebuildDefaultWindow();
+        RECT anchor;
+        GetWindowRect((HWND)hWnd, &anchor);
+        mgr.ShowGroupAt(anchor, (HWND)hWnd);
+    }
+    return 1;
 }
 
 // ============================================================
@@ -361,6 +406,66 @@ static HWND PtFindTMMainWindow() {
         return TRUE;
     }, (LPARAM)&ctx);
     return ctx.found;
+}
+
+// Classify the TM window under the cursor: floating main window or taskbar
+// window. Returns nullptr when the cursor is not over any TrafficMonitor
+// window. （M6 §4.3.1，照抄 PNM :1187-1218——先查自身再走 parent 链，
+// 否则 FindTMWindowInChain 返回 parent（主窗）丢任务栏上下文）
+static HWND DetectTMWindow(HWND hover_wnd, bool& is_taskbar) {
+    is_taskbar = false;
+    if (!hover_wnd) return nullptr;
+
+    // TM's taskbar window is an MFC dialog with class "#32770" and window
+    // text "TrafficMonitorTaskbarWindow". Its parent is the main TM window.
+    wchar_t wnd_text[256] = {};
+    GetWindowTextW(hover_wnd, wnd_text, 256);
+    wchar_t hover_cls[64] = {};
+    GetClassNameW(hover_wnd, hover_cls, 64);
+
+    if (wcsstr(wnd_text, L"TrafficMonitorTaskbarWindow") != nullptr ||
+        (wcscmp(hover_cls, L"#32770") == 0 && wcsstr(wnd_text, L"TrafficMonitor") != nullptr)) {
+        HWND parent = GetParent(hover_wnd);
+        if (parent) {
+            wchar_t pcls[64] = {};
+            GetClassNameW(parent, pcls, 64);
+            if (wcsncmp(pcls, L"TrafficMonitor", 14) == 0) {
+                is_taskbar = true;
+                return parent;   // 返回主窗句柄（锚/跟随目标）
+            }
+        }
+    }
+    HWND tm = FindTMWindowInChain(hover_wnd);
+    if (!tm) return nullptr;
+    if (IsTMTaskbarWindow(tm)) { is_taskbar = true; return tm; }
+    if (IsTMMainWindow(tm)) return tm;
+    return nullptr;
+}
+
+// True while a menu opened by this thread (TrafficMonitor's right-click
+// menu) is tracking. Our popup windows live on TM's UI thread, so querying
+// thread 0 (current) reports exactly TM's menu state - a hard signal that
+// does not depend on where the cursor sits. （M6 §4.3.1，抄 PNM :351-356）
+static bool IsTMMenuMode() {
+    GUITHREADINFO gti = { sizeof(GUITHREADINFO) };
+    if (!GetGUIThreadInfo(0, &gti)) return false;
+    return (gti.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0 ||
+           gti.hwndMenuOwner != nullptr;
+}
+
+// Hide TM's native tooltip windows right now (same thing CToolTipCtrl::Pop
+// does). Upstream pops them synchronously only in the taskbar window's
+// right-click handler; the main window relies on a 1 s timer, so its
+// tooltip can sit on top of the context menu for up to a second.
+// （M6 §4.3.1，抄 PNM :363-371）
+static void PopTMTooltips() {
+    HWND hwnd = nullptr;
+    while ((hwnd = FindWindowExW(nullptr, hwnd, L"tooltips_class32", nullptr)) != nullptr) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId())
+            SendMessageW(hwnd, TTM_POP, 0, 0);
+    }
 }
 
 RECT CProcessTopPlugin::GetStartupAnchor() {
@@ -553,27 +658,137 @@ void CProcessTopPlugin::ApplyGpuScope(const GpuScopeConfig& cfg) {
     m_gpu.Configure(cfg);
 }
 
-void CProcessTopPlugin::ToggleTopListWindow(HWND parent) {
-    // C3 过渡版（C4 由 CTopItem::OnMouseEvent 的 pin 语义取代）：
-    // 空组重建默认窗（default_metric，M6 §4.2.5）+ 组显隐切换
+// ============================================================
+// hover 状态机 + pin（M6 §4.3.2/§4.3.3，照抄 PNM :1305-1400 全语义，
+// popup→group 替换）
+// ============================================================
+
+void CProcessTopPlugin::RebuildDefaultWindow() {
+    // 全部窗销毁后 item 点击重建默认窗（kind=default_metric，M6 §4.2.5）
     auto& mgr = WindowManager::Instance();
-    if (mgr.Count() == 0) {
-        WindowCfg def;
-        def.kind = m_settings.default_metric;
-        def.topn = m_settings.topn;
-        def.io_view = m_settings.io_view;
-        mgr.AddWindow(def);
-        m_settings_dirty = true;
-    }
-    if (mgr.GroupVisible()) {
+    if (mgr.Count() != 0) return;
+    WindowCfg def;
+    def.kind = m_settings.default_metric;
+    def.topn = m_settings.topn;
+    def.io_view = m_settings.io_view;
+    mgr.AddWindow(def);
+    m_settings_dirty = true;
+}
+
+void CProcessTopPlugin::PinGroup(const RECT* anchor_for_show) {
+    // pin 翻转（任务栏 item / 菜单 360 共用，M6 §4.3.3/§4.6）：
+    // pinned → 取消 pin + 收回（回 hover 态）；未 pin → pin=true
+    // （组不可见时按 anchor 弹出；已可见就地固定并卸锚跟随）
+    auto& mgr = WindowManager::Instance();
+    if (m_group_pinned) {
+        m_group_pinned = false;
         mgr.HideGroup();
     } else {
-        RECT anchor;
-        if (parent && IsWindow(parent) && GetWindowRect(parent, &anchor))
-            mgr.ShowGroupAt(anchor);
-        else
-            mgr.ShowGroupAt(GetStartupAnchor());
+        m_group_pinned = true;
+        if (!mgr.GroupVisible() && anchor_for_show) {
+            mgr.ShowGroupAt(*anchor_for_show);   // pin 态不挂锚跟随
+        } else {
+            mgr.DetachAnchorTracker();   // 已可见：就地固定
+        }
     }
+}
+
+void CProcessTopPlugin::HoverTick() {
+    // 100ms WM_TIMER（id=2）挂组长窗；组隐藏时窗口 SW_HIDE 不停 timer。
+    // 常驻模式（popup_mode==1）无 hover 逻辑——常驻组常显，item 点击的
+    // 对称取消语义见 OnMouseEvent
+    if (m_settings.popup_mode == 1) return;
+    auto& mgr = WindowManager::Instance();
+    if (mgr.Count() == 0) return;   // 无窗可弹（hover 无处显示直到 item 重建）
+
+    // 1. TM 右键菜单打开：立即隐藏（无宽限，菜单绝不与弹窗同屏，pin 态
+    // 也让位）+ 清 hover 状态 + Pop 原生 tooltip（防其盖菜单）
+    if (IsTMMenuMode()) {
+        if (mgr.GroupVisible()) {
+            m_group_pinned = false;
+            mgr.HideGroup();
+        }
+        m_hover_target = nullptr;
+        m_hover_start_tick = 0;
+        m_hover_leave_tick = 0;
+        PopTMTooltips();   // idempotent；covers the main window's 1s gap
+        return;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    POINT pt;
+    GetCursorPos(&pt);
+    HWND hover_wnd = WindowFromPoint(pt);
+
+    // 2. over_group：光标窗 == 任一 PTM 窗，或组内 TrackMouseEvent
+    //    leave 信号（光标短暂离开窗口矩形时窗口仍是 hover 目标）
+    bool over_group = false;
+    for (int i = 0; i < mgr.Count() && !over_group; i++) {
+        CTopListWindow* w = mgr.At(i);
+        if (!w) continue;
+        if (hover_wnd && hover_wnd == w->GetHwnd()) over_group = true;
+        else if (w->IsHovering()) over_group = true;
+    }
+    bool is_taskbar = false;
+    HWND tm_wnd = DetectTMWindow(hover_wnd, is_taskbar);
+
+    // 3. show / hide 状态机
+    if (tm_wnd) {
+        // 光标在 TM 窗上：清离开计时；换目标窗重置 hover 起点
+        m_hover_leave_tick = 0;
+        if (tm_wnd != m_hover_target) {
+            m_hover_target = tm_wnd;
+            m_hover_is_taskbar = is_taskbar;
+            m_hover_start_tick = now;
+        }
+        if (!mgr.GroupVisible() && !m_group_pinned &&
+            now - m_hover_start_tick >= 400) {
+            RECT anchor;
+            if (is_taskbar) {
+                // 任务栏 → 光标 ±60px 锚带（用任务栏对话框 rect——parent
+                // 主窗在桌面不在任务栏；PNM :1349-1358 钳位写法照抄）
+                RECT wr;
+                GetWindowRect(hover_wnd, &wr);
+                int half = 60;
+                anchor = { pt.x - half, wr.top, pt.x + half, wr.bottom };
+                if (anchor.left < wr.left) { anchor.left = wr.left; anchor.right = wr.left + 2 * half; }
+                if (anchor.right > wr.right) { anchor.right = wr.right; anchor.left = wr.right - 2 * half; }
+            } else {
+                GetWindowRect(tm_wnd, &anchor);   // 主悬浮窗 → 整窗 rect
+            }
+            mgr.ShowGroupAt(anchor, is_taskbar ? nullptr : tm_wnd);
+        }
+    } else if (!over_group) {
+        // 光标在别处：组可见且未 pin → 300ms 宽限后隐藏（宽限期内回去
+        // 取消）；组不可见 → 清 hover 目标
+        m_hover_start_tick = 0;
+        if (mgr.GroupVisible() && !m_group_pinned) {
+            if (m_hover_leave_tick == 0) {
+                m_hover_leave_tick = now;
+            } else if (now - m_hover_leave_tick >= 300) {
+                mgr.HideGroup();
+                m_hover_target = nullptr;
+            }
+        } else if (!mgr.GroupVisible()) {
+            m_hover_target = nullptr;
+        }
+    } else {
+        // 光标在弹窗上：保持显示
+        m_hover_leave_tick = 0;
+    }
+
+    // 4. 锚 reconcile：组可见且未 pin 且非任务栏锚 → 子类化锚窗跟随；
+    //    否则卸载（pin/换目标在此每 tick 收敛；事件路径经回调同步回写
+    //    m_popup_anchor，子类化被注入器剥掉时轮询兜底接管）
+    {
+        HWND follow_wnd = nullptr;
+        if (mgr.GroupVisible() && !m_group_pinned && m_hover_target &&
+            !m_hover_is_taskbar && IsWindow(m_hover_target))
+            follow_wnd = m_hover_target;
+        mgr.SetAnchorFollow(follow_wnd);
+    }
+    // 组可见期间数据刷新：WM_PTM_REFRESH 投递管线不变（轻量：锚没动
+    // 不重排）
 }
 
 void CProcessTopPlugin::SaveSettingsIfDirty() {

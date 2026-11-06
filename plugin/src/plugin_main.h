@@ -63,7 +63,6 @@ public:
 
     // ---- UI thread entry points (called from the top-list window) ----
     void TopListRefreshFromSnapshot();   // WM_PTM_REFRESH handler
-    void ToggleTopListWindow(HWND parent);   // C3 过渡：C4 由 item pin 语义取代
     void SaveSettingsIfDirty();
     void ApplySettingsToCollectors();    // memory basis / GPU scope / debug logs
     void SaveWindowConfigsNow();         // 拖动结束等即时落盘路径（缺陷①修复）
@@ -83,13 +82,18 @@ public:
     FileIoGrade RetryFileIoSession() { return m_etw.Start(); }     // 幂等重试
     void GetIoStatusForDialog(wchar_t* out, size_t cap);           // 档位文案 + 丢事件
 
-    // ---- M6 hover/pin 状态（UI 线程；§4.3.2 状态字段照 PNM 命名）----
+    // ---- M6 hover 状态机 + pin（UI 线程；§4.3.2 状态字段照 PNM 命名）----
     bool GroupPinned() const { return m_group_pinned; }
+    // 常驻/pin 态弹窗可拖（§4.1.3：hover 态恒 HTCLIENT 跟锚不可拖）
+    bool GroupDraggable() const { return m_settings.popup_mode == 1 || m_group_pinned; }
     HWND m_hover_target = nullptr;       // 当前 hover 的 TM 窗（主窗句柄）
     bool m_hover_is_taskbar = false;     // 目标是否任务栏上下文（锚带跟随）
     ULONGLONG m_hover_start_tick = 0;    // hover 计时起点（400ms 阈值）
     ULONGLONG m_hover_leave_tick = 0;    // 离开宽限起点（300ms）
     bool m_group_pinned = false;         // pin：hover/常驻间临时切换
+    void HoverTick();                    // 100ms 状态机（组长窗 timer id=2 驱动）
+    void PinGroup(const RECT* anchor_for_show);   // pin 翻转（item/菜单 360 共用）
+    void RebuildDefaultWindow();         // windows 空时 item 点击重建默认窗
     // 常驻启动/pin 恢复的布局锚：TM 主窗 rect（枚举查找），找不到用
     // 主屏工作区兜底（M6 §4.2.4）
     RECT GetStartupAnchor();

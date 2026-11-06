@@ -76,6 +76,12 @@ public:
 private:
     WindowManager() = default;
     static LRESULT CALLBACK AnchorProc(HWND, UINT, WPARAM, LPARAM);
+    // 子类化看门狗（M6 §4.3.4，照抄 PNM tooltip_popup.cpp:572-587+:87-95）：
+    // message-only 窗 + 原生注册 proc + 1s timer，发现组长窗 wndproc 被
+    // 外部注入器剥掉 → 重装（防 hover timer 静默死亡导致弹窗永不消失）
+    static LRESULT CALLBACK WatchdogProc(HWND, UINT, WPARAM, LPARAM);
+    void EnsureWatchdog();
+    HWND m_watchdog_hwnd = nullptr;
     std::vector<std::unique_ptr<CTopListWindow>> m_windows;
     std::atomic<int> m_bound_mask{0};
     int m_cascade = 0;   // 级联偏移计数（新窗位置 = 工作区 10% 处 + 28*n）

@@ -358,6 +358,9 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             ResolvePendingPaths();
             if (PumpIconExtraction(2))
                 InvalidateRect(m_hwnd, nullptr, FALSE);
+        } else if (wp == 2) {
+            // hover 状态机 tick（挂组长窗，M6 §4.3.2；组隐藏不停 timer）
+            CProcessTopPlugin::Instance().HoverTick();
         }
         return 0;
 
@@ -440,9 +443,12 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(m_hwnd, msg, wp, lp);
 
     case WM_NCHITTEST: {
-        // 头部条 = 拖动柄（HTCAPTION 系统托管拖动，ULW 下同样工作）；
-        // 单窗模式指标区让给点击切换（M6 §4.1.2/§4.1.3），多窗模式整
-        // 头部条可拖（本窗固定指标，无切换控件）；其余 = 客户区
+        // 常驻/pin 态：头部条 = 拖动柄（HTCAPTION 系统托管拖动，ULW 下
+        // 同样工作），单窗模式指标区让给点击切换、多窗模式整头部条可拖
+        // （本窗固定指标，无切换控件）。hover 态（未 pin）：恒 HTCLIENT
+        // ——不可拖，跟锚（M6 §4.1.3）
+        if (!CProcessTopPlugin::Instance().GroupDraggable())
+            return HTCLIENT;
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         ScreenToClient(m_hwnd, &pt);
         bool multi = CProcessTopPlugin::Instance().m_settings.multi_window;
@@ -508,15 +514,35 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             m_topn = m_cfg.topn;
             RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
-        } else if (id == 310) {
-            // 新建悬浮窗：复制当前窗 cfg 作起点，位置改级联（方案 §4）
-            WindowCfg c = m_cfg;
-            c.x = INT_MIN;
-            c.y = INT_MIN;
-            WindowManager::Instance().AddWindow(c);
-            CProcessTopPlugin::Instance().m_settings_dirty = true;
-        } else if (id == 300) {
+        } else if (id >= 320 && id <= 324) {
+            // 添加窗口（M6 §4.6）：kind 映射 320..324 → Cpu/Mem/DiskIo/
+            // Gpu/Vram；当前单窗且窗数将 >1 → 自动进入多窗；组可见时
+            // 重排全组让新窗上屏
+            static const int kinds[5] = { 0, 1, 2, 5, 6 };
+            auto& plugin = CProcessTopPlugin::Instance();
+            auto& mgr = WindowManager::Instance();
+            WindowCfg c;
+            c.kind = kinds[id - 320];
+            c.topn = plugin.m_settings.topn;       // 新窗默认行数/视图
+            c.io_view = plugin.m_settings.io_view; // （x/y=INT_MIN：组布局摆位）
+            if (mgr.AddWindow(c) >= 0) {
+                if (!plugin.m_settings.multi_window && mgr.Count() > 1)
+                    plugin.m_settings.multi_window = true;   // 自动转多窗
+                plugin.m_settings_dirty = true;
+                if (mgr.GroupVisible())
+                    mgr.ShowGroupAt(mgr.AnchorRect());
+            }
+        } else if (id == 350 || id == 300) {
+            // 移除此窗口（350，多窗且窗数>1）与关闭悬浮窗（300）：单窗
+            // 模式 300 = 销毁整个窗组（单窗组即本窗），多窗 300 = 等同
+            // 350 = 销毁本窗——都销毁自己。异步 WM_CLOSE（× 钮同路径）：
+            // 窗口自己的消息处理栈里同步 erase 对象是 use-after-free，
+            // Destroy() 保留死句柄由 ReclaimDead 收尸（既有安全机制）
             PostMessage(m_hwnd, WM_CLOSE, 0, 0);
+            CProcessTopPlugin::Instance().m_settings_dirty = true;
+        } else if (id == 360) {
+            // 固定/取消固定（M6 §4.6）：与点任务栏 item 同一函数
+            CProcessTopPlugin::Instance().PinGroup(nullptr);
         }
         // GPU 口径菜单（400 全部 / 410+N 引擎 toggle / 500 截断开关）由
         // BuildContextMenu 直接处理（toggle 后需重开菜单刷新勾选态）
@@ -624,7 +650,7 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"GPU 口径"));
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
-        // 行数（每窗独立）+ 新建悬浮窗（多窗模式，方案 §4）
+        // 行数（每窗独立，恒显；M6 §4.6）
         {
             HMENU sub_rows = CreatePopupMenu();
             const int rows_n[3] = { 5, 10, 15 };
@@ -637,16 +663,36 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             }
             AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub_rows, TR(L"行数"));
         }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        // 添加窗口子菜单（恒显；达 6 窗灰显整组，M6 §4.6）：当前单窗且
+        // 添加后窗数 >1 → 自动进入多窗
         {
             auto& mgr = WindowManager::Instance();
-            AppendMenuW(menu, MF_STRING | (mgr.Count() >= CTopListWindow::MAX_WINDOWS
-                                               ? MF_GRAYED : 0),
-                        310, TR(L"新建悬浮窗"));
+            bool full = mgr.Count() >= CTopListWindow::MAX_WINDOWS;
+            HMENU sub_add = CreatePopupMenu();
+            struct { UINT id; const wchar_t* label; } adds[] = {
+                { 320, L"CPU" },
+                { 321, L"内存" },
+                { 322, L"磁盘 IO" },
+                { 323, L"GPU" },
+                { 324, L"显存" },
+            };
+            for (auto& a : adds)
+                AppendMenuW(sub_add, MF_STRING | (full ? MF_GRAYED : 0),
+                            a.id, TR(a.label));
+            AppendMenuW(menu, MF_POPUP | (full ? MF_GRAYED : 0),
+                        (UINT_PTR)sub_add, TR(L"添加窗口"));
         }
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        // 停靠子菜单已随 dock_manager 整体移除（M6 §4.4：WinEventHook
-        // 职责由锚子类化完整替代）
-        AppendMenuW(menu, MF_STRING, 300, TR(L"关闭"));
+        // 移除此窗口（多窗且窗数 >1；M6 §4.6 350）
+        if (multi && WindowManager::Instance().Count() > 1)
+            AppendMenuW(menu, MF_STRING, 350, TR(L"移除此窗口"));
+        // 关闭悬浮窗（恒显；M6 §4.6 300）：单窗 = 销毁整个窗组（windows
+        // 清空→采集停，item 可重建）；多窗 = 等同 350
+        AppendMenuW(menu, MF_STRING, 300, TR(L"关闭悬浮窗"));
+        // 固定/取消固定（恒显；M6 §4.6 360）：与点任务栏 item 同一函数
+        AppendMenuW(menu, MF_STRING, 360,
+                    TR(CProcessTopPlugin::Instance().GroupPinned()
+                           ? L"取消固定" : L"固定"));
         // 「关闭」任何窗数可用：最后一窗 × = 退出悬浮窗模式（item 保留），
         // 单窗/多窗同一语义（方案 §3.2 关闭语义表）
         SetForegroundWindow(m_hwnd);
