@@ -1437,9 +1437,15 @@ void CTopListWindow::Hide() {
 }
 
 void CTopListWindow::Reposition() {
-    // 内部重排（尺寸变化/指标切换，M6 §4.1.5）：以当前位置为基，
-    // clamp 与成对显示统一走 ShowAt
+    // 内部重排（尺寸变化/指标切换，M6 §4.1.5）：只服务已可见窗。
+    // 隐藏窗不上屏——启动链 AddWindow→ApplyCfg→RecalcAndRepaint 曾把
+    // 按设计应保持隐藏的窗 SWP_SHOWWINDOW 拉起（级联位≈左上角闪现），
+    // hover 状态机 300ms 后又收回。显示只由组显示路径
+    // （ShowGroupAt/LayoutGroup → ShowAt 顶层）驱动，与
+    // UpdateFromSnapshot 的 !m_visible 早退同一条纪律（问题⑤治本）。
+    // 常驻模式不受影响——InitOnce 常驻分支自己走 ShowGroupAt 显示
     if (!m_hwnd || !IsWindow(m_hwnd)) return;
+    if (!m_visible) return;
     RECT rc;
     GetWindowRect(m_hwnd, &rc);
     ShowAt(rc.left, rc.top);
