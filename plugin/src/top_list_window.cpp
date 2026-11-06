@@ -276,10 +276,9 @@ COLORREF CTopListWindow::GetTextColor() {
     return UseTextTheme() ? RGB(240, 240, 240) : RGB(30, 30, 30);
 }
 
-// 指标 accent 色（排行数值/标题），深浅两变体跟文字主题。
-// CPU 青蓝 / 内存 紫 / IO 橙 / GPU 绿 / 显存 天蓝（一眼辨指标）
-COLORREF CTopListWindow::GetAccentColor() {
-    bool light = UseTextTheme();
+// 指标 accent 色板单变体（浅/深）。CPU 青蓝 / 内存 紫 / IO 橙 /
+// GPU 绿 / 显存 天蓝（一眼辨指标）
+COLORREF CTopListWindow::AccentVariant(bool light) {
     switch (m_kind) {
     case MetricKind::Mem:
         return light ? RGB(200, 150, 255) : RGB(160, 100, 220);
@@ -292,6 +291,39 @@ COLORREF CTopListWindow::GetAccentColor() {
     default:
         return light ? RGB(90, 190, 255) : RGB(60, 160, 230);
     }
+}
+
+// 指标 accent 色（排行数值/标题用）。三段：
+// 1) 深浅变体跟文字主题（UseTextTheme）起底；
+// 2) 右值区独立翻转（PNM m_speed_flip 适配）：数值列背景亮度与左列
+//    不同（透明/低浓度档透出的桌面内容左右各异），RefreshBackdrop 按
+//    右值区中位亮度独立判定要不要用另一变体——标题与数值同调用同
+//    翻转，颜色恒一致（PNM 2026-10-18 拍板同款）；
+// 3) 对比保障推离（PNM 2026-10-18 顺修）：背景亮度落在所选变体 ±45
+//    内（中灰过渡带——低浓度+系统压暗后的典型产物）时彩字发灰「没有
+//    高亮」。等比缩放 RGB（色相/饱和度不变，只动亮度）推离背景到差
+//    ≥45；背景亮于字 → 压到比背景暗 45（无上限），暗于字 → 提到比
+//    背景亮 45（单通道 clamp 255 后如实到顶）。基准优先右值区 sbg
+//    （数值实际所在背景），无独立判定数据时退整窗 m_bg_lum
+COLORREF CTopListWindow::GetAccentColor() {
+    bool light = UseTextTheme();
+    if (m_accent_flip) light = !light;
+    COLORREF c = AccentVariant(light);
+
+    double base = m_accent_bg_lum >= 0.0 ? m_accent_bg_lum : m_bg_lum;
+    if (base >= 0.0) {
+        double cl = (299.0 * GetRValue(c) + 587.0 * GetGValue(c)
+                     + 114.0 * GetBValue(c)) / 1000.0;
+        double diff = base - cl;
+        if (fabs(diff) < 45.0) {
+            double target = (diff >= 0.0) ? base - 45.0 : base + 45.0;
+            double k = target / cl;
+            c = RGB((int)std::min(255.0, GetRValue(c) * k + 0.5),
+                    (int)std::min(255.0, GetGValue(c) * k + 0.5),
+                    (int)std::min(255.0, GetBValue(c) * k + 0.5));
+        }
+    }
+    return c;
 }
 
 const wchar_t* CTopListWindow::MetricTitle() const {
@@ -350,6 +382,26 @@ void CTopListWindow::RecreateScaledResources() {
 // ============================================================
 
 LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
+    // 预览实例（LoadDemoSnapshot 置位）：纯展示，交互全短路——拖动/
+    // 点击切换/滚轮/右键菜单/命令/timer/刷新广播一概不响应（不在
+    // WindowManager 册上理论收不到广播，此为双保险）
+    if (m_preview) {
+        switch (msg) {
+        case WM_NCHITTEST:
+            return HTCLIENT;   // 恒不可拖（HTCAPTION 会被系统托管拖动）
+        case WM_TIMER:
+        case WM_LBUTTONDOWN:
+        case WM_NCLBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_NCRBUTTONUP:
+        case WM_CONTEXTMENU:
+        case WM_MOUSEWHEEL:
+        case WM_COMMAND:
+        case WM_PTM_REFRESH:
+            return 0;
+        default: break;
+        }
+    }
     switch (msg) {
     case WM_PAINT:
         OnPaint();
@@ -405,6 +457,11 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             m_cfg.y = rc.top;
         }
         CProcessTopPlugin::Instance().SaveWindowConfigsNow();
+        // 松手强制重判（PNM 2026-10 实测经验）：跨亮度背景拖动（深壁纸
+        // →白窗口）后不等静止期慢路径，下一拍刷新（≤refresh_ms）即走
+        // 300ms 快判通道重判文字/accent 翻转
+        m_last_refresh_tick = 0;
+        m_steady_probe_fast = true;
         return 0;
     }
 
@@ -1086,12 +1143,16 @@ bool CTopListWindow::CaptureSnapNoFlash(const RECT& popup_rect, int w, int h) {
     return true;
 }
 
-// 文字反色判定（PNM-inherited, 简化：无右列 accent 独立判定）
+// 文字反色判定（PNM-inherited + 2026-11 数值列独立翻转补齐）：
+// 左带（名字/文字主体）中位亮度 → 整窗文字深浅翻转（迟滞带）；
+// 右带（数值区）中位亮度 → accent 变体独立翻转 + 推离基准 sbg
 void CTopListWindow::RefreshBackdrop(const RECT& popup_rect) {
     bool prev_adaptive = m_text_adaptive;
     m_text_adaptive = false;
     m_text_dark = m_dark_mode;
     m_bg_lum = -1.0;
+    m_accent_flip = false;
+    m_accent_bg_lum = -1.0;
     if (!m_acrylic_active) return;
 
     int w = popup_rect.right - popup_rect.left;
@@ -1111,14 +1172,22 @@ void CTopListWindow::RefreshBackdrop(const RECT& popup_rect) {
         ReleaseDC(nullptr, scr);
     }
 
-    std::vector<unsigned short> lums;
-    lums.reserve((size_t)((h / 4 + 1) * (w / 4 + 1)));
+    // 左右分带采样（PNM 1381-1396 同款）：右带 = 数值区（值区宽 + 右
+    // PADDING 缓冲），名字/文字主体在左带。布局异常时保底半宽
+    int judge_w = w - ValueAreaWidth() - PADDING;
+    if (judge_w < w / 2) judge_w = w / 2;
+    if (judge_w > w) judge_w = w;
+    std::vector<unsigned short> lums, lums_r;
+    lums.reserve((size_t)((h / 4 + 1) * (judge_w / 4 + 1)));
+    lums_r.reserve((size_t)((h / 4 + 1) * ((w - judge_w) / 4 + 1)));
     unsigned char* p8 = (unsigned char*)m_snap_bits;
     for (int y = 0; y < h; y += 4)
         for (int x = 0; x < w; x += 4) {
             size_t i = ((size_t)y * w + x) * 4;
-            lums.push_back((unsigned short)(
-                (299 * p8[i + 2] + 587 * p8[i + 1] + 114 * p8[i]) / 1000));
+            unsigned short lum = (unsigned short)(
+                (299 * p8[i + 2] + 587 * p8[i + 1] + 114 * p8[i]) / 1000);
+            if (x < judge_w) lums.push_back(lum);
+            else lums_r.push_back(lum);
         }
     if (lums.empty()) return;
     size_t mid = lums.size() / 2;
@@ -1137,6 +1206,25 @@ void CTopListWindow::RefreshBackdrop(const RECT& popup_rect) {
         m_text_adaptive = true;
     }
     m_bg_lum = bg_lum;
+
+    // 数值列独立翻转（PNM m_speed_flip 适配）：右带中位 sbg 与本窗指标
+    // accent 两变体亮度中点比较——背景暗用亮变体、亮用暗变体；IO 双列
+    // 读/写同橙共用一个翻转。sbg 同时是 GetAccentColor 推离保障的基准
+    if (!lums_r.empty()) {
+        size_t mid_r = lums_r.size() / 2;
+        std::nth_element(lums_r.begin(), lums_r.begin() + mid_r, lums_r.end());
+        double sbg = (op / 100.0) * panel_lum
+                   + (1.0 - op / 100.0) * (double)lums_r[mid_r];
+        double vl = (299.0 * GetRValue(AccentVariant(true))
+                     + 587.0 * GetGValue(AccentVariant(true))
+                     + 114.0 * GetBValue(AccentVariant(true))) / 1000.0;
+        double vd = (299.0 * GetRValue(AccentVariant(false))
+                     + 587.0 * GetGValue(AccentVariant(false))
+                     + 114.0 * GetBValue(AccentVariant(false))) / 1000.0;
+        bool want_light = sbg < (vl + vd) / 2.0;
+        m_accent_flip = (want_light != UseTextTheme());
+        m_accent_bg_lum = sbg;
+    }
 }
 
 // ============================================================
@@ -1366,11 +1454,11 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
             m_steady_probe_fast = true;
         } else if (GetTickCount64() - m_last_refresh_tick
                    >= (m_steady_probe_fast ? 300 : 1000)) {
-            bool d0 = m_text_dark, a0 = m_text_adaptive;
+            bool d0 = m_text_dark, a0 = m_text_adaptive, f0 = m_accent_flip;
             RefreshBackdrop(cur);
             m_last_refresh_tick = GetTickCount64();
             m_steady_probe_fast = false;
-            if (m_text_dark != d0 || m_text_adaptive != a0)
+            if (m_text_dark != d0 || m_text_adaptive != a0 || m_accent_flip != f0)
                 InvalidateRect(m_hwnd, nullptr, FALSE);
         }
     }
@@ -1388,6 +1476,69 @@ void CTopListWindow::RecalcAndRepaint(bool reposition) {
     Reposition();
     InvalidateRect(m_hwnd, nullptr, FALSE);
     if (m_acrylic_active) UpdateWindow(m_hwnd);   // compose synchronously, no blank frame
+}
+
+// 预览实例灌装（选项对话框外观反馈）：固定示例数据 + 预览模式置位。
+// 行 pid=0——LookupIcon 天然跳过图标提取，不碰真实进程；字段按各指标
+// 给足 DrawHeader/Summary/Row 的显示分支（传感器/IO 双列/GPU 有效性）
+void CTopListWindow::LoadDemoSnapshot(int kind) {
+    m_preview = true;
+    m_kind = (MetricKind)kind;
+    m_io_view = 0;
+    m_io_grade = FileIoGrade::A;   // 正常档：黄警/灰说明状态行全不出
+    m_io_events_lost = 0;
+    m_gpu_grade = GpuGrade::G1;
+    m_gpu_reason.clear();
+    m_gpu_total = 37.5;
+    m_gpu_total_valid = true;
+    m_vram_sys_ded = 6ULL * 1024 * 1024 * 1024;
+    m_vram_sys_shared = 2ULL * 1024 * 1024 * 1024;
+    m_vram_sys_valid = true;
+    m_mem_total = 32ULL * 1024 * 1024 * 1024;
+    m_mem_used = 21ULL * 1024 * 1024 * 1024;
+    m_cpu_total = 12.3;
+    m_io_read_total = 152.4 * 1024 * 1024;
+    m_io_write_total = 86.2 * 1024 * 1024;
+    m_tm_cpu_temp = 52;    // 传感器摘要示例：CPU 维度出温度+频率
+    m_tm_cpu_freq = 3600;
+    m_tm_gpu_temp = 61;    // GPU/显存维度出 GPU 温度
+
+    struct DemoRow { const wchar_t* name; double v; double rd; double wr; };
+    static const DemoRow demo[] = {
+        { L"chrome.exe",         8.4, 12.5 * 1024 * 1024, 1.2 * 1024 * 1024 },
+        { L"Code.exe",           5.1,  3.4 * 1024 * 1024, 0.8 * 1024 * 1024 },
+        { L"TrafficMonitor.exe", 2.7,  0.3 * 1024 * 1024, 0.1 * 1024 * 1024 },
+        { L"explorer.exe",       1.9,  4.8 * 1024 * 1024, 2.2 * 1024 * 1024 },
+        { L"steam.exe",          1.3,  1.1 * 1024 * 1024, 0.4 * 1024 * 1024 },
+        { L"python.exe",         0.8,  0.6 * 1024 * 1024, 0.9 * 1024 * 1024 },
+        { L"msedge.exe",         0.6,  0.9 * 1024 * 1024, 0.2 * 1024 * 1024 },
+        { L"devenv.exe",         0.4,  0.5 * 1024 * 1024, 0.3 * 1024 * 1024 },
+    };
+    m_rows.clear();
+    for (const DemoRow& d : demo) {
+        TopRow r;
+        r.name = d.name;
+        r.value = d.v;
+        r.io_read_bps = d.rd;    // IO 合计视图双列示例
+        r.io_write_bps = d.wr;
+        m_rows.push_back(r);
+    }
+    m_rows_has_value = true;
+    // summary 值与 ApplySnapshotForCurrentView 同源逻辑（示例值）
+    switch (m_kind) {
+    case MetricKind::Mem: m_summary_value = (double)m_mem_used; break;
+    case MetricKind::DiskIo:
+        m_summary_value = m_io_read_total + m_io_write_total; break;
+    case MetricKind::Gpu: m_summary_value = m_gpu_total; break;
+    case MetricKind::Vram:
+        m_summary_value = (double)(PtVramWithShared()
+                                   ? m_vram_sys_ded + m_vram_sys_shared
+                                   : m_vram_sys_ded);
+        break;
+    default: m_summary_value = m_cpu_total; break;
+    }
+    m_dirty_sig.clear();   // 预览不走 UpdateFromSnapshot；清指纹防误比对
+    RecalcAndRepaint(true);
 }
 
 void CTopListWindow::ShowAt(int x, int y) {

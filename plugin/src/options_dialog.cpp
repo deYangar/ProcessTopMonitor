@@ -55,6 +55,53 @@ struct PtDlgState {
 
 int Sc(int v) { return (int)(v * g_st.dpi); }
 
+// 低系统保存/预览校正（PNM OptionsClampEffectForOS 同款）：亚克力/模糊
+// 在 <Win10 1703 上 SWCA 磨砂不渲染，统一落透明档——与 ApplyBackdrop
+// 生效降级同规则，配置与观感永远一致
+int PtClampEffectForOS(int eff) {
+    if ((eff == 0 || eff == 2) && !PTM_IsAccentBlurSupported()) return 1;
+    return eff;
+}
+
+// ---- 预览实例（无可见悬浮窗时的外观反馈，PNM COpacityPreview 的 PTM
+// 形态）：SWCA/ULW 是窗口级效果，预览必须自立门户；但呈现代码不二
+// 份——直接用 CTopListWindow 本类画固定示例数据（LoadDemoSnapshot）。
+// 已有可见悬浮窗时真窗口预览更直观，走 PtApplyAppearanceToAll ----
+CTopListWindow* g_preview = nullptr;
+
+void PtPreviewHide() {
+    delete g_preview;   // 析构含 blur 层成对销毁（shutdown 短路纪律同款）
+    g_preview = nullptr;
+}
+
+void PtPreviewEnsure(HWND hDlg, int color_mode, int effect, int opacity) {
+    CProcessTopPlugin& plugin = CProcessTopPlugin::Instance();
+    if (!g_preview) {
+        g_preview = new CTopListWindow();
+        if (!g_preview->Create(nullptr)) {
+            delete g_preview;
+            g_preview = nullptr;
+            return;
+        }
+        g_preview->LoadDemoSnapshot(plugin.m_settings.default_metric);
+    }
+    g_preview->SetAppearance(color_mode, effect, opacity);
+    // 已可见时的外观变化：SetAppearance→ApplyBackdrop 在效果/浓度/主题
+    // 任一变化时自带重建 + InvalidateRect，幂等早退时无需重画——不必
+    // 显式重绘
+    if (!g_preview->IsVisible()) {
+        // 对话框右侧并排（放不下→左侧）；越界兜底交给 ShowAt 工作区 clamp
+        RECT rd, wa;
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        GetWindowRect(hDlg, &rd);
+        int pw = (int)(300 * g_st.dpi);   // 粗算宽度（IO 合计双列略宽，clamp 兜住）
+        int gap = Sc(16);
+        int px = rd.right + gap;
+        if (px + pw > wa.right) px = rd.left - gap - pw;
+        g_preview->ShowAt(px, rd.top);
+    }
+}
+
 void PtApplyAppearanceToAll(int color_mode, int effect, int opacity) {
     WindowManager::Instance().ForEach([color_mode, effect, opacity](CTopListWindow& w, int) {
         w.SetAppearance(color_mode, effect, opacity);
@@ -331,7 +378,15 @@ void PtCreateControls(HWND hwnd) {
         int iy = y + Sc(24);
         PtFont(PtLabel(hwnd, TR(L"效果"), M + Sc(12), iy + Sc(4), Sc(40), Sc(20)));
         HWND c5 = PtCombo(hwnd, IDC_EFFECT_CBO, M + Sc(60), iy, Sc(110));
-        const wchar_t* effs[] = { L"亚克力", L"透明", L"模糊", L"不透明" };
+        // 低系统（<Win10 1703，SWCA 磨砂不渲染）给亚克力/模糊两项加需求
+        // 标注——仍可选择，预览与保存处统一降级透明档（PNM 同款）
+        bool blur_ok = PTM_IsAccentBlurSupported();
+        const wchar_t* effs[] = {
+            blur_ok ? L"亚克力" : L"亚克力（需 Win10 1703+）",
+            L"透明",
+            blur_ok ? L"模糊" : L"模糊（需 Win10 1703+）",
+            L"不透明",
+        };
         for (int i = 0; i < 4; i++) {
             PtCboAdd(hwnd, IDC_EFFECT_CBO, TR(effs[i]), i);
             if (st.popup_effect == i) SendMessageW(c5, CB_SETCURSEL, i, 0);
@@ -389,12 +444,23 @@ void PtCreateControls(HWND hwnd) {
 // ---- 外观即时预览（效果/不透明度/颜色：控件态 → 全部窗口，方案 §3）----
 void PtPreviewAppearance(HWND hwnd) {
     int effect = PtCboSel(hwnd, IDC_EFFECT_CBO);
+    if (effect >= 0) {
+        int clamped = PtClampEffectForOS(effect);
+        if (clamped != effect)   // 低系统降级：下拉同步跳到透明档，让降级可见（PNM 同款）
+            SendMessageW(GetDlgItem(hwnd, IDC_EFFECT_CBO), CB_SETCURSEL, clamped, 0);
+        effect = clamped;
+    }
     int color = PtCboSel(hwnd, IDC_COLOR_CBO);
     int opacity = (int)SendMessageW(GetDlgItem(hwnd, IDC_OPACITY_TRK), TBM_GETPOS, 0, 0);
     if (effect < 0) effect = g_st.snap_effect;
     if (color < 0) color = g_st.snap_color_mode;
     if (opacity < 10) opacity = g_st.snap_opacity;
-    PtApplyAppearanceToAll(color, effect, opacity);
+    if (WindowManager::Instance().GroupVisible()) {
+        PtApplyAppearanceToAll(color, effect, opacity);
+        if (g_preview) PtPreviewHide();   // 真窗口接管反馈，预览实例退场
+    } else {
+        PtPreviewEnsure(hwnd, color, effect, opacity);   // hover 隐藏期：预览反馈
+    }
 }
 
 // ---- 确定：写回 + 生效管线（方案 §6）----
@@ -437,7 +503,7 @@ void PtOnOk(HWND hwnd) {
     st.sensor_summary = SendMessageW(GetDlgItem(hwnd, IDC_SENSOR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.debug_logs = SendMessageW(GetDlgItem(hwnd, IDC_DEBUG_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     int eff = PtCboSel(hwnd, IDC_EFFECT_CBO);
-    if (eff >= 0) st.popup_effect = eff;
+    if (eff >= 0) st.popup_effect = PtClampEffectForOS(eff);   // 低系统存档降级透明档
     int col = PtCboSel(hwnd, IDC_COLOR_CBO);
     if (col >= 0) st.color_mode = col;
     int opa = (int)SendMessageW(GetDlgItem(hwnd, IDC_OPACITY_TRK), TBM_GETPOS, 0, 0);
@@ -525,6 +591,7 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PtOnCancel(hwnd);
         return 0;
     case WM_DESTROY:
+        PtPreviewHide();   // 预览实例随对话框销毁（OK/取消/ESC/关闭全路径）
         if (g_st.font) { DeleteObject(g_st.font); g_st.font = nullptr; }
         return 0;
     }

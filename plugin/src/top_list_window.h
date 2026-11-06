@@ -87,6 +87,12 @@ public:
 
     int GetIoView() const { return m_io_view; }   // plugin syncs it into settings
 
+    // 预览实例入口（选项对话框外观反馈，PNM COpacityPreview 的 PTM
+    // 形态）：灌固定示例数据并置预览模式（交互全短路），随后 ShowAt
+    // 上屏。不注册进 WindowManager——不占槽位/不进组布局/收不到刷新
+    // 广播/不被收尸，生命周期归创建方（options_dialog）管
+    void LoadDemoSnapshot(int kind);
+
 private:
     // 快照 → 本窗显示数据的全套灌装（kind/io_view/topn 取本窗当前状态，
     // 问题②治本）：UpdateFromSnapshot 每拍走这里；SetKind/io_view/行数
@@ -131,6 +137,8 @@ private:
     bool UseTextTheme() const { return m_text_adaptive ? m_text_dark : m_dark_mode; }
     COLORREF GetBgColor();
     COLORREF GetTextColor();
+    // 指标 accent 色板单变体提取（翻转判定要算两变体中点用）
+    COLORREF AccentVariant(bool light);
     COLORREF GetAccentColor();
     void UpdateDpiScale();
     void RecreateScaledResources();
@@ -198,6 +206,13 @@ private:
     bool m_text_dark = false;
     bool m_text_adaptive = false;
     double m_bg_lum = -1.0;
+    // 数值列独立翻转 + accent 对比保障（PNM m_speed_flip/m_speed_bg_lum
+    // 2026-10 顺修的 PTM 适配）：右值区独立采样中位亮度 sbg → 与本窗
+    // 指标 accent 两变体中点比较独立翻转（数值列背景与左列不同，透明/
+    // 低浓度档透出的桌面内容左右各异）；推离基准优先右值区 sbg，无
+    // 独立判定数据时退整窗 m_bg_lum
+    bool m_accent_flip = false;
+    double m_accent_bg_lum = -1.0;
 
     // ULW surfaces
     HDC m_ulw_dc = nullptr;  HBITMAP m_ulw_bmp = nullptr;  void* m_ulw_bits = nullptr;
@@ -226,6 +241,7 @@ private:
     // hover state for header bar (repaint on flip only)
     bool m_tracking = false;
     bool m_hovering = false;           // 光标在窗内（HoverTick over_group 信号）
+    bool m_preview = false;            // 预览实例（LoadDemoSnapshot 置位）：交互全短路
     RECT m_rc_header = {};             // 头部条（拖动柄 + 命中测试）
     RECT m_rc_metric = {};             // 指标区（点击切换；单窗模式可点）
 
