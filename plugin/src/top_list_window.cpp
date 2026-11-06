@@ -168,8 +168,10 @@ bool CTopListWindow::Create(const POINT* suggested) {
 
     wchar_t cls[64];
     swprintf_s(cls, 64, L"PTMTopList_%p", m_hinst);
+    // M6 §4.1.1：去掉 WS_EX_APPWINDOW——任务栏不该出现 PTM 弹窗按钮
+    // （TOOLWINDOW 已足够；APPWINDOW 会强制作业栏按钮）
     m_hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_APPWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         cls, L"", WS_POPUP,
         0, 0, BASE_WIDTH, 400,
         nullptr, nullptr, m_hinst, nullptr);
