@@ -457,9 +457,13 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             m_cfg.y = rc.top;
         }
         CProcessTopPlugin::Instance().SaveWindowConfigsNow();
-        // 松手强制重判（PNM 2026-10 实测经验）：跨亮度背景拖动（深壁纸
-        // →白窗口）后不等静止期慢路径，下一拍刷新（≤refresh_ms）即走
-        // 300ms 快判通道重判文字/accent 翻转
+        // 松手强制终判（PNM 2026-10 实测经验）：同步矩形基准——拖动最后
+        // 一帧位置没进过静止期路径的 m_last_snap_rect，不同步的话下一拍
+        // 走「矩形不等→重置计时」分支把下面的 tick=0 覆盖掉（自伤 bug，
+        // 2026-11-07 修复），最坏再等两拍。同步后下一拍矩形相等 + tick=0
+        // 直接进判定分支
+        RECT rc2;
+        if (GetWindowRect(m_hwnd, &rc2)) m_last_snap_rect = rc2;
         m_last_refresh_tick = 0;
         m_steady_probe_fast = true;
         return 0;
@@ -497,6 +501,27 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (p && m_blur_hwnd && !(p->flags & SWP_NOMOVE) && IsWindowVisible(m_hwnd)) {
             SetWindowPos(m_blur_hwnd, nullptr, p->x, p->y, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        // 拖动/跟随移动中的实时反色（PNM AnchorJudgeThrottled 同款语义，
+        // 2026-11-07 反馈「拖动自动反转颜色」补齐）：移动事件流上
+        // 150ms 节流截屏判定——否则静止期路径在拖动中每拍都走「矩形
+        // 变了→重置计时」分支，永远进不了判定，颜色纹丝不动。覆盖自身
+        // HTCAPTION 拖动与锚跟随 GroupDeltaMove 两种移动；截屏剔自身后
+        // 判的是当时位置的纯背景，拖动中天然成立
+        if (m_acrylic_active && m_affinity_ok && IsWindowVisible(m_hwnd)) {
+            ULONGLONG now = GetTickCount64();
+            if (now - m_last_refresh_tick >= 150) {
+                m_last_refresh_tick = now;
+                bool d0 = m_text_dark, a0 = m_text_adaptive, f0 = m_accent_flip;
+                RECT cur;
+                if (GetWindowRect(m_hwnd, &cur)) {
+                    RefreshBackdrop(cur);
+                    m_last_snap_rect = cur;   // 拖动基准同步，静止期衔接
+                    if (m_text_dark != d0 || m_text_adaptive != a0
+                        || m_accent_flip != f0)
+                        InvalidateRect(m_hwnd, nullptr, FALSE);
+                }
+            }
         }
         return DefWindowProcW(m_hwnd, msg, wp, lp);
     }
