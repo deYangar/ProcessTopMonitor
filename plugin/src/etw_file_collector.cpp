@@ -120,6 +120,14 @@ static ULONG PtStopSession(TRACEHANDLE handle, const wchar_t* name) {
 }
 
 FileIoGrade EtwFileCollector::Start() {
+    // 串行化点（问题①B）：上一次 StopAsync 的收尾未完成时，先等收尸
+    // 线程 join 掉旧消费者（m_running 随之翻 false），再重启——否则旧
+    // 消费者还活着，下面的幂等检查会误判「正在运行」直接返回旧档位。
+    // 迟停机制下此路径只在 3 分钟空闲真停后再启用 IO 窗时出现，罕见；
+    // Start 本身允许 ~1s 的档位等待（现状），此处最多再叠收尸剩余时间
+    if (m_reaper.joinable()) {
+        try { m_reaper.join(); } catch (...) { m_reaper.detach(); }
+    }
     if (m_running.load()) return Grade();
     s_self = this;
     m_stop = false;
@@ -152,7 +160,9 @@ FileIoGrade EtwFileCollector::Start() {
 }
 
 void EtwFileCollector::Stop() {
-    if (!m_running.load() && !m_thread.joinable()) {
+    // 完整停（析构/DLL 卸载/选项对话框）：同步等待消费者退出——此处
+    // 允许阻塞。tick 线程的按需停走 StopAsync（问题①B）
+    if (!m_running.load() && !m_thread.joinable() && !m_reaper.joinable()) {
         SetStatus(FileIoGrade::Off, L"");
         return;
     }
@@ -166,7 +176,11 @@ void EtwFileCollector::Stop() {
         TRACEHANDLE h = m_cur_consumer.load();
         if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
     }
-    if (m_thread.joinable()) {
+    // 收尸协调（并发 join 同一 std::thread 是 UB）：reaper 在就等它完成
+    // （它已把 m_thread join 掉）；没有 reaper 才由本线程直接等+join
+    if (m_reaper.joinable()) {
+        try { m_reaper.join(); } catch (...) { m_reaper.detach(); }
+    } else if (m_thread.joinable()) {
         for (int i = 0; i < 30 && m_running.load(); i++) Sleep(100);
         if (m_thread.joinable()) {
             try { m_thread.join(); } catch (...) { m_thread.detach(); }
@@ -174,6 +188,41 @@ void EtwFileCollector::Stop() {
     }
     m_running = false;
     SetStatus(FileIoGrade::Off, L"");
+}
+
+void EtwFileCollector::StopAsync() {
+    // tick 线程的按需停（问题①B）：绝不 join——发停信号 + 解锁
+    // ProcessTrace 即返回，join/收尾交给一次性收尸线程。重复调用无害
+    // （m_stop 已置位时直接返回，不重叠收尸）
+    if (m_stop.load()) return;
+    if (!m_running.load() && !m_thread.joinable()) {
+        SetStatus(FileIoGrade::Off, L"");
+        return;
+    }
+    m_stop = true;
+
+    // 解锁路径与 Stop() 相同（停止自己的会话 / CloseTrace attach 消费者）
+    if (m_own_session_handle) {
+        PtStopSession(m_own_session_handle, nullptr);
+    } else {
+        TRACEHANDLE h = m_cur_consumer.load();
+        if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
+    }
+
+    // 一次性收尸线程：等消费者退出（m_running 由 ConsumerLoop 末尾置
+    // false——语义 = 消费者已退出）再 join。Stop()/Start() 里的串行化
+    // 点都先 join 本线程，保证对 m_thread 的 join 永远只有一个执行者。
+    // 创建失败（资源枯竭）退化为「不 join」：消费者仍会自行退出，
+    // 析构 Stop() 的兜底分支会完成等待
+    try {
+        m_reaper = std::thread([this] {
+            for (int i = 0; i < 30 && m_running.load(); i++) Sleep(100);
+            if (m_thread.joinable()) {
+                try { m_thread.join(); } catch (...) { m_thread.detach(); }
+            }
+        });
+    } catch (...) {
+    }
 }
 
 void EtwFileCollector::ConsumerLoop() {

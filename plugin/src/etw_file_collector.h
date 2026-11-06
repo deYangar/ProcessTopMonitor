@@ -59,6 +59,12 @@ public:
     // blocks the caller for long (consumer thread does the session work).
     FileIoGrade Start();
     void Stop();
+    // Async stop (tick thread, 问题①B)：只发停信号 + 解锁 ProcessTrace，
+    // join/收尾交给一次性收尸线程——tick 线程绝不同步等 3s（旧 Stop 的
+    // join 会卡住 m_refresh_busy 门闩、全部维度数据停更）。m_running 仍由
+    // ConsumerLoop 末尾置 false（语义 = 消费者已退出），TakeDelta 的
+    // IsRunning 判定天然兼容。下一次 Start() 开头串行化等收尸完成。
+    void StopAsync();
     bool IsRunning() const { return m_running.load(); }
     FileIoGrade Grade() const;
 
@@ -96,6 +102,7 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stop{false};
     std::thread m_thread;
+    std::thread m_reaper;    // StopAsync 的一次性收尸线程：join 消费者
 
     // ---- handoff protocol (see header comment) ----
     std::atomic<bool> m_take_req{false};
