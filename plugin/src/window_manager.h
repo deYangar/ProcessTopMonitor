@@ -75,7 +75,11 @@ public:
 
 private:
     WindowManager() = default;
-    static LRESULT CALLBACK AnchorProc(HWND, UINT, WPARAM, LPARAM);
+    // 锚窗子类化走 comctl32 SetWindowSubclass（2026-11-06 双环崩溃根治）：
+    // master_proc 中性地址挂在 GWLP_WNDPROC 链头，本方 proc 地址不被链上
+    // 任何一方当 orig 持有——跨插件叠挂/摘除不可能造出自指/互指环
+    static LRESULT CALLBACK AnchorProc(HWND, UINT, WPARAM, LPARAM,
+                                       UINT_PTR id, DWORD_PTR ref);
     // 子类化看门狗（M6 §4.3.4，照抄 PNM tooltip_popup.cpp:572-587+:87-95）：
     // message-only 窗 + 原生注册 proc + 1s timer，发现组长窗 wndproc 被
     // 外部注入器剥掉 → 重装（防 hover timer 静默死亡导致弹窗永不消失）
@@ -89,15 +93,10 @@ private:
 
     // ---- 锚跟随状态（全部 UI 线程）----
     HWND m_anchor_wnd = nullptr;          // 子类化中的锚窗
-    WNDPROC m_anchor_orig_proc = nullptr;
     bool m_anchor_in_sizemove = false;
     RECT m_last_seen_anchor = {};         // delta 基准
     bool m_have_last_seen_anchor = false; // 首事件只建基准不跟随
     HMONITOR m_last_seen_mon = nullptr;
     ULONGLONG m_last_full_pass_tick = 0;  // 全量重排节流（100ms）
     RECT m_popup_anchor = {};             // 锚 rect（供 HoverTick 轮询兜底比对）
-    // detach 时若本插件不在子类化链头（有后来者叠在上方），直接还原 orig
-    // 会掐断后来者的链——此时留 AnchorProc 原地纯透传（PNM :107-108 同款）
-    static WNDPROC s_orphan_anchor_orig;
-    static HWND s_orphan_anchor_hwnd;
 };

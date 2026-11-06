@@ -3,6 +3,114 @@
 #include "window_manager.h"
 #include "plugin_main.h"
 #include "utils.h"   // WM_PTM_RECLAIM / DPI helpers
+#include <algorithm>
+#include <commctrl.h>   // SetWindowSubclass / DefSubclassProc（锚子类化框架）
+
+// ============================================================
+// PNM 悬浮窗避让（2026-11-06 green 位反馈二治本）
+// PTM 组布局与 PNM PositionWindow 是同款方位公式（上方优先），hover 弹组
+// 与 PNM tooltip 弹向完全相同的矩形 → 叠死。检测同进程可见 PNM 窗（类名
+// 前缀 PNMTooltip_，含实例指针后缀），rect 相交则 nudge；候选优先级同
+// PNM 避让 TM 原生 tooltip 的框架（tooltip_popup.cpp:1700）：副轴平移 >
+// 主轴推开 > 锚对面翻面，4 pass 迭代收敛。仅 hover 自动定位路径调用；
+// 常驻/pin 用户手放的位置不参与避让。
+// ============================================================
+namespace {
+
+struct PnmAvoidCtx {
+    std::vector<RECT>* out;
+    DWORD pid;
+};
+
+BOOL CALLBACK CollectPNMPopup(HWND h, LPARAM lp) {
+    auto* c = (PnmAvoidCtx*)lp;
+    wchar_t cls[64];
+    if (!GetClassNameW(h, cls, 64)) return TRUE;
+    if (wcsncmp(cls, L"PNMTooltip_", 11) != 0) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+    RECT r;
+    if (GetWindowRect(h, &r) && r.right > r.left && r.bottom > r.top)
+        c->out->push_back(r);
+    return TRUE;
+}
+
+void AvoidPNMPopups(int& x, int& y, int pw, int ph, const RECT& anchor,
+                    const RECT& work, float dpi) {
+    std::vector<RECT> avoid;
+    PnmAvoidCtx ctx{ &avoid, GetCurrentProcessId() };
+    EnumWindows(CollectPNMPopup, (LPARAM)&ctx);
+    if (avoid.empty()) return;
+    int tip_margin = std::max(4, (int)(8 * dpi));
+    int margin = std::max(4, (int)(4 * dpi));
+    bool at_bottom = anchor.bottom >= work.bottom - 2;
+    bool at_top    = anchor.top <= work.top + 2;
+    bool at_left   = anchor.left <= work.left + 2;
+    bool at_right  = anchor.right >= work.right - 2;
+    auto intersects = [&](int cx, int cy, const RECT& arc) {
+        return cx < arc.right && cx + pw > arc.left &&
+               cy < arc.bottom && cy + ph > arc.top;
+    };
+    for (int pass = 0; pass < 4; pass++) {
+        bool moved = false;
+        for (const auto& rc : avoid) {
+            RECT arc = { rc.left - tip_margin, rc.top - tip_margin,
+                         rc.right + tip_margin, rc.bottom + tip_margin };
+            if (!intersects(x, y, arc)) continue;
+            // 候选1（副轴平移）：水平弹出→左右让；垂直弹出→上下让
+            int c1x = x, c1y = y;
+            bool ok = false;
+            if (at_bottom || at_top || (!at_left && !at_right)) {
+                int right = arc.right + margin;
+                int left = arc.left - pw - margin;
+                if (right + pw <= work.right - margin) { c1x = right; ok = true; }
+                else if (left >= work.left + margin) { c1x = left; ok = true; }
+            } else {
+                int down = arc.bottom + margin;
+                int up = arc.top - ph - margin;
+                if (down + ph <= work.bottom - margin) { c1y = down; ok = true; }
+                else if (up >= work.top + margin) { c1y = up; ok = true; }
+            }
+            if (ok && !intersects(c1x, c1y, arc)) { x = c1x; y = c1y; moved = true; continue; }
+            // 候选2（主轴推开）：沿弹出方向继续远离锚
+            int c2x = x, c2y = y;
+            ok = false;
+            if (at_bottom || (!at_top && !at_left && !at_right)) {
+                int cand = arc.top - ph;
+                if (cand >= work.top + margin) { c2y = cand; ok = true; }
+            } else if (at_top) {
+                int cand = arc.bottom;
+                if (cand + ph <= work.bottom - margin) { c2y = cand; ok = true; }
+            } else if (at_left) {
+                int cand = arc.right;
+                if (cand + pw <= work.right - margin) { c2x = cand; ok = true; }
+            } else if (at_right) {
+                int cand = arc.left - pw;
+                if (cand >= work.left + margin) { c2x = cand; ok = true; }
+            }
+            if (ok && !intersects(c2x, c2y, arc)) { x = c2x; y = c2y; moved = true; continue; }
+            // 候选3（翻面）：锚的另一侧，clamp 进工作区
+            int c3x = x, c3y = y;
+            if (at_bottom || (!at_top && !at_left && !at_right))
+                c3y = anchor.bottom + margin;
+            else if (at_top)
+                c3y = anchor.top - ph - margin;
+            else if (at_left)
+                c3x = anchor.left - pw - margin;
+            else if (at_right)
+                c3x = anchor.right + margin;
+            int wl = (int)work.left + margin, wr = (int)work.right - pw - margin;
+            int wt = (int)work.top + margin, wb = (int)work.bottom - ph - margin;
+            if (wr > wl) c3x = std::min(std::max(c3x, wl), wr);
+            if (wb > wt) c3y = std::min(std::max(c3y, wt), wb);
+            if (!intersects(c3x, c3y, arc)) { x = c3x; y = c3y; moved = true; }
+        }
+        if (!moved) break;
+    }
+}
+
+}   // namespace
 
 WindowManager& WindowManager::Instance() {
     static WindowManager s_instance;
@@ -188,6 +296,10 @@ void WindowManager::LayoutGroup(const RECT& anchor) {
     if (y + ph > work.bottom) y = work.bottom - ph - margin;
     if (y < work.top) y = work.top + margin;
 
+    // PNM 悬浮窗避让：仅 hover 自动定位路径（常驻/pin = 用户手放，尊重）
+    if (!resident)
+        AvoidPNMPopups(x, y, pw, ph, anchor, work, dpi);
+
     // 真排布（wrap 判定用组长真实 x）
     int cx = x, cy = y, row_h = 0;
     for (int i = 0; i < n; i++) {
@@ -234,24 +346,27 @@ void WindowManager::GroupDeltaMove(int dx, int dy) {
 }
 
 // ============================================================
-// 锚窗子类化跟随五件套（M6 §4.2.3，抄 PNM tooltip_popup.cpp:60-260）
+// 锚窗子类化跟随（M6 §4.2.3；2026-11-06 根治改 SetWindowSubclass）
+//
+// 手搓 SetWindowLongPtrW 链在跨插件叠挂下有两种必崩环形态（14:04 自指环
+// / 14:31 互指环，均 c00000fd 栈溢出，dump 实证见方案 §1.2/§1.3-v2）：
+// detach 方留 orphan 残链时本方 proc 地址被对方当 orig 持有，此后任一方
+// re-attach 即成环。治本 = comctl32 SetWindowSubclass：GWLP_WNDPROC 链头
+// 挂的是中性 master_proc，子类节点登记在 master 内部链表，本方 proc 地
+// 址**不被任何一方持有**——摘除（RemoveWindowSubclass）从表里删节点，
+// 表空自动还原原 proc，环在物理上不可构造。
 // ============================================================
 
-WNDPROC WindowManager::s_orphan_anchor_orig = nullptr;
-HWND WindowManager::s_orphan_anchor_hwnd = nullptr;
+namespace {
+// 子类 id（进程内本插件唯一即可；comctl32 按 (pfn, id) 寻址）
+constexpr UINT_PTR kAnchorSubclassId = 0x50544D41;   // 'PTMA'
+}
 
-LRESULT CALLBACK WindowManager::AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT CALLBACK WindowManager::AnchorProc(HWND hwnd, UINT msg, WPARAM wp,
+                                           LPARAM lp, UINT_PTR /*id*/,
+                                           DWORD_PTR /*ref*/) {
     WindowManager* self = &Instance();
-    WNDPROC orig = nullptr;
-    bool tracked = (self->m_anchor_wnd == hwnd && self->m_anchor_orig_proc);
-    if (tracked) {
-        orig = self->m_anchor_orig_proc;
-    } else if (s_orphan_anchor_hwnd == hwnd && s_orphan_anchor_orig) {
-        orig = s_orphan_anchor_orig;   // 已 detach 的残留链：纯透传
-    }
-    if (!orig) return DefWindowProcW(hwnd, msg, wp, lp);
-
-    if (tracked) {
+    if (self->m_anchor_wnd == hwnd) {
         switch (msg) {
         case WM_ENTERSIZEMOVE:
             self->m_anchor_in_sizemove = true;
@@ -270,60 +385,40 @@ LRESULT CALLBACK WindowManager::AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             break;
         }
         case WM_NCDESTROY:
-            // 锚窗销毁：链随窗口一起消失，清状态即可（无需还原）
+            // 锚窗销毁：comctl32 随窗口清理子类表，这里只清状态
             self->m_anchor_wnd = nullptr;
-            self->m_anchor_orig_proc = nullptr;
             self->m_have_last_seen_anchor = false;
-            if (s_orphan_anchor_hwnd == hwnd) {
-                s_orphan_anchor_hwnd = nullptr;
-                s_orphan_anchor_orig = nullptr;
-            }
             break;
         }
     }
-    return CallWindowProcW(orig, hwnd, msg, wp, lp);
+    return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 void WindowManager::SetAnchorFollow(HWND anchor) {
     if (anchor == m_anchor_wnd) return;   // 幂等：HoverTick 每 tick 调
     DetachAnchorTracker();
     if (!anchor || !IsWindow(anchor)) return;
-    // 仅同线程窗口（弹窗与 TM 主窗同住主线程；跨线程改 WNDPROC 不安全）。
+    // 仅同线程窗口（弹窗与 TM 主窗同住主线程；跨线程子类化不安全）。
     // 注意 GetWindowThreadProcessId 的返回值才是线程 ID，out 参数是进程
     // ID——PNM 曾把两者读反导致锚窗跟踪永远装不上，照抄注释防重蹈
     DWORD pid_anchor = 0;
     DWORD tid_anchor = GetWindowThreadProcessId(anchor, &pid_anchor);
     if (tid_anchor != GetCurrentThreadId()) return;
-    m_anchor_orig_proc = (WNDPROC)SetWindowLongPtrW(anchor, GWLP_WNDPROC,
-                                                    (LONG_PTR)AnchorProc);
-    if (!m_anchor_orig_proc) return;
+    if (!SetWindowSubclass(anchor, AnchorProc, kAnchorSubclassId, 0)) return;
     m_anchor_wnd = anchor;
     m_anchor_in_sizemove = false;
     m_have_last_seen_anchor = false;   // 首个位置事件只建基准、不跟随
-    if (s_orphan_anchor_hwnd == anchor) {
-        // 同窗重挂：旧残留链失去透传职责（新链自己链对 orig），作废
-        s_orphan_anchor_hwnd = nullptr;
-        s_orphan_anchor_orig = nullptr;
-    }
 }
 
 void WindowManager::DetachAnchorTracker() {
     if (!m_anchor_wnd) return;
     HWND hwnd = m_anchor_wnd;
-    WNDPROC orig = m_anchor_orig_proc;
     m_anchor_wnd = nullptr;
-    m_anchor_orig_proc = nullptr;
     m_have_last_seen_anchor = false;
     m_anchor_in_sizemove = false;
-    if (!IsWindow(hwnd) || !orig) return;
-    if ((WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == AnchorProc) {
-        // 我们在链头：安全还原
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig);
-    } else {
-        // 有后来者叠在上方：留透传链（见 window_manager.h 注释）
-        s_orphan_anchor_hwnd = hwnd;
-        s_orphan_anchor_orig = orig;
-    }
+    // 从 master 链表摘本节点（被叠场景同样干净）；表空 comctl32 自动还原
+    if (IsWindow(hwnd))
+        RemoveWindowSubclass(hwnd, AnchorProc, kAnchorSubclassId);
 }
 
 void WindowManager::OnAnchorPosChanged(const RECT& new_anchor, bool sized) {
