@@ -891,8 +891,16 @@ void CProcessTopPlugin::RefreshTick() {
     int mask = WindowManager::Instance().BoundMask();
     bool gpu_bound = mask & (PtKindMask(MetricKind::Gpu) | PtKindMask(MetricKind::Vram));
     if (gpu_bound) {
+        bool was_running = m_gpu.IsRunning();
         m_gpu.EnsureStarted();
         m_gpu_idle_since = 0;
+        if (!was_running && m_gpu.IsRunning()) {
+            // 分频相位重置（问题①C）：拨到 0 → 本拍 ++ 后为 1（非 gpu_tick，
+            // 避开与 EnsureStarted 预热采样的同时间戳第二次采集），下一拍
+            // ++ 后为 2 = gpu_tick——正好衔接预热第 1 拍出利用率，消除相位
+            // 随机多等的一拍。真冷启动整体 = 1 拍 hint + 下一拍有值
+            m_gpu_tick_div = 0;
+        }
     } else if (m_gpu.IsRunning()) {
         if (m_gpu_idle_since == 0) m_gpu_idle_since = now;
         if (now - m_gpu_idle_since >= kGpuIdleStopMs) {

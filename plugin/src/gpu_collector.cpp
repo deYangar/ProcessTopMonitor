@@ -133,7 +133,13 @@ bool GpuCollector::EnsureStarted() {
             m_running.store(false);
             return false;
         }
-        m_collections = 0;
+        // 启动预热（问题①C）：Utilization Percentage 是 cooked 计数器，
+        // 需要 2 次 PdhCollectQueryData 才有值。真冷启动同拍先采第 1 次，
+        // 下一拍（首个 gpu_tick）即第 2 次——冷启动 2~4 拍缩到 1 拍出值。
+        // 本拍内不再叠加第二次采集（时间戳相同 PDH 会拒），相位配合见
+        // plugin_main RefreshTick 的 m_gpu_tick_div 重置
+        m_collections = (PdhCollectQueryData((PDH_HQUERY)m_query) == ERROR_SUCCESS)
+                            ? 1 : 0;
         m_running.store(true);
         return true;
     }

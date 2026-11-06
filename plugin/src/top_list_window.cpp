@@ -1747,7 +1747,12 @@ void CTopListWindow::DrawContent(HDC dc, int w, int h, bool content_only) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, UseTextTheme() ? RGB(120, 120, 120) : RGB(160, 160, 160));
         HFONT hOld = (HFONT)SelectObject(dc, m_font_normal);
-        const wchar_t* hint = m_rows_has_value ? TR(L"暂无进程") : TR(L"等待首次采样…");
+        // hint 细分（问题①D）：GPU 利用率是 cooked 计数器、需 2 次采样——
+        // 迟停落地后冷启动极少出现，出现时如实说明预热中
+        const wchar_t* hint;
+        if (m_rows_has_value) hint = TR(L"暂无进程");
+        else if (m_kind == MetricKind::Gpu) hint = TR(L"GPU 采样预热中…");
+        else hint = TR(L"等待首次采样…");
         RECT rc = { PADDING + 2, y, w - PADDING, y + ROW_HEIGHT };
         DrawTextW(dc, hint, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SelectObject(dc, hOld);
