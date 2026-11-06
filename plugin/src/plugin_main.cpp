@@ -1029,6 +1029,31 @@ void CProcessTopPlugin::RestartRefreshTimer() {
     StartRefreshTimer();
 }
 
+void CProcessTopPlugin::ApplyWindowMode() {
+    // M6 §4.5：三项生效。多窗开关取消 = 收敛到单窗（保留第一窗，其余
+    // 销毁——对话框 OK 的 UI 线程不在被销毁窗的消息栈里，同步 erase 安全）；
+    // 默认指标确定 = 重置当前单窗指标（§3.2 持久化语义）；出现方式：
+    // 常驻 → 立即显示（记忆位置或组布局，不挂锚），hover → 收起回 hover 态
+    auto& mgr = WindowManager::Instance();
+    if (!m_settings.multi_window) {
+        while (mgr.Count() > 1) mgr.DestroyAt(mgr.Count() - 1);
+    }
+    if (!m_settings.multi_window && mgr.Count() == 1) {
+        if (auto* w = mgr.At(0))
+            w->SetKind((MetricKind)m_settings.default_metric);
+    }
+    if (m_settings.popup_mode == 1) {
+        if (!mgr.GroupVisible()) {
+            mgr.ShowGroupAt(GetStartupAnchor());
+            mgr.DetachAnchorTracker();   // 常驻不跟锚
+        }
+    } else {
+        m_group_pinned = false;
+        mgr.HideGroup();
+    }
+    m_settings_dirty = true;
+}
+
 // ---- UI-thread entry points ----
 
 void CProcessTopPlugin::TopListRefreshFromSnapshot() {

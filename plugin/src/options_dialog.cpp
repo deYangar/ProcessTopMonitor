@@ -34,6 +34,9 @@ enum {
     IDC_COLOR_CBO,            // 颜色模式
     IDC_SENSOR_CHK,           // 传感器摘要
     IDC_DEBUG_CHK,            // 调试日志
+    IDC_POPUPMODE_CBO = 1070, // 出现方式（M6 §4.5）
+    IDC_DEFMETRIC_CBO,        // 默认指标
+    IDC_MULTIWINDOW_CHK,      // 多窗口并排
 };
 
 // ---- 对话框会话状态（单开，模态期内独占）----
@@ -291,6 +294,37 @@ void PtCreateControls(HWND hwnd) {
     }
     y += Sc(52) + Sc(12);
 
+    // ---- 显示（M6 §4.5：出现方式/默认指标/多窗口并排三行）----
+    PtGroup(hwnd, TR(L"显示"), M, y, GW, Sc(88));
+    {
+        int iy = y + Sc(26);
+        PtFont(PtLabel(hwnd, TR(L"出现方式"), M + Sc(12), iy + Sc(4), Sc(60), Sc(20)));
+        HWND c8 = PtCombo(hwnd, IDC_POPUPMODE_CBO, M + Sc(80), iy, Sc(110));
+        const wchar_t* pms[] = { L"悬停显示", L"常驻显示" };
+        for (int i = 0; i < 2; i++) {
+            PtCboAdd(hwnd, IDC_POPUPMODE_CBO, TR(pms[i]), i);
+            if (st.popup_mode == i) SendMessageW(c8, CB_SETCURSEL, i, 0);
+        }
+        PtFont(c8);
+        PtFont(PtLabel(hwnd, TR(L"默认指标"), M + Sc(220), iy + Sc(4), Sc(60), Sc(20)));
+        HWND c9 = PtCombo(hwnd, IDC_DEFMETRIC_CBO, M + Sc(290), iy, Sc(110));
+        const int dmk[] = { 0, 1, 2, 5, 6 };   // MetricKind 原值（itemdata）
+        const wchar_t* dmt[] = { L"CPU", L"内存", L"磁盘 IO", L"GPU", L"显存" };
+        for (int i = 0; i < 5; i++) {
+            PtCboAdd(hwnd, IDC_DEFMETRIC_CBO, TR(dmt[i]), dmk[i]);
+            if (st.default_metric == dmk[i]) SendMessageW(c9, CB_SETCURSEL, i, 0);
+        }
+        PtFont(c9);
+        HWND mw = CreateWindowW(L"BUTTON",
+            TR(L"多窗口并排（每窗固定指标，增删走右键菜单）"),
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            M + Sc(12), iy + Sc(34), Sc(420), Sc(20), hwnd,
+            (HMENU)(INT_PTR)IDC_MULTIWINDOW_CHK, nullptr, nullptr);
+        SendMessageW(mw, BM_SETCHECK, st.multi_window ? BST_CHECKED : BST_UNCHECKED, 0);
+        PtFont(mw);
+    }
+    y += Sc(88) + Sc(12);
+
     // ---- 窗口与外观 ----
     PtGroup(hwnd, TR(L"窗口与外观"), M, y, GW, Sc(118));
     {
@@ -389,6 +423,17 @@ void PtOnOk(HWND hwnd) {
     st.vram_basis = (SendMessageW(GetDlgItem(hwnd, IDC_VRAM_SHARED), BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     int iov = PtCboSel(hwnd, IDC_IOVIEW_CBO);
     if (iov >= 0) st.io_view = iov;
+    // M6 显示三行：出现方式 / 默认指标 / 多窗口并排
+    int pms = PtCboSel(hwnd, IDC_POPUPMODE_CBO);
+    if (pms >= 0) st.popup_mode = pms;
+    int dmi = PtCboSel(hwnd, IDC_DEFMETRIC_CBO);
+    if (dmi >= 0) {
+        LPARAM dm = SendMessageW(GetDlgItem(hwnd, IDC_DEFMETRIC_CBO),
+                                 CB_GETITEMDATA, dmi, 0);
+        if (dm) st.default_metric = (int)dm;
+    }
+    st.multi_window = SendMessageW(GetDlgItem(hwnd, IDC_MULTIWINDOW_CHK),
+                                   BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.sensor_summary = SendMessageW(GetDlgItem(hwnd, IDC_SENSOR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.debug_logs = SendMessageW(GetDlgItem(hwnd, IDC_DEBUG_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     int eff = PtCboSel(hwnd, IDC_EFFECT_CBO);
@@ -417,13 +462,15 @@ void PtOnOk(HWND hwnd) {
         }
     }
 
-    // 生效管线：口径 → 定时器 → 语言 → 立即落盘
+    // 生效管线：口径 → 窗口形态（M6）→ 定时器 → 语言 → 立即落盘
     plugin.ApplySettingsToCollectors();
+    plugin.ApplyWindowMode();   // popup_mode/multi_window/default_metric 生效
     if (!(scope == old_scope)) plugin.ApplyGpuScope(scope);
     if (st.refresh_ms != old_refresh) plugin.RestartRefreshTimer();
     EtwFileCollector::SetDebugLogs(st.debug_logs);
     if (st.lang != old_lang) plugin.ApplyLanguageNow();
     plugin.SaveWindowConfigsNow();   // 设置面改动低频：立即落盘不等节流
+                                       //（ApplyWindowMode 内已置 dirty）
     g_st.changed = true;
     DestroyWindow(hwnd);
 }
@@ -519,7 +566,7 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     g_st.font = CreateFontIndirectW(&ncm.lfMessageFont);
 
-    int dlg_w = Sc(660), dlg_h = Sc(620);
+    int dlg_w = Sc(660), dlg_h = Sc(700);
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"ProcessTopMonitorOptionsDlg",

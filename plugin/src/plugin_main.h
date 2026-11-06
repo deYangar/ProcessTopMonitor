@@ -69,6 +69,9 @@ public:
     // M4 选项对话框生效管线用的接缝（刷新率重启/语言切换/立即落盘）
     void RestartRefreshTimer();
     void ApplyLanguageNow();
+    // M6 §4.5：popup_mode/multi_window/default_metric 三项的生效函数
+    //（选项对话框「确定」管线集中调用，UI 线程）
+    void ApplyWindowMode();
 
     // GPU 口径（窗口口径菜单读写，均 UI 线程）
     GpuScopeConfig GpuScope() const { return m_settings.GpuScope(); }
