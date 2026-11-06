@@ -324,7 +324,7 @@ void CTopListWindow::UpdateDpiScale() {
     ROW_HEIGHT = (int)(BASE_ROW_HEIGHT * s);
     ICON_SIZE = (int)(BASE_ICON_SIZE * s);
     CORNER_RADIUS = std::max(1, (int)(BASE_CORNER_RADIUS * s));
-    TITLE_H = (int)(BASE_TITLE_H * s);
+    HEADER_H = (int)(BASE_HEADER_H * s);
     SUMMARY_H = (int)(BASE_SUMMARY_H * s);
     STATUS_H = (int)(BASE_STATUS_H * s);
     VALUE_AREA_W = (int)(BASE_VALUE_AREA_W * s);
@@ -408,26 +408,55 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             TrackMouseEvent(&tme);
             m_tracking = true;
         }
+        m_hovering = true;   // HoverTick over_group 信号（M6 §4.3.2）
         return 0;
     }
 
     case WM_MOUSELEAVE:
         m_tracking = false;
+        m_hovering = false;
         return 0;
+
+    case WM_WINDOWPOSCHANGED: {
+        // M6 问题①治本：系统拖动模态循环期间每帧发本消息——blur 与内容
+        // 同帧成对移动。旧序 blur 只在刷新周期 Reposition() 里同步，拖动
+        // 期间亚克力面板与内容分家（PNM tooltip_popup.cpp:231-235 同手法
+        // 用于锚跟随路径）。尺寸变化走 Reposition 成对重建，这里只跟位置
+        WINDOWPOS* p = (WINDOWPOS*)lp;
+        if (p && m_blur_hwnd && !(p->flags & SWP_NOMOVE) && IsWindowVisible(m_hwnd)) {
+            SetWindowPos(m_blur_hwnd, nullptr, p->x, p->y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return DefWindowProcW(m_hwnd, msg, wp, lp);
+    }
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            SetCursor(LoadCursor(nullptr, IDC_ARROW));
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(m_hwnd, &pt);
+            // 指标区手型：可点击切换（M6 §4.1.2 单窗模式）
+            SetCursor(LoadCursor(nullptr,
+                                 PtInRect(&m_rc_metric, pt) ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         return DefWindowProcW(m_hwnd, msg, wp, lp);
 
     case WM_NCHITTEST: {
-        // 标题栏 = 系统托管拖动（ULW 下同样工作）；内容区 = 客户区
+        // 头部条 = 拖动柄（HTCAPTION 系统托管拖动，ULW 下同样工作）；
+        // 指标区让给点击切换（单窗可点，M6 §4.1.2）；其余 = 客户区
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         ScreenToClient(m_hwnd, &pt);
-        if (pt.y < TITLE_H) return HTCAPTION;
+        if (PtInRect(&m_rc_header, pt) && !PtInRect(&m_rc_metric, pt))
+            return HTCAPTION;
         return HTCLIENT;
+    }
+
+    case WM_LBUTTONDOWN: {
+        // 指标区点击 = 切下一指标（循环，与滚轮同调 SetKind；M6 §4.1.3）
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        if (PtInRect(&m_rc_metric, pt)) CycleKind(1);
+        return 0;
     }
 
     case WM_NCRBUTTONUP:
@@ -449,14 +478,7 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         // 滚轮循环切换指标（方案 §6.2）：零额外采集，只换快照子集
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        static const MetricKind order[] = {
-            MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
-            MetricKind::Gpu, MetricKind::Vram
-        };
-        int idx = 0;
-        for (int i = 0; i < 5; i++) if (order[i] == m_kind) idx = i;
-        idx = (idx + (delta > 0 ? 1 : 4)) % 5;
-        SetKind(order[idx]);
+        CycleKind(delta > 0 ? 1 : -1);
         return 0;
     }
 
@@ -529,6 +551,18 @@ void CTopListWindow::SetKind(MetricKind k) {
     WindowManager::Instance().RecomputeBoundMask();
     CProcessTopPlugin::Instance().m_settings_dirty = true;
     RecalcAndRepaint(true);
+}
+
+void CTopListWindow::CycleKind(int step) {
+    // 循环切换（滚轮/头部指标区点击共用，M6 §4.1.2/§4.1.3）
+    static const MetricKind order[] = {
+        MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
+        MetricKind::Gpu, MetricKind::Vram
+    };
+    int idx = 0;
+    for (int i = 0; i < 5; i++) if (order[i] == m_kind) idx = i;
+    idx = ((idx + step) % 5 + 5) % 5;
+    SetKind(order[idx]);
 }
 
 // ============================================================
@@ -1338,25 +1372,88 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     SelectObject(hdc, hOld);
 
     out_w = (int)(BASE_WIDTH * m_dpi_scale);
-    out_h = PADDING + TITLE_H + SUMMARY_H
+    out_h = PADDING + HEADER_H + SUMMARY_H
             + status_lines * STATUS_H
             + rows * ROW_HEIGHT
             + PADDING;
-    if (out_h < TITLE_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING)
-        out_h = TITLE_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING;
+    if (out_h < HEADER_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING)
+        out_h = HEADER_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING;
 }
 
-void CTopListWindow::DrawTitleBar(HDC hdc, int w, int y) {
-    // 标题：当前指标名（accent 色）。（M6：右上角 × 关闭键已删——关闭
-    // 走右键菜单；本函数由头部条取代是 C2 的事，此处保留标题布局）
+void CTopListWindow::DrawHeader(HDC hdc, int w, int y) {
+    // M6 §4.1.2 头部条（替代自创标题栏）：左 = 指标区 ‹ 名称 ›（chevron
+    // 常显，暗示可切换；指标名 accent 色），右 = 传感器摘要（M3-3 逻辑
+    // 原样从摘要行挪入）。rect 记入 m_rc_header/m_rc_metric 供命中测试
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, GetAccentColor());
-    HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
-    wchar_t title[64];
-    swprintf_s(title, 64, L"%s", MetricTitle());
-    RECT rc = { PADDING, y, w - PADDING - IDX_W, y + TITLE_H };
-    DrawTextW(hdc, title, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    m_rc_header = { 0, y, w, y + HEADER_H };
 
+    const wchar_t* title = MetricTitle();
+    HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
+    SIZE sz_name{};
+    GetTextExtentPoint32W(hdc, title, (int)wcslen(title), &sz_name);
+    SelectObject(hdc, m_font_small);
+    SIZE sz_cl{}, sz_cr{};
+    GetTextExtentPoint32W(hdc, L"\u2039", 1, &sz_cl);   // ‹
+    GetTextExtentPoint32W(hdc, L"\u203a", 1, &sz_cr);   // ›
+    int gap = (int)(4 * m_dpi_scale);
+
+    COLORREF dim = UseTextTheme() ? RGB(150, 150, 150) : RGB(110, 110, 110);
+    int x = PADDING;
+    SetTextColor(hdc, dim);
+    RECT rl = { x, y, x + sz_cl.cx + gap, y + HEADER_H };
+    DrawTextW(hdc, L"\u2039", -1, &rl, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    x += sz_cl.cx + gap;
+
+    SelectObject(hdc, m_font_normal);
+    SetTextColor(hdc, GetAccentColor());
+    RECT rn = { x, y, x + sz_name.cx + gap * 2, y + HEADER_H };
+    DrawTextW(hdc, title, -1, &rn, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    x += sz_name.cx + gap;
+
+    SelectObject(hdc, m_font_small);
+    SetTextColor(hdc, dim);
+    RECT rr = { x, y, x + sz_cr.cx + gap, y + HEADER_H };
+    DrawTextW(hdc, L"\u203a", -1, &rr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    // 指标区 rect：整段（点击切换 / 手型光标；多窗模式不画 chevron 的
+    // 分支在 C3 设置项就绪后接入）
+    m_rc_metric = { PADDING, y, x + sz_cr.cx, y + HEADER_H };
+
+    // ---- 右：传感器摘要（CPU=温度+频率；GPU/显存=GPU 温度；非零才显示，
+    // sensor_summary=false 不画；M6 §4.1.2 从摘要行挪入头部条右端）----
+    wchar_t sensor[48] = L"";
+    if (CProcessTopPlugin::Instance().m_settings.sensor_summary) {
+        wchar_t seg[32];
+        if (m_kind == MetricKind::Cpu) {
+            // 频率 MHz 整数 ≥1000 换算 GHz 一位小数（单位换算非精度截断）
+            if (m_tm_cpu_temp > 0) {
+                swprintf_s(seg, 32, L"%d\x00b0C", m_tm_cpu_temp);
+                wcscat_s(sensor, 48, seg);
+            }
+            if (m_tm_cpu_freq > 0) {
+                if (sensor[0]) wcscat_s(sensor, 48, L" ");
+                if (m_tm_cpu_freq >= 1000) {
+                    int tenths = (m_tm_cpu_freq + 50) / 100;
+                    swprintf_s(seg, 32, L"%d.%dGHz", tenths / 10, tenths % 10);
+                } else {
+                    swprintf_s(seg, 32, L"%dMHz", m_tm_cpu_freq);
+                }
+                wcscat_s(sensor, 48, seg);
+            }
+        } else if (m_kind == MetricKind::Gpu || m_kind == MetricKind::Vram) {
+            if (m_tm_gpu_temp > 0) {
+                swprintf_s(seg, 32, L"%d\x00b0C", m_tm_gpu_temp);
+                wcscat_s(sensor, 48, seg);
+            }
+        }
+        // 内存/磁盘维度无对应传感器：不显示（温度与维度无关反而误导）
+    }
+    if (sensor[0]) {
+        SetTextColor(hdc, dim);
+        RECT rs = { PADDING, y, w - PADDING, y + HEADER_H };
+        InflateRect(&rs, -(int)(8 * m_dpi_scale), 0);
+        DrawTextW(hdc, sensor, -1, &rs,
+                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
     SelectObject(hdc, hOld);
 }
 
@@ -1413,45 +1510,7 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_small);
     RECT rc = { PADDING, y, w - PADDING, y + SUMMARY_H };
     DrawTextW(hdc, text, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-    // 传感器段（M3-3 L0 白拿）：开关开着且值非 0 才显示（风险 #18——
-    // TM 未启用温度监控时自动隐藏，不留空白占位）；画在摘要行右端，
-    // 与左侧数值之间留 8px，小号字体 + 次要色（与状态行同款灰）
-    wchar_t sensor[48] = L"";
-    if (CProcessTopPlugin::Instance().m_settings.sensor_summary) {
-        wchar_t seg[32];
-        if (m_kind == MetricKind::Cpu) {
-            // CPU：温度 + 频率（各有值才拼各自段）；频率 MHz 整数 ≥1000
-            // 换算 GHz 一位小数（单位换算，不是精度截断），<1000 显示 MHz
-            if (m_tm_cpu_temp > 0) {
-                swprintf_s(seg, 32, L"%d\x00b0C", m_tm_cpu_temp);
-                wcscat_s(sensor, 48, seg);
-            }
-            if (m_tm_cpu_freq > 0) {
-                if (sensor[0]) wcscat_s(sensor, 48, L" ");
-                if (m_tm_cpu_freq >= 1000) {
-                    // 一位小数（四舍五入到 0.1GHz；4950 → 5.0 而非 4.10）
-                    int tenths = (m_tm_cpu_freq + 50) / 100;
-                    swprintf_s(seg, 32, L"%d.%dGHz", tenths / 10, tenths % 10);
-                } else {
-                    swprintf_s(seg, 32, L"%dMHz", m_tm_cpu_freq);
-                }
-                wcscat_s(sensor, 48, seg);
-            }
-        } else if (m_kind == MetricKind::Gpu || m_kind == MetricKind::Vram) {
-            if (m_tm_gpu_temp > 0) {
-                swprintf_s(seg, 32, L"%d\x00b0C", m_tm_gpu_temp);
-                wcscat_s(sensor, 48, seg);
-            }
-        }
-        // 内存/磁盘维度无对应传感器：不显示（温度与维度无关反而误导）
-    }
-    if (sensor[0]) {
-        SetTextColor(hdc, UseTextTheme() ? RGB(150, 150, 150) : RGB(110, 110, 110));
-        RECT rs = { PADDING, y, w - PADDING, y + SUMMARY_H };
-        InflateRect(&rs, -(int)(8 * m_dpi_scale), 0);
-        DrawTextW(hdc, sensor, -1, &rs, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    }
+    // 传感器摘要已挪头部条右端（M6 §4.1.2），摘要行只留数值
     SelectObject(hdc, hOld);
 }
 
@@ -1583,8 +1642,8 @@ void CTopListWindow::DrawContent(HDC dc, int w, int h, bool content_only) {
     }
 
     int y = PADDING;
-    DrawTitleBar(dc, w, y);
-    y += TITLE_H;
+    DrawHeader(dc, w, y);
+    y += HEADER_H;
     DrawSummary(dc, w, y);
     y += SUMMARY_H;
     // 状态行（清单与 CalcLayout 共用，顺序一致）

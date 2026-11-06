@@ -62,6 +62,8 @@ public:
     bool IsVisible() const { return m_hwnd && IsWindowVisible(m_hwnd) != FALSE; }
     // 首显判定（内部 ULW 首显干净截屏路径用；隐藏≠未首显）
     bool WasShownOnce() const { return m_visible; }
+    // hover 状态机信号（TrackMouseEvent leave 追踪，M6 §4.3.2 over_group）
+    bool IsHovering() const { return m_hovering; }
     HWND GetHwnd() const { return m_hwnd; }
     void GetWindowPos(POINT& pt) const;   // settings persistence
 
@@ -93,8 +95,10 @@ private:
     void CalcLayout(HDC hdc, int& out_w, int& out_h);
     void DrawContent(HDC dc, int w, int h, bool content_only);
     void DrawRow(HDC hdc, int y, int idx, const TopRow& row);
-    void DrawTitleBar(HDC hdc, int w, int y);
+    void DrawHeader(HDC hdc, int w, int y);   // M6 头部条：‹指标名› + 传感器摘要
     void DrawSummary(HDC hdc, int w, int y);
+    // 指标循环切换（滚轮/头部点击共用；单窗模式，M6 §4.1.2/§4.1.3）
+    void CycleKind(int step);
     enum StatusTone {
         ToneIoGrade,      // 黄：IO C 档警示
         ToneEventsLost,   // 黄：ETW 丢事件
@@ -204,16 +208,19 @@ private:
     HPEN m_pen_separator = nullptr;
     bool m_pen_dark = true;
 
-    // hover state for title bar (repaint on flip only)
+    // hover state for header bar (repaint on flip only)
     bool m_tracking = false;
+    bool m_hovering = false;           // 光标在窗内（HoverTick over_group 信号）
+    RECT m_rc_header = {};             // 头部条（拖动柄 + 命中测试）
+    RECT m_rc_metric = {};             // 指标区（点击切换；单窗模式可点）
 
     // layout constants (96-DPI base, DPI-scaled members)
     int PADDING = 12, ROW_HEIGHT = 30, ICON_SIZE = 20, CORNER_RADIUS = 8;
-    int TITLE_H = 30, SUMMARY_H = 26, STATUS_H = 20;
+    int HEADER_H = 26, SUMMARY_H = 26, STATUS_H = 20;
     int VALUE_AREA_W = 90, IDX_W = 22;
     static constexpr int BASE_PADDING = 12, BASE_ROW_HEIGHT = 30, BASE_ICON_SIZE = 20;
     static constexpr int BASE_CORNER_RADIUS = 8;
-    static constexpr int BASE_TITLE_H = 30, BASE_SUMMARY_H = 26, BASE_STATUS_H = 20;
+    static constexpr int BASE_HEADER_H = 26, BASE_SUMMARY_H = 26, BASE_STATUS_H = 20;
     static constexpr int BASE_VALUE_AREA_W = 90, BASE_IDX_W = 22;
     int BASE_WIDTH = 300;
     float m_dpi_scale = 1.0f;
