@@ -141,6 +141,8 @@ private:
     // ETW 冷启动 ~1s 且伴口径闪变——切换循环全部落在冷启动窗内）
     ULONGLONG m_gpu_idle_since = 0;
     ULONGLONG m_etw_idle_since = 0;
+    // PNM 秩序兜底轮询节流（问题④，UI 线程）：0 = 从未检查
+    ULONGLONG m_pnm_poll_tick = 0;
     ULONGLONG m_last_save_tick = 0;
 
     std::wstring m_tm_config_dir;

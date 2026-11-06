@@ -382,6 +382,19 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         WindowManager::Instance().ReclaimDead();
         return 0;
 
+    case WM_PTM_YIELD: {
+        // PNM 占位通知（问题④不对称秩序）：PNM 已弹出到方位公式正位，
+        // 本组让位重排——LayoutGroup 内 AvoidPNMPopups 枚举到 PNM 窗
+        // 自然让到旁边。pin/常驻手放位置不响应；组不可见无需重排；
+        // 消息幂等（布局同输入同输出，PNM 对每扇窗都 Post 亦无副作用）
+        if (!CProcessTopPlugin::Instance().GroupDraggable()) {
+            auto& mgr = WindowManager::Instance();
+            if (mgr.GroupVisible())
+                mgr.LayoutGroup(mgr.AnchorRect());
+        }
+        return 0;
+    }
+
     case WM_EXITSIZEMOVE: {
         // 拖动结束（常驻/pin 态才可拖，M6 §4.1.4）：位置立即写 cfg 并
         // 落盘——缺陷①（M5/A1）治本路径保留，不等 30s 节流。记忆位置

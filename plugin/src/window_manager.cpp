@@ -36,6 +36,30 @@ BOOL CALLBACK CollectPNMPopup(HWND h, LPARAM lp) {
     return TRUE;
 }
 
+// 找同进程可见 PNM 窗的包围盒（问题④兜底轮询用：PNM 在场判定 +
+// 相交检测）。两插件同住 TM UI 线程，枚举期间无并发变化
+struct PnmPresence {
+    RECT bounds{};
+    bool any = false;
+};
+
+BOOL CALLBACK CollectPNMPresence(HWND h, LPARAM lp) {
+    auto* c = (PnmPresence*)lp;
+    wchar_t cls[64];
+    if (!GetClassNameW(h, cls, 64)) return TRUE;
+    if (wcsncmp(cls, L"PNMTooltip_", 11) != 0) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h)) return TRUE;
+    RECT r;
+    if (GetWindowRect(h, &r) && r.right > r.left && r.bottom > r.top) {
+        if (c->any) UnionRect(&c->bounds, &c->bounds, &r);
+        else c->bounds = r;
+        c->any = true;
+    }
+    return TRUE;
+}
+
 void AvoidPNMPopups(int& x, int& y, int pw, int ph, const RECT& anchor,
                     const RECT& work, float dpi) {
     std::vector<RECT> avoid;
@@ -206,23 +230,21 @@ void WindowManager::HideGroup() {
     DetachAnchorTracker();
 }
 
-void WindowManager::LayoutGroup(const RECT& anchor) {
-    // M6 §4.2.2 组布局：
-    // 1) 组长位置 = PNM PositionWindow 方位公式（锚贴工作区哪条边就往
-    //    反方向弹；悬浮主窗不贴边 → 优先上方、放不下 → 下方；水平对锚
-    //    居中；margin=max(4, 4×DPI)；工作区取 MonitorFromRect(anchor)）
-    // 2) 组内排布：按 windows[] 顺序横排，间距 8×DPI；总宽超出工作区 →
-    //    换行（行间距 8×DPI，第二行从组长 x 起）；行高不同的窗按行对齐
-    // 3) 有记忆位置（x/y != INT_MIN）且当前为常驻/pin 态的窗：用记忆
-    //    位置，不参与排布
-    // 4) 逐窗 ShowAt()
-    if (m_windows.empty()) return;
-    auto& plugin = CProcessTopPlugin::Instance();
-    bool resident = (plugin.m_settings.popup_mode == 1) || plugin.GroupPinned();
-
+void WindowManager::CalcGroupLayout(const RECT& anchor, bool resident,
+                                     std::vector<SIZE>& sz,
+                                     std::vector<bool>& use_mem,
+                                     int& x, int& y, int& pw, int& ph,
+                                     bool avoid_pnm) {
+    // M6 §4.2.2 组布局纯计算（LayoutGroup 摆窗前段；问题④抽出供
+    // PnmOrderReconcile 的「理论落点 vs 实际位置」比对共用）：
+    // 1) 各窗尺寸 + 记忆位窗标记（常驻/pin 且有记忆位的窗不参与排布）
+    // 2) 横排 wrap 预演算 → 组包围盒
+    // 3) 组长位置 = PNM PositionWindow 方位公式
+    // 4) 工作区 clamp
+    // 5) 可选 PNM 避让（avoid_pnm；理论落点计算传 false）
     int n = Count();
-    std::vector<SIZE> sz(n);
-    std::vector<bool> use_mem(n, false);
+    sz.assign(n, SIZE{ 0, 0 });
+    use_mem.assign(n, false);
     HDC hdc = m_windows[0]->GetHwnd() ? GetDC(m_windows[0]->GetHwnd())
                                       : GetDC(nullptr);
     for (int i = 0; i < n; i++) {
@@ -244,23 +266,24 @@ void WindowManager::LayoutGroup(const RECT& anchor) {
 
     // 排布窗横排 wrap 预演算（x0 取工作区左界近似；求包围盒供方位公式）
     auto flow_bounds = [&](int x0, int y0, SIZE& total) {
-        int x = x0, y = y0, row_h = 0, max_w = 0;
+        int fx = x0, fy = y0, row_h = 0, max_w = 0;
         for (int i = 0; i < n; i++) {
             if (use_mem[i]) continue;
-            if (x > x0 && x + sz[i].cx > work.right - margin) {   // 换行
-                x = x0;
-                y += row_h + gap;
+            if (fx > x0 && fx + sz[i].cx > work.right - margin) {   // 换行
+                fx = x0;
+                fy += row_h + gap;
                 row_h = 0;
             }
-            max_w = std::max(max_w, (int)(x + sz[i].cx - x0));
-            x += (int)sz[i].cx + gap;
+            max_w = std::max(max_w, (int)(fx + sz[i].cx - x0));
+            fx += (int)sz[i].cx + gap;
             row_h = std::max(row_h, (int)sz[i].cy);
         }
-        total = { max_w, (row_h > 0 || y > y0) ? (y + row_h - y0) : 0 };
+        total = { max_w, (row_h > 0 || fy > y0) ? (fy + row_h - y0) : 0 };
     };
     SIZE total{};
     flow_bounds(work.left + margin, work.top + margin, total);
-    int pw = total.cx, ph = total.cy;
+    pw = total.cx;
+    ph = total.cy;
 
     // 组长位置：PNM PositionWindow 方位公式（tooltip_popup.cpp:1644-1690）
     int aw = anchor.right - anchor.left;
@@ -270,7 +293,6 @@ void WindowManager::LayoutGroup(const RECT& anchor) {
     bool at_left   = anchor.left <= work.left + 2;
     bool at_right  = anchor.right >= work.right - 2;
 
-    int x, y;
     if (at_bottom) {          // 任务栏在下 → 上方
         x = anchor.left + (aw - pw) / 2;
         y = anchor.top - ph - margin;
@@ -297,8 +319,30 @@ void WindowManager::LayoutGroup(const RECT& anchor) {
     if (y < work.top) y = work.top + margin;
 
     // PNM 悬浮窗避让：仅 hover 自动定位路径（常驻/pin = 用户手放，尊重）
-    if (!resident)
+    if (avoid_pnm && !resident)
         AvoidPNMPopups(x, y, pw, ph, anchor, work, dpi);
+}
+
+void WindowManager::LayoutGroup(const RECT& anchor) {
+    // M6 §4.2.2 组布局（计算见 CalcGroupLayout）：
+    // 3) 有记忆位置（x/y != INT_MIN）且当前为常驻/pin 态的窗：用记忆
+    //    位置，不参与排布
+    // 4) 逐窗 ShowAt()
+    if (m_windows.empty()) return;
+    auto& plugin = CProcessTopPlugin::Instance();
+    bool resident = (plugin.m_settings.popup_mode == 1) || plugin.GroupPinned();
+
+    std::vector<SIZE> sz;
+    std::vector<bool> use_mem;
+    int x, y, pw, ph;
+    CalcGroupLayout(anchor, resident, sz, use_mem, x, y, pw, ph, true);
+
+    int n = Count();
+    RECT work, mon;
+    PTM_GetWorkAreaForRect(anchor, work, mon);
+    float dpi = PTM_GetDpiScaleForRect(anchor);
+    int gap = (int)(8 * dpi);
+    int margin = std::max(4, (int)(4 * dpi));
 
     // 真排布（wrap 判定用组长真实 x）
     int cx = x, cy = y, row_h = 0;
@@ -317,6 +361,60 @@ void WindowManager::LayoutGroup(const RECT& anchor) {
         row_h = std::max(row_h, (int)sz[i].cy);
     }
     m_popup_anchor = anchor;
+}
+
+void WindowManager::PnmOrderReconcile() {
+    // 问题④兜底轮询（消息丢失/时序错乱的收敛网，HoverTick 每 ≥500ms
+    // 调）：不对称秩序——PNM 恒占方位公式正位（PNM 侧已移除对 PTM 的
+    // 避让），PTM 以 PNM 矩形为参照让到旁边；PNM 不在场时 PTM 占正位。
+    // 判定用「组长是否在理论落点」而不是裸「是否相交」：让开之后即使
+    // 包围盒仍与 PNM 相邻近也不重排，杜绝抖动循环。pin/常驻 = 用户手
+    // 放位置，永不参与
+    if (m_windows.empty()) return;
+    auto& plugin = CProcessTopPlugin::Instance();
+    if (plugin.m_settings.popup_mode == 1 || plugin.GroupPinned()) return;
+    if (!GroupVisible()) return;
+
+    PnmPresence pnm;
+    EnumWindows(CollectPNMPresence, (LPARAM)&pnm);
+
+    // PTM 组包围盒（可见窗 union）
+    RECT group{};
+    bool any_vis = false;
+    for (auto& w : m_windows) {
+        if (!w->IsVisible()) continue;
+        HWND h = w->GetHwnd();
+        RECT r;
+        if (!h || !GetWindowRect(h, &r)) continue;
+        if (any_vis) UnionRect(&group, &group, &r);
+        else { group = r; any_vis = true; }
+    }
+    if (!any_vis) return;
+
+    // 理论落点 = 无避让的方位公式输出（与 LayoutGroup 同一份公式，
+    // CalcGroupLayout 单一事实源）；组长实际位与之重合 ±2px 视为「在
+    // 正位」——AvoidPNMPopups 的让位位移以整窗宽计，远超此容差
+    std::vector<SIZE> sz;
+    std::vector<bool> use_mem;
+    int tx, ty, tw, th;
+    CalcGroupLayout(m_popup_anchor, false, sz, use_mem, tx, ty, tw, th, false);
+    HWND leader = m_windows[0]->GetHwnd();
+    RECT lr;
+    if (!leader || !GetWindowRect(leader, &lr)) return;
+    bool at_theoretical = (abs(lr.left - tx) <= 2 && abs(lr.top - ty) <= 2);
+
+    if (pnm.any) {
+        RECT inter;
+        if (IntersectRect(&inter, &group, &pnm.bounds) && at_theoretical) {
+            // PNM 压到组上且 PTM 还在正位：重排让位（LayoutGroup 内
+            // AvoidPNMPopups 枚举到 PNM 窗自然让开；幂等）
+            LayoutGroup(m_popup_anchor);
+        }
+    } else if (!at_theoretical) {
+        // PNM 全部收起且 PTM 还让在旁边：重排归位（无 PNM 窗可避，
+        // LayoutGroup 回理论落点；幂等）
+        LayoutGroup(m_popup_anchor);
+    }
 }
 
 void WindowManager::GroupDeltaMove(int dx, int dy) {

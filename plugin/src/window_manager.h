@@ -70,11 +70,25 @@ public:
     // 组隐藏时窗口 SW_HIDE 不停 timer；组长变化（首建/销毁）后重挂
     void EnsureHoverTimer();
 
+    // ---- PNM 秩序兜底（问题④不对称秩序，UI 线程）----
+    // HoverTick 每 ≥500ms 调：检测同进程 PNMTooltip_ 窗与 PTM 组的
+    // 关系——PNM 压住正位且 PTM 还在理论矩形 → 重排让位；PNM 全部消失
+    // 且 PTM 已让开 → 重排归位。判定用「组长是否在理论落点」而非裸
+    // 相交，避免让开后的抖动循环；pin/常驻手放位置不参与
+    void PnmOrderReconcile();
+
     // ---- 死窗回收（tick 线程调；× 钮销毁 HWND 后由这里清对象）----
     void ReclaimDead();
 
 private:
     WindowManager() = default;
+    // 组布局纯计算（LayoutGroup 的 1-5 段：各窗尺寸 → wrap 包围盒 →
+    // 方位公式 → 工作区 clamp → 可选 PNM 避让）。LayoutGroup 摆窗与
+    // PnmOrderReconcile 的理论落点比对共用同一份公式，杜绝第二份布局
+    // 逻辑漂移（问题④）
+    void CalcGroupLayout(const RECT& anchor, bool resident,
+                         std::vector<SIZE>& sz, std::vector<bool>& use_mem,
+                         int& x, int& y, int& pw, int& ph, bool avoid_pnm);
     // 锚窗子类化走 comctl32 SetWindowSubclass（2026-11-06 双环崩溃根治）：
     // master_proc 中性地址挂在 GWLP_WNDPROC 链头，本方 proc 地址不被链上
     // 任何一方当 orig 持有——跨插件叠挂/摘除不可能造出自指/互指环

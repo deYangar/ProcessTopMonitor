@@ -787,6 +787,13 @@ void CProcessTopPlugin::HoverTick() {
             follow_wnd = m_hover_target;
         mgr.SetAnchorFollow(follow_wnd);
     }
+    // 5. PNM 秩序兜底轮询（问题④）：WM_PTM_YIELD 消息丢失/时序错乱时
+    //    ≤500ms 收敛——PNM 压正位→让位、PNM 收起→归位（判定与重排在
+    //    WindowManager::PnmOrderReconcile；pin/常驻内部自行短路）
+    if (now - m_pnm_poll_tick >= 500) {
+        m_pnm_poll_tick = now;
+        mgr.PnmOrderReconcile();
+    }
     // 组可见期间数据刷新：WM_PTM_REFRESH 投递管线不变（轻量：锚没动
     // 不重排）
 }

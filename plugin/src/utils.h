@@ -45,6 +45,12 @@ inline bool PTM_GetDebugDir(wchar_t* buf, size_t cap) {
 // Posted (possibly from the tick thread) to a live window: run WindowManager
 // dead-window reclamation on the UI thread (vector mutation is UI-only)
 #define WM_PTM_RECLAIM (WM_APP + 7)
+// PNM → PTM 让位通知（问题④不对称秩序，紧接本插件 WM_APP+1..7 段）：
+// PNM PositionWindow 定位完成（占住方位公式正位）后 Post 给同进程可见
+// PTMTopList_ 窗，PTM 收到即 LayoutGroup 重排让到旁边。只 Post 不 Send
+// ——跨 DLL 单向弱通知，PTM 未加载/无窗时自然无人处理；PNM 侧以裸
+// 常量 WM_APP+8 对齐（两 DLL 不共享头文件），幂等无副作用
+#define WM_PTM_YIELD (WM_APP + 8)
 
 // Measure text width (pixels) with a given font. DPI-native by definition.
 inline int PTM_MeasureText(HDC hdc, HFONT hFont, const wchar_t* text) {
