@@ -903,10 +903,24 @@ void CProcessTopPlugin::RefreshTick() {
         m_gpu.EnsureStarted();
         m_gpu_idle_since = 0;
         if (!was_running && m_gpu.IsRunning()) {
-            // 分频相位重置（问题①C）：拨到 0 → 本拍 ++ 后为 1（非 gpu_tick，
-            // 避开与 EnsureStarted 预热采样的同时间戳第二次采集），下一拍
-            // ++ 后为 2 = gpu_tick——正好衔接预热第 1 拍出利用率，消除相位
-            // 随机多等的一拍。真冷启动整体 = 1 拍 hint + 下一拍有值
+            // 真冷启动当拍出值（问题①C 收尾，2026-11-06 反馈「切到
+            // GPU 还是要预热」）：Utilization Percentage 是 cooked 计数器
+            // 需两次采样，EnsureStarted 已采基准拍——这里跨时间戳补第 2
+            // 次并让 Tick 把解析做完，本拍快照即有 GPU 数据，首帧零 hint
+            // （迟停 3 分钟窗内切回本就零冷启动，此处只治真停后场景）。
+            // 探针 tools/pdh_warm_probe.cpp 实测：0ms 间隔值全 0（旧注释
+            // 「时间戳相同 PDH 会拒」不准——collect 不拒但 rate 算不出），
+            // +50ms 出有效值；50ms 一次性成本在 tick 线程无锁段可接受。
+            // G2（D3DKMT）首拍自记基准、第二拍差分出值，不走此路径
+            if (m_gpu.Grade() == GpuGrade::G1) {
+                Sleep(50);
+                std::vector<DWORD> pids;
+                pids.reserve(m.procs.size());
+                for (auto& p : m.procs) pids.push_back(p.pid);
+                m_gpu.Tick(m_gpu_last, pids);
+            }
+            // 相位重置：本拍 ++ 后为 1（非 gpu_tick，沿用刚采的数据），
+            // 下一拍 ++ 后为 2 = gpu_tick——正常 2 拍节奏无缝衔接
             m_gpu_tick_div = 0;
         }
     } else if (m_gpu.IsRunning()) {
