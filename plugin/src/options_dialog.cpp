@@ -5,7 +5,6 @@
 #include "options_dialog.h"
 #include "plugin_main.h"
 #include "window_manager.h"
-#include "dock_manager.h"
 #include "utils.h"
 #include "i18n.h"
 #include <commctrl.h>
@@ -33,7 +32,6 @@ enum {
     IDC_OPACITY_TRK,          // 不透明度滑条
     IDC_OPACITY_VAL,          // 不透明度数值
     IDC_COLOR_CBO,            // 颜色模式
-    IDC_DOCKEDGE_CBO,         // 停靠边
     IDC_SENSOR_CHK,           // 传感器摘要
     IDC_DEBUG_CHK,            // 调试日志
 };
@@ -328,14 +326,7 @@ void PtCreateControls(HWND hwnd) {
         }
         PtFont(c6);
         int iy2 = iy + Sc(34);
-        PtFont(PtLabel(hwnd, TR(L"停靠边"), M + Sc(12), iy2 + Sc(4), Sc(44), Sc(20)));
-        HWND c7 = PtCombo(hwnd, IDC_DOCKEDGE_CBO, M + Sc(60), iy2, Sc(110));
-        const wchar_t* edges[] = { L"自动", L"右侧", L"左侧" };
-        for (int i = 0; i < 3; i++) {
-            PtCboAdd(hwnd, IDC_DOCKEDGE_CBO, TR(edges[i]), i);
-            if (st.dock_edge == i) SendMessageW(c7, CB_SETCURSEL, i, 0);
-        }
-        PtFont(c7);
+        // 停靠边已随 dock_manager 移除（M6 §4.4）；传感器摘要挪头部条
         HWND s1 = CreateWindowW(L"BUTTON", TR(L"标题栏显示温度/频率（来自 TrafficMonitor）"),
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
             M + Sc(190), iy2, Sc(340), Sc(20), hwnd,
@@ -398,7 +389,6 @@ void PtOnOk(HWND hwnd) {
     st.vram_basis = (SendMessageW(GetDlgItem(hwnd, IDC_VRAM_SHARED), BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
     int iov = PtCboSel(hwnd, IDC_IOVIEW_CBO);
     if (iov >= 0) st.io_view = iov;
-    st.dock_edge = std::max(0, PtCboSel(hwnd, IDC_DOCKEDGE_CBO));
     st.sensor_summary = SendMessageW(GetDlgItem(hwnd, IDC_SENSOR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.debug_logs = SendMessageW(GetDlgItem(hwnd, IDC_DEBUG_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     int eff = PtCboSel(hwnd, IDC_EFFECT_CBO);

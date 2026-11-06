@@ -6,7 +6,6 @@
 #include "top_aggregator.h"
 #include "top_list_window.h"
 #include "window_manager.h"
-#include "dock_manager.h"
 #include "settings.h"
 #include "i18n.h"
 #include <atomic>
@@ -57,14 +56,14 @@ public:
         StopRefreshTimer();
         m_etw.Stop();
         m_gpu.EnsureStopped();
-        // hook 是进程资源，TM 退出随进程回收；显式清理防 FMW 场景 DLL
-        // 先于进程卸载时回调进已卸载代码（M3-2 边界 6，PNM issue #7 同族）
-        DockManager::Instance().RemoveHooks();
+        // 锚窗子类化还原：TM 主窗通常活得比本 DLL 久，留着 AnchorProc
+        // 会在 DLL 卸载后炸宿主（PNM 同款纪律）
+        WindowManager::Instance().DetachAnchorTracker();
     }
 
     // ---- UI thread entry points (called from the top-list window) ----
     void TopListRefreshFromSnapshot();   // WM_PTM_REFRESH handler
-    void ToggleTopListWindow(HWND parent);
+    void ToggleTopListWindow(HWND parent);   // C3 过渡：C4 由 item pin 语义取代
     void SaveSettingsIfDirty();
     void ApplySettingsToCollectors();    // memory basis / GPU scope / debug logs
     void SaveWindowConfigsNow();         // 拖动结束等即时落盘路径（缺陷①修复）
@@ -83,6 +82,17 @@ public:
     std::vector<std::wstring> EnumerateGpuEnginesForDialog();      // 运行中取快照，否则临时查询
     FileIoGrade RetryFileIoSession() { return m_etw.Start(); }     // 幂等重试
     void GetIoStatusForDialog(wchar_t* out, size_t cap);           // 档位文案 + 丢事件
+
+    // ---- M6 hover/pin 状态（UI 线程；§4.3.2 状态字段照 PNM 命名）----
+    bool GroupPinned() const { return m_group_pinned; }
+    HWND m_hover_target = nullptr;       // 当前 hover 的 TM 窗（主窗句柄）
+    bool m_hover_is_taskbar = false;     // 目标是否任务栏上下文（锚带跟随）
+    ULONGLONG m_hover_start_tick = 0;    // hover 计时起点（400ms 阈值）
+    ULONGLONG m_hover_leave_tick = 0;    // 离开宽限起点（300ms）
+    bool m_group_pinned = false;         // pin：hover/常驻间临时切换
+    // 常驻启动/pin 恢复的布局锚：TM 主窗 rect（枚举查找），找不到用
+    // 主屏工作区兜底（M6 §4.2.4）
+    RECT GetStartupAnchor();
 
     // settings live here; the window reads a copy on push
     PtSettings m_settings;

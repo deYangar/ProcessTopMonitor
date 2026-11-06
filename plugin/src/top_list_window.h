@@ -59,6 +59,12 @@ public:
     void SetKind(MetricKind k);
     MetricKind GetKind() const { return m_kind; }
 
+    // 组显示入口（M6 §4.1.5，WindowManager 组布局逐窗调用）：
+    // ShowAt = 指定位置上屏（blur 先内容后成对 SetWindowPos，含首显
+    // 干净截屏反色判定）；Hide = 双窗 SW_HIDE 成对 + 状态复位
+    void ShowAt(int x, int y);
+    void Hide();
+
     bool IsVisible() const { return m_hwnd && IsWindowVisible(m_hwnd) != FALSE; }
     // 首显判定（内部 ULW 首显干净截屏路径用；隐藏≠未首显）
     bool WasShownOnce() const { return m_visible; }

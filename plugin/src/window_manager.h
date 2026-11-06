@@ -1,10 +1,13 @@
 #pragma once
 // ============================================================
-// window_manager — 排行悬浮窗实例生命周期 + windows[] 配置持久化
-// (技术方案 §6.3/§6.4，M3-1)
+// window_manager — 排行悬浮窗实例生命周期 + windows[] 配置持久化 +
+// 组显示控制（组布局 / 锚窗子类化跟随，M6 §4.2）
 // 单例（与插件单例同生命周期）。全部方法只在 TM 主线程调用，仅两处例外：
 //   - BoundMask()：tick 线程原子读（GPU 按需启停判定）
 //   - ReclaimDead()：tick 线程调用，但收尸动作会转交 UI 线程（见实现）
+// M6 职责变化：新增组显示控制 + 组布局 + 锚窗子类化；删除
+// ShowAll/HideAll/ToggleAll（被 plugin_main hover 状态机取代）与
+// OnWindowMoveEnded（移入窗口自身 WM_EXITSIZEMOVE）。
 // ============================================================
 #include "top_list_window.h"
 #include <memory>
@@ -20,19 +23,33 @@ public:
     // 启动时从 cfgs 恢复全部窗口（空则不建窗）；返回实际建窗数。
     // 某窗 Create 失败（资源枯竭）跳过该行不中断。
     int RestoreAll(const std::vector<WindowCfg>& cfgs);
-    // 新建一窗（菜单「新建悬浮窗」/item 点击建默认窗）。cfg.x==INT_MIN
-    // 时取工作区级联位置；返回 index，失败 -1。
+    // 新建一窗（菜单「添加窗口」/item 点击建默认窗）。返回 index，失败 -1。
     int AddWindow(const WindowCfg& cfg);
     // 销毁第 idx 窗并从列表移除（配置随行删除），返回剩余窗数
     int DestroyAt(int idx);
     // 全部销毁（窗口随进程走，DLL 卸载期不调用；此方法给测试用）
     void DestroyAll();
 
-    // ---- 显示状态 ----
-    bool AnyVisible() const;
-    void ShowAll();    // item 点击：显示全部（恢复隐藏窗 + 立即灌快照）
-    void HideAll();    // item 点击：隐藏全部（配置保留）
-    void ToggleAll();  // = AnyVisible ? HideAll : (空列表则建默认窗) ShowAll
+    // ---- 组显示控制（M6 §4.2.4，UI 线程）----
+    // LayoutGroup + 可选挂锚跟随（follow_wnd=nullptr：pin/常驻不跟锚）。
+    // 锚 rect：TM 主窗 rect 或任务栏光标 ±60px 锚带
+    void ShowGroupAt(const RECT& anchor, HWND follow_wnd = nullptr);
+    void HideGroup();                       // 逐窗 Hide() + 卸锚子类化
+    bool GroupVisible() const;              // 任一窗可见
+    // 组布局（M6 §4.2.2）：组长位置 = PNM PositionWindow 方位公式；
+    // 组内横排 wrap；有记忆位置且常驻/pin 态的窗用记忆位置不参与排布；
+    // 逐窗 ShowAt()。只在出现/锚全量重排/尺寸变化时跑，纯跟随走 delta 路径
+    void LayoutGroup(const RECT& anchor);
+    // 锚纯位移路径（M6 §4.2.3）：整组每窗 blur+内容同参数连续
+    // SetWindowPos + 工作区 clamp（无累积漂移）
+    void GroupDeltaMove(int dx, int dy);
+
+    // ---- 锚窗子类化跟随五件套（M6 §4.2.3，抄 PNM tooltip_popup 机制）----
+    void SetAnchorFollow(HWND anchor);      // 幂等；仅同线程窗口
+    void DetachAnchorTracker();             // 链头在则还原；被叠留 orphan 透传链
+    void OnAnchorPosChanged(const RECT& new_anchor, bool sized);
+    void AnchorFullPass(const RECT& anchor_rect);   // sized/跨屏/松手全量重排
+    RECT AnchorRect() const { return m_popup_anchor; }   // HoverTick 兜底比对
 
     // ---- 数据/通知广播（UI 线程：RefreshTick 投递后窗口拉取）----
     void RefreshAll(const MetricsSnapshot& snap, bool snap_valid,
@@ -44,21 +61,37 @@ public:
     CTopListWindow* At(int idx);
     int Count() const { return (int)m_windows.size(); }
     std::vector<WindowCfg> CollectConfigs() const;   // 持久化时读（含隐藏窗）
-    // 指标绑定位集（bit per MetricKind）：遍历可见窗口求并集——
-    // HideAll 后 GPU 停采，ShowAll 恢复（方案 §3.3 语义）
-    void RecomputeBoundMask();                       // 增删窗/SetKind/显隐后调
+    // 指标绑定位集（bit per MetricKind）：M6 §4.2.5 语义修正——「存在」
+    // （配置内）窗口并集，hover 隐藏 ≠ 关闭，采集保持预热
+    void RecomputeBoundMask();                       // 增删窗/SetKind 后调
     int  BoundMask() const { return m_bound_mask.load(std::memory_order_relaxed); }
 
-    // ---- 缺陷①修复（M5/A1）：窗口拖动结束回调 → 立即落盘 ----
-    void OnWindowMoveEnded(int idx);
+    // ---- hover 状态机 timer（100ms，挂组长窗，M6 §4.3.2）----
+    // 组隐藏时窗口 SW_HIDE 不停 timer；组长变化（首建/销毁）后重挂
+    void EnsureHoverTimer();
 
     // ---- 死窗回收（tick 线程调；× 钮销毁 HWND 后由这里清对象）----
     void ReclaimDead();
 
 private:
     WindowManager() = default;
+    static LRESULT CALLBACK AnchorProc(HWND, UINT, WPARAM, LPARAM);
     std::vector<std::unique_ptr<CTopListWindow>> m_windows;
     std::atomic<int> m_bound_mask{0};
     int m_cascade = 0;   // 级联偏移计数（新窗位置 = 工作区 10% 处 + 28*n）
     DWORD m_ui_tid = 0;  // 首窗创建线程（= UI 线程），收尸分派判定用
+
+    // ---- 锚跟随状态（全部 UI 线程）----
+    HWND m_anchor_wnd = nullptr;          // 子类化中的锚窗
+    WNDPROC m_anchor_orig_proc = nullptr;
+    bool m_anchor_in_sizemove = false;
+    RECT m_last_seen_anchor = {};         // delta 基准
+    bool m_have_last_seen_anchor = false; // 首事件只建基准不跟随
+    HMONITOR m_last_seen_mon = nullptr;
+    ULONGLONG m_last_full_pass_tick = 0;  // 全量重排节流（100ms）
+    RECT m_popup_anchor = {};             // 锚 rect（供 HoverTick 轮询兜底比对）
+    // detach 时若本插件不在子类化链头（有后来者叠在上方），直接还原 orig
+    // 会掐断后来者的链——此时留 AnchorProc 原地纯透传（PNM :107-108 同款）
+    static WNDPROC s_orphan_anchor_orig;
+    static HWND s_orphan_anchor_hwnd;
 };

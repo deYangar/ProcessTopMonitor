@@ -271,6 +271,112 @@ int CTopItem::OnMouseEvent(MouseEventType type, int x, int y, void* hWnd, int fl
 }
 
 // ============================================================
+// TM window classification (M6 §4.3.1，照抄 PNM plugin_main.cpp:1097-1221)
+// ============================================================
+
+// Check if a TrafficMonitor window is the floating main window (not on taskbar)
+static bool IsTMMainWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (wcsncmp(cls, L"TrafficMonitor", 14) != 0) return false;
+
+    RECT rc;
+    GetWindowRect(hwnd, &rc);
+
+    APPBARDATA abd = { sizeof(abd) };
+    UINT state = SHAppBarMessage(ABM_GETTASKBARPOS, &abd);
+    if (!state) return true;
+
+    RECT tb = abd.rc;
+    switch (abd.uEdge) {
+    case ABE_BOTTOM: return rc.top < tb.top;
+    case ABE_TOP:    return rc.bottom > tb.bottom;
+    case ABE_LEFT:   return rc.right > tb.right;
+    case ABE_RIGHT:  return rc.left < tb.left;
+    }
+    return true;
+}
+
+// Check if a TrafficMonitor window is embedded in the taskbar
+static bool IsTMTaskbarWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (wcsncmp(cls, L"TrafficMonitor", 14) != 0) return false;
+
+    RECT rc;
+    GetWindowRect(hwnd, &rc);
+
+    APPBARDATA abd = { sizeof(abd) };
+    UINT state = SHAppBarMessage(ABM_GETTASKBARPOS, &abd);
+    if (!state) return false;  // can't determine taskbar position
+
+    // Check if window overlaps with taskbar
+    RECT tb = abd.rc;
+    RECT inter;
+    return IntersectRect(&inter, &rc, &tb) != 0;
+}
+
+// Walk the parent chain to find a TrafficMonitor window.
+// Dialogs (class #32770) stop the chain: hovering a settings / connection
+// dialog (owned by TM) must NOT trigger our popup. The taskbar dialog is
+// the exception - its title contains "TrafficMonitorTaskbarWindow" and we
+// keep walking up to its parent (the main TM window).
+static HWND FindTMWindowInChain(HWND hwnd) {
+    for (HWND cur = hwnd; cur; cur = GetParent(cur)) {
+        wchar_t cls[64] = {};
+        GetClassNameW(cur, cls, 64);
+        if (wcsncmp(cls, L"TrafficMonitor", 14) == 0)
+            return cur;
+        // Popup menu (#32768): hovering any menu (incl. submenus) must NOT
+        // trigger our popup - menus are owned by TM but are separate windows
+        if (wcscmp(cls, L"#32768") == 0)
+            return nullptr;
+        if (wcscmp(cls, L"#32770") == 0) {
+            wchar_t txt[256] = {};
+            GetWindowTextW(cur, txt, 256);
+            // Taskbar dialog: keep walking up to its parent (main TM window)
+            if (wcsstr(txt, L"TrafficMonitorTaskbarWindow") != nullptr ||
+                wcsstr(txt, L"TrafficMonitor") != nullptr)
+                continue;
+            // Any other dialog (options, connection details, ...): stop
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+// EnumWindows 找悬浮主窗（常驻启动/pin 恢复的布局锚用；M6 §4.2.4）
+static HWND PtFindTMMainWindow() {
+    struct Ctx { HWND found = nullptr; } ctx;
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        wchar_t cls[64] = {};
+        GetClassNameW(hwnd, cls, 64);
+        if (wcsncmp(cls, L"TrafficMonitor", 14) == 0 && IsTMMainWindow(hwnd)) {
+            c->found = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, (LPARAM)&ctx);
+    return ctx.found;
+}
+
+RECT CProcessTopPlugin::GetStartupAnchor() {
+    HWND tm = PtFindTMMainWindow();
+    if (tm) {
+        RECT rc;
+        if (GetWindowRect(tm, &rc)) return rc;
+    }
+    // 兜底：主屏工作区右上虚拟锚（贴顶边 → 组弹下方；常驻用户基本都
+    // 有记忆位置，此路径只影响从未拖过的首启）
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    return { wa.right - 200, wa.top, wa.right, wa.top + 40 };
+}
+
+// ============================================================
 // CProcessTopPlugin
 // ============================================================
 
@@ -398,20 +504,24 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     StartRefreshTimer();
 
     // ranking windows: crash guards are in place, safe to create now.
-    // RestoreAll 按 windows[] 恢复；全新用户默认一扇 CPU 窗（与 M1/M2 行为
-    // 一致）；首显经 TopListRefreshFromSnapshot 的首显路径（方案 §3.6）
+    // RestoreAll 按 windows[] 恢复（空配置 = 悬浮窗模式退出，不建窗）；
+    // 全新用户默认一扇窗，指标 = default_metric（M6 §3.1 默认 CPU）。
+    // M6：窗创建后保持隐藏——hover 模式等状态机弹显，常驻模式直接显示
     WindowManager::Instance().RestoreAll(m_settings.windows);
     if (WindowManager::Instance().Count() == 0) {
         WindowCfg def;
-        def.kind = 0;
+        def.kind = m_settings.default_metric;
         def.topn = m_settings.topn;
         def.io_view = m_settings.io_view;
         WindowManager::Instance().AddWindow(def);
     }
-    // 停靠恢复：cfg.docked==1 的窗逐个尝试贴锚（锚不在 → Floating 落位，
-    // cfg.docked 置 0），流程结束统一落盘一次（M3-2 方案 §5）
-    DockManager::Instance().RestoreFromConfigs();
-    TopListRefreshFromSnapshot();
+    TopListRefreshFromSnapshot();   // 首拍数据就位（隐藏态只保鲜不上屏）
+    // 常驻模式（popup_mode=1）：TM 启动即显示——有记忆位置的窗用记忆位
+    // 置，其余组布局（锚=TM 主窗 rect，找不到用工作区兜底）；不挂锚子
+    // 类化（常驻不跟锚，M6 §4.2.4）
+    if (m_settings.popup_mode == 1 && WindowManager::Instance().Count() > 0) {
+        WindowManager::Instance().ShowGroupAt(GetStartupAnchor());
+    }
 }
 
 void CProcessTopPlugin::ApplySettingsToCollectors() {
@@ -444,11 +554,26 @@ void CProcessTopPlugin::ApplyGpuScope(const GpuScopeConfig& cfg) {
 }
 
 void CProcessTopPlugin::ToggleTopListWindow(HWND parent) {
-    (void)parent;
-    // item toggle：全部可见 → 全部隐藏（配置保留）；有隐藏/空 → 显示/建默认
-    // 窗。两个心智模型分开：暂时收起用 item，「永久关」用窗 ×（方案 §3.2）
-    WindowManager::Instance().ToggleAll();
-    if (WindowManager::Instance().AnyVisible()) TopListRefreshFromSnapshot();
+    // C3 过渡版（C4 由 CTopItem::OnMouseEvent 的 pin 语义取代）：
+    // 空组重建默认窗（default_metric，M6 §4.2.5）+ 组显隐切换
+    auto& mgr = WindowManager::Instance();
+    if (mgr.Count() == 0) {
+        WindowCfg def;
+        def.kind = m_settings.default_metric;
+        def.topn = m_settings.topn;
+        def.io_view = m_settings.io_view;
+        mgr.AddWindow(def);
+        m_settings_dirty = true;
+    }
+    if (mgr.GroupVisible()) {
+        mgr.HideGroup();
+    } else {
+        RECT anchor;
+        if (parent && IsWindow(parent) && GetWindowRect(parent, &anchor))
+            mgr.ShowGroupAt(anchor);
+        else
+            mgr.ShowGroupAt(GetStartupAnchor());
+    }
 }
 
 void CProcessTopPlugin::SaveSettingsIfDirty() {
@@ -541,7 +666,8 @@ void CProcessTopPlugin::RefreshTick() {
 
     // 2b) GPU 按需启停（绑定位集不含 GPU/显存 → PDH 全关，方案 §3.3）。
     // 关停时同步清空缓存结果，重开后的首拍不会拿旧数据冒充。
-    // 位集来自可见窗口的绑定指标并集（隐藏窗不算——HideAll 停采/ShowAll 恢复）
+    // 位集语义（M6 §4.2.5）：「存在」（配置内）窗口并集——hover 隐藏 ≠
+    // 关闭，窗随时弹回，采集保持预热
     int mask = WindowManager::Instance().BoundMask();
     bool gpu_bound = mask & (PtKindMask(MetricKind::Gpu) | PtKindMask(MetricKind::Vram));
     if (gpu_bound) {
@@ -637,10 +763,10 @@ void CProcessTopPlugin::RefreshTick() {
         SaveSettingsIfDirty();
         EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
     }
-    // 全部窗口隐藏/关闭 → 定时器停（方案 §4.2/§8.3）：CPU 归零，任务栏
-    // item 退化为 TM tick 惰性读缓存；ShowAll/新建窗时由 WindowManager
-    // 重新拉起定时器（RestartRefreshTimer）
-    if (mask == 0) StopRefreshTimer(false);   // 回调内自停：不能等待自己
+    // 全部窗口销毁（windows 清空）→ 定时器停（M6 §4.2.5：hover 隐藏不
+    // 停采集，只有窗销毁才停）：CPU 归零，任务栏 item 退化为 TM tick 惰
+    // 性读缓存；item 重建窗时由 AddWindow 重新拉起定时器
+    if (WindowManager::Instance().Count() == 0) StopRefreshTimer(false);   // 回调内自停：不能等待自己
     m_refresh_busy.store(false);
 }
 

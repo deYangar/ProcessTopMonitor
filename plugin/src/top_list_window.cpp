@@ -2,7 +2,6 @@
 #include "top_list_window.h"
 #include "plugin_main.h"    // WM_PTM_REFRESH pulls the snapshot via the plugin
 #include "window_manager.h"
-#include "dock_manager.h"
 #include "utils.h"
 #include "i18n.h"
 #include <shellapi.h>
@@ -222,8 +221,6 @@ void CTopListWindow::Destroy() {
     }
     m_visible = false;
     UnregisterDispatch();
-    // 停靠关系摘除 + 其余 Docked 窗补位（M3-2 方案 §7.3）
-    DockManager::Instance().OnWindowDestroyed(this);
     // × 语义 = windows[] 删行（配置不保留，方案 §3.2）：标脏等节流落盘
     CProcessTopPlugin::Instance().m_settings_dirty = true;
     WindowManager::Instance().RecomputeBoundMask();
@@ -381,16 +378,15 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_EXITSIZEMOVE: {
-        // 拖动/尺寸调整结束：位置立即写 cfg 并落盘——缺陷①（M5/A1）治本，
-        // 不等 30s 节流（拖动结束即写 settings.json，微秒级无压力）
+        // 拖动结束（常驻/pin 态才可拖，M6 §4.1.4）：位置立即写 cfg 并
+        // 落盘——缺陷①（M5/A1）治本路径保留，不等 30s 节流。记忆位置
+        // 语义 = 拖过（下次常驻/pin 恢复用）；hover 态不可拖不会到这里
         RECT rc;
         if (GetWindowRect(m_hwnd, &rc)) {
             m_cfg.x = rc.left;
             m_cfg.y = rc.top;
         }
-        // Docked 态拖离判定：距锚 >48px → Detached；微调则吸回布局位（M3-2）
-        DockManager::Instance().OnWindowDragged(this);
-        WindowManager::Instance().OnWindowMoveEnded(m_index);
+        CProcessTopPlugin::Instance().SaveWindowConfigsNow();
         return 0;
     }
 
@@ -435,27 +431,33 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt;
             GetCursorPos(&pt);
             ScreenToClient(m_hwnd, &pt);
-            // 指标区手型：可点击切换（M6 §4.1.2 单窗模式）
-            SetCursor(LoadCursor(nullptr,
-                                 PtInRect(&m_rc_metric, pt) ? IDC_HAND : IDC_ARROW));
+            // 指标区手型：可点击切换（仅单窗模式，M6 §4.1.2）
+            bool hand = !CProcessTopPlugin::Instance().m_settings.multi_window
+                        && PtInRect(&m_rc_metric, pt);
+            SetCursor(LoadCursor(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         return DefWindowProcW(m_hwnd, msg, wp, lp);
 
     case WM_NCHITTEST: {
         // 头部条 = 拖动柄（HTCAPTION 系统托管拖动，ULW 下同样工作）；
-        // 指标区让给点击切换（单窗可点，M6 §4.1.2）；其余 = 客户区
+        // 单窗模式指标区让给点击切换（M6 §4.1.2/§4.1.3），多窗模式整
+        // 头部条可拖（本窗固定指标，无切换控件）；其余 = 客户区
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         ScreenToClient(m_hwnd, &pt);
-        if (PtInRect(&m_rc_header, pt) && !PtInRect(&m_rc_metric, pt))
+        bool multi = CProcessTopPlugin::Instance().m_settings.multi_window;
+        if (PtInRect(&m_rc_header, pt) && (multi || !PtInRect(&m_rc_metric, pt)))
             return HTCAPTION;
         return HTCLIENT;
     }
 
     case WM_LBUTTONDOWN: {
-        // 指标区点击 = 切下一指标（循环，与滚轮同调 SetKind；M6 §4.1.3）
-        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
-        if (PtInRect(&m_rc_metric, pt)) CycleKind(1);
+        // 指标区点击 = 切下一指标（循环，与滚轮同调 SetKind；仅单窗
+        // 模式，M6 §4.1.3：多窗每窗固定指标不可切换）
+        if (!CProcessTopPlugin::Instance().m_settings.multi_window) {
+            POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+            if (PtInRect(&m_rc_metric, pt)) CycleKind(1);
+        }
         return 0;
     }
 
@@ -476,9 +478,12 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEWHEEL: {
-        // 滚轮循环切换指标（方案 §6.2）：零额外采集，只换快照子集
-        int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        CycleKind(delta > 0 ? 1 : -1);
+        // 滚轮循环切换指标（方案 §6.2）：零额外采集，只换快照子集；
+        // 仅单窗模式（M6 §4.1.3：多窗每窗固定指标，滚轮无动作）
+        if (!CProcessTopPlugin::Instance().m_settings.multi_window) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            CycleKind(delta > 0 ? 1 : -1);
+        }
         return 0;
     }
 
@@ -509,18 +514,6 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             c.x = INT_MIN;
             c.y = INT_MIN;
             WindowManager::Instance().AddWindow(c);
-            CProcessTopPlugin::Instance().m_settings_dirty = true;
-        } else if (id >= 700 && id <= 702) {
-            // 停靠到…（M3-2）：锚不在时如实提示，不静默
-            if (!DockManager::Instance().Dock(this, (DockTarget)(id - 700))) {
-                MessageBoxW(m_hwnd, TR(L"未找到可停靠窗口"),
-                            TR(L"停靠"), MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
-            } else {
-                CProcessTopPlugin::Instance().m_settings_dirty = true;
-            }
-        } else if (id == 710) {
-            // 解除停靠：窗口留在当前位置（M3-2 方案 §5）
-            DockManager::Instance().Undock(this);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
         } else if (id == 300) {
             PostMessage(m_hwnd, WM_CLOSE, 0, 0);
@@ -575,22 +568,26 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
     for (;;) {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
-        // 指标组（M2：CPU/内存/磁盘 IO/GPU/显存；不可用维度灰显并标注原因）
-        bool gpu_hidden = (m_gpu_grade == GpuGrade::G3);
-        struct { UINT id; MetricKind kind; const wchar_t* label; bool gray; } kinds[] = {
-            { 100, MetricKind::Cpu, L"CPU", false },
-            { 101, MetricKind::Mem, L"内存", false },
-            { 102, MetricKind::DiskIo, L"磁盘 IO", false },
-            { 103, MetricKind::Gpu, L"GPU", gpu_hidden },
-            { 104, MetricKind::Vram, L"显存", gpu_hidden },
-        };
-        for (auto& k : kinds) {
-            UINT flags = MF_STRING;
-            if (k.kind == m_kind) flags |= MF_CHECKED;
-            if (k.gray) flags |= MF_GRAYED;
-            AppendMenuW(menu, flags, k.id, TR(k.label));
+        // 指标组（M2：CPU/内存/磁盘 IO/GPU/显存；不可用维度灰显并标注
+        // 原因）——仅单窗模式（M6 §4.6：多窗每窗固定指标，不显示本组）
+        bool multi = CProcessTopPlugin::Instance().m_settings.multi_window;
+        if (!multi) {
+            bool gpu_hidden = (m_gpu_grade == GpuGrade::G3);
+            struct { UINT id; MetricKind kind; const wchar_t* label; bool gray; } kinds[] = {
+                { 100, MetricKind::Cpu, L"CPU", false },
+                { 101, MetricKind::Mem, L"内存", false },
+                { 102, MetricKind::DiskIo, L"磁盘 IO", false },
+                { 103, MetricKind::Gpu, L"GPU", gpu_hidden },
+                { 104, MetricKind::Vram, L"显存", gpu_hidden },
+            };
+            for (auto& k : kinds) {
+                UINT flags = MF_STRING;
+                if (k.kind == m_kind) flags |= MF_CHECKED;
+                if (k.gray) flags |= MF_GRAYED;
+                AppendMenuW(menu, flags, k.id, TR(k.label));
+            }
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         if (m_kind == MetricKind::DiskIo) {
             // IO 视图子菜单：合计/读/写（方案 §1.2 子视图）
             HMENU sub = CreatePopupMenu();
@@ -647,19 +644,8 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
                         310, TR(L"新建悬浮窗"));
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        // 停靠（M3-2 方案 §7）：全程不主动，只由显式菜单动作触发
-        {
-            bool docked_now = DockManager::Instance().StateOf(this) == DockState::Docked;
-            HMENU dock_sub = CreatePopupMenu();
-            AppendMenuW(dock_sub, MF_STRING, 700, TR(L"自动（优先 PNM 详情窗）"));
-            AppendMenuW(dock_sub, MF_STRING, 701, TR(L"PNM 详情窗"));
-            AppendMenuW(dock_sub, MF_STRING, 702, TR(L"TrafficMonitor 主窗"));
-            AppendMenuW(menu, MF_POPUP | (docked_now ? MF_GRAYED : 0),
-                        (UINT_PTR)dock_sub, TR(L"停靠到…"));
-            AppendMenuW(menu, MF_STRING | (!docked_now ? MF_GRAYED : 0),
-                        710, TR(L"解除停靠"));
-        }
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        // 停靠子菜单已随 dock_manager 整体移除（M6 §4.4：WinEventHook
+        // 职责由锚子类化完整替代）
         AppendMenuW(menu, MF_STRING, 300, TR(L"关闭"));
         // 「关闭」任何窗数可用：最后一窗 × = 退出悬浮窗模式（item 保留），
         // 单窗/多窗同一语义（方案 §3.2 关闭语义表）
@@ -1266,10 +1252,10 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
     m_dirty_sig = std::move(sig);
 
     if (!m_visible) {
-        RecalcAndRepaint(true);   // 首显：摆位 + 干净截屏后上屏
+        // 隐藏期：数据已同步保鲜，不上屏——显示的唯一入口是 ShowAt
+        // （组布局/锚跟随驱动，M6 §4.1.5）；弹回时 ShowAt 已上屏重画
         return;
     }
-    if (!IsVisible()) return;     // 隐藏窗：跳过灌数据（ShowAll 时立即补灌）
     if (changed) {
         RecalcAndRepaint(false);
         return;
@@ -1308,18 +1294,19 @@ void CTopListWindow::RecalcAndRepaint(bool reposition) {
     if (m_acrylic_active) UpdateWindow(m_hwnd);   // compose synchronously, no blank frame
 }
 
-void CTopListWindow::Reposition() {
+void CTopListWindow::ShowAt(int x, int y) {
+    // M6 §4.1.5：WM 算好组布局后逐窗调——指定位置上屏，blur 先内容后
+    // SetWindowPos 成对（SWP_SHOWWINDOW），含首显干净截屏反色判定
     if (!m_hwnd || !IsWindow(m_hwnd)) return;
+    UpdateDpiScale();
     HDC hdc = GetDC(m_hwnd);
     int pw = 0, ph = 0;
     CalcLayout(hdc, pw, ph);
     ReleaseDC(m_hwnd, hdc);
 
-    RECT rc;
-    GetWindowRect(m_hwnd, &rc);
+    RECT probe = { x, y, x + pw, y + ph };
     RECT work, mon;
-    PTM_GetWorkAreaForRect(rc, work, mon);
-    int x = rc.left, y = rc.top;
+    PTM_GetWorkAreaForRect(probe, work, mon);
     int margin = std::max(4, (int)(4 * m_dpi_scale));
     if (x + pw > work.right) x = work.right - pw - margin;
     if (x < work.left) x = work.left + margin;
@@ -1342,6 +1329,24 @@ void CTopListWindow::Reposition() {
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     m_visible = true;
     if (m_acrylic_active) UpdateWindow(m_hwnd);
+}
+
+void CTopListWindow::Hide() {
+    // M6 §4.1.5：双窗 SW_HIDE 成对 + 状态复位（blur 与内容同时消失）
+    if (m_hwnd && IsWindow(m_hwnd)) ShowWindow(m_hwnd, SW_HIDE);
+    if (m_blur_hwnd && IsWindow(m_blur_hwnd)) ShowWindow(m_blur_hwnd, SW_HIDE);
+    m_visible = false;
+    m_hovering = false;
+    m_tracking = false;
+}
+
+void CTopListWindow::Reposition() {
+    // 内部重排（尺寸变化/指标切换，M6 §4.1.5）：以当前位置为基，
+    // clamp 与成对显示统一走 ShowAt
+    if (!m_hwnd || !IsWindow(m_hwnd)) return;
+    RECT rc;
+    GetWindowRect(m_hwnd, &rc);
+    ShowAt(rc.left, rc.top);
 }
 
 // ============================================================

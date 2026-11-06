@@ -20,12 +20,12 @@ echo === Building x64 ===
 set "INCLUDE=%MSVC%\VC\Tools\MSVC\14.44.35207\include;%SDK%\Include\%SDKVER%\um;%SDK%\Include\%SDKVER%\ucrt;%SDK%\Include\%SDKVER%\shared"
 set "LIB=%MSVC%\VC\Tools\MSVC\14.44.35207\lib\x64;%SDK%\Lib\%SDKVER%\um\x64;%SDK%\Lib\%SDKVER%\ucrt\x64"
 set "PATH=%MSVC%\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64;%PATH%"
-cl %COMMON_FLAGS% /FeProcessTopMonitor.dll src\metrics_collector.cpp src\etw_file_collector.cpp src\gpu_collector.cpp src\top_aggregator.cpp src\top_list_window.cpp src\window_manager.cpp src\dock_manager.cpp src\options_dialog.cpp src\plugin_main.cpp src\i18n.cpp /link %COMMON_LINK% src\resource.res /OUT:ProcessTopMonitor.dll
+cl %COMMON_FLAGS% /FeProcessTopMonitor.dll src\metrics_collector.cpp src\etw_file_collector.cpp src\gpu_collector.cpp src\top_aggregator.cpp src\top_list_window.cpp src\window_manager.cpp src\options_dialog.cpp src\plugin_main.cpp src\i18n.cpp /link %COMMON_LINK% src\resource.res /OUT:ProcessTopMonitor.dll
 echo X64_EXIT=%ERRORLEVEL%
 
 echo === Building x86 ===
 set "INCLUDE=%MSVC%\VC\Tools\MSVC\14.44.35207\include;%SDK%\Include\%SDKVER%\um;%SDK%\Include\%SDKVER%\ucrt;%SDK%\Include\%SDKVER%\shared"
 set "LIB=%MSVC%\VC\Tools\MSVC\14.44.35207\lib\x86;%SDK%\Lib\%SDKVER%\um\x86;%SDK%\Lib\%SDKVER%\ucrt\x86"
 set "PATH=%MSVC%\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86;%PATH%"
-cl %COMMON_FLAGS% /FeProcessTopMonitor_x86.dll src\metrics_collector.cpp src\etw_file_collector.cpp src\gpu_collector.cpp src\top_aggregator.cpp src\top_list_window.cpp src\window_manager.cpp src\dock_manager.cpp src\options_dialog.cpp src\plugin_main.cpp src\i18n.cpp /link %COMMON_LINK% src\resource.res /OUT:ProcessTopMonitor_x86.dll
+cl %COMMON_FLAGS% /FeProcessTopMonitor_x86.dll src\metrics_collector.cpp src\etw_file_collector.cpp src\gpu_collector.cpp src\top_aggregator.cpp src\top_list_window.cpp src\window_manager.cpp src\options_dialog.cpp src\plugin_main.cpp src\i18n.cpp /link %COMMON_LINK% src\resource.res /OUT:ProcessTopMonitor_x86.dll
 echo X86_EXIT=%ERRORLEVEL%

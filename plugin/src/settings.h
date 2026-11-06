@@ -3,6 +3,9 @@
 // settings.h — settings.json persistence (技术方案 §6.4 schema, M1 fields)
 // Same hand-rolled read/write style as PNM: fprintf out, find+atoi in.
 // No third-party JSON dependency (零依赖原则).
+// M6 schema v3：popup_mode / default_metric / multi_window 三新键，
+// 删 dock_edge 与 WindowCfg 的 dock 字段（v1 残留 metric/win_x/win_y
+// 迁移源改由加载局部变量承接，不再常驻结构）。
 // ============================================================
 #include <windows.h>
 #include <cstdio>
@@ -12,21 +15,21 @@
 #include "top_aggregator.h"   // MetricKind
 
 // 每窗持久化配置（settings.json windows[] 一行；纯数值无字符串——手写
-// JSON 解析保持简单，M3-1 方案 §2.1/§5）。docked/dock_target 由停靠模块
-// （M3-2）使用，本结构只负责透传持久化。
+// JSON 解析保持简单，M3-1 方案 §2.1/§5）。
 // 注意：kind 存 MetricKind 原始 int 值（枚举含 DiskRead=3/DiskWrite=4
-// 占位，Gpu=5、Vram=6——方案注释「0..4」没算上占位，落地以枚举真值为准）
+// 占位，Gpu=5、Vram=6——3/4 不进配置域）。
+// x/y 语义（M6 §3.1）：仅常驻/pin 态使用的「拖过的位置记忆」；
+// INT_MIN=未拖过（常驻态用组布局，hover 态忽略）
 struct WindowCfg {
     int kind = 0;          // MetricKind as int（0=Cpu 1=Mem 2=DiskIo 5=Gpu 6=Vram）
     int io_view = 0;       // 0=combined 1=read 2=write（仅 kind==2 有意义）
     int topn = 10;         // 5/10/15
-    int x = INT_MIN;       // INT_MIN = 默认级联位置
+    int x = INT_MIN;       // INT_MIN = 未拖过
     int y = INT_MIN;
-    int docked = 0;        // 0=浮动 1=停靠
-    int dock_target = 0;   // 0=auto 1=pnm 2=tm
 };
 
 struct PtSettings {
+    // ---- 不变 ----
     int refresh_ms = 500;          // 250/500/1000/2000
     int topn = 10;                 // 5/10/15（新窗默认值，M3-1 起每窗独立）
     int memory_basis = 0;          // 0=private commit 1=working set
@@ -34,18 +37,19 @@ struct PtSettings {
     int color_mode = 0;            // 0=auto 1=dark 2=light
     int popup_effect = 0;          // 0=acrylic 1=transparent 2=blur 3=opaque
     int popup_opacity = 100;       // 10-100
-    int metric = 0;                // v1 迁移源（schema 2 不再作为运行配置）
-    int win_x = INT_MIN, win_y = INT_MIN;   // v1 迁移源
-    int schema = 2;                // schema 版本（写盘固定 2）
-    std::vector<WindowCfg> windows;   // 空 = 悬浮窗模式关闭（item 可重开默认窗）
-    // GPU 口径（方案 §2.4 引擎类型多选 + 截断；§2.5 显存口径）
     std::wstring gpu_engines = L"all";   // "all" 或逗号分隔 engtype 列表
     bool gpu_cap_100 = true;             // 引擎求和 >100% 截断
     int vram_basis = 0;                  // 0=dedicated 1=dedicated+shared
     std::wstring lang = L"auto";   // auto or BCP-47
     bool debug_logs = false;
-    int dock_edge = 0;              // 停靠边偏好（M3-2 方案 §7.2）：0=auto 1=right 2=left
-    bool sensor_summary = false;    // 标题栏传感器摘要（M3-3 L0，方案 §9 默认关）
+    bool sensor_summary = true;    // 头部条传感器摘要（M6 决策 3=A，默认 true）
+
+    // ---- v3 新增（M6 §3.1）----
+    int schema = 3;                // schema 版本（写盘固定 3）
+    int popup_mode = 0;            // 0=hover（默认） 1=常驻
+    int default_metric = 0;        // MetricKind 原值：0=Cpu 1=Mem 2=DiskIo 5=Gpu 6=Vram
+    bool multi_window = false;     // false=单窗+切换 true=多窗并排（每窗固定指标）
+    std::vector<WindowCfg> windows;   // 单窗模式≤1；多窗 1..6；空=悬浮窗模式退出
 
     // clamp everything to its legal domain (hand-edited settings.json must
     // not brick the plugin)
@@ -59,20 +63,24 @@ struct PtSettings {
         if (popup_effect < 0 || popup_effect > 3) popup_effect = 0;
         if (popup_opacity < 10) popup_opacity = 10;
         if (popup_opacity > 100) popup_opacity = 100;
-        if (metric < 0 || metric > 4) metric = 0;   // cpu/mem/io/gpu/vram
         if (vram_basis != 0 && vram_basis != 1) vram_basis = 0;
         if (gpu_engines.empty()) gpu_engines = L"all";
         if (lang.empty()) lang = L"auto";
-        if (dock_edge < 0 || dock_edge > 2) dock_edge = 0;
+        // v3 三新键（M6 §3.2）
+        if (popup_mode != 0 && popup_mode != 1) popup_mode = 0;
+        if (default_metric != 0 && default_metric != 1 && default_metric != 2 &&
+            default_metric != 5 && default_metric != 6)
+            default_metric = 0;   // 非法（含 3/4 占位）→ CPU
         // windows[]：数量钳到上限，每行字段钳域（手改 settings.json 防砖）。
-        // kind 域 = MetricKind 枚举全集 [0,6]（3/4 是 DiskRead/DiskWrite 占位）
+        // 单窗模式窗数收敛到 ≤1（多窗切回单窗保留第一窗）；空列表合法
+        // ——「关闭悬浮窗」后 hover 无弹窗直到 item 重建，不强造窗
         if (windows.size() > 6) windows.resize(6);
+        if (!multi_window && windows.size() > 1) windows.resize(1);
         for (auto& c : windows) {
-            if (c.kind < 0 || c.kind > 6) c.kind = 0;
+            if (c.kind != 0 && c.kind != 1 && c.kind != 2 && c.kind != 5 && c.kind != 6)
+                c.kind = 0;   // 3/4 是 DiskRead/DiskWrite 占位，不进配置
             if (c.io_view < 0 || c.io_view > 2) c.io_view = 0;
             if (c.topn != 5 && c.topn != 10 && c.topn != 15) c.topn = 10;
-            if (c.docked != 0 && c.docked != 1) c.docked = 0;
-            if (c.dock_target < 0 || c.dock_target > 2) c.dock_target = 0;
         }
     }
 
@@ -87,9 +95,11 @@ struct PtSettings {
         }
     }
 
-    // v1 迁移：加载后若无 windows 且有 metric/win_x → 生成 windows[0]
+    // v1 迁移（M6 §3.2：v1 字段由 PtLoadSettings 读进局部传入——结构里
+    // 已无 v1 残留成员）：无 windows 且有 metric/win_x → 生成 windows[0]
     // （v1 用户原是单窗模式，指标与位置原样搬入）
-    void MigrateV1() {
+    static void MigrateV1Into(std::vector<WindowCfg>& windows, int metric,
+                              int win_x, int win_y, int io_view, int topn) {
         if (!windows.empty()) return;
         if (metric != 0 || win_x != INT_MIN || win_y != INT_MIN) {
             WindowCfg c;
@@ -154,8 +164,11 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     if (swprintf_s(path, MAX_PATH, L"%s\\settings.json", config_dir.c_str()) <= 0) return false;
     FILE* f = _wfopen(path, L"w");
     if (!f) return false;
+    // M6 §3.2：schema 固定写 3；新增三键；windows[] 每行只写
+    // {kind, io_view, topn, x, y}；dock_edge/docked/dock_target 与 v1 的
+    // metric/win_x/win_y 不再写出
     fprintf(f, "{\n");
-    fprintf(f, "  \"schema\": %d,\n", st.schema);
+    fprintf(f, "  \"schema\": 3,\n");
     fprintf(f, "  \"refresh_ms\": %d,\n", st.refresh_ms);
     fprintf(f, "  \"topn\": %d,\n", st.topn);
     fprintf(f, "  \"memory_basis\": %d,\n", st.memory_basis);
@@ -168,15 +181,15 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"vram_basis\": %d,\n", st.vram_basis);
     fprintf(f, "  \"debug_logs\": %s,\n", st.debug_logs ? "true" : "false");
     fprintf(f, "  \"lang\": \"%s\",\n", PtToUtf8(st.lang).c_str());
-    fprintf(f, "  \"dock_edge\": %d,\n", st.dock_edge);
     fprintf(f, "  \"sensor_summary\": %s,\n", st.sensor_summary ? "true" : "false");
-    // windows[]（schema 2 核心字段；v1 的 metric/win_x/win_y 停止写出）
+    fprintf(f, "  \"popup_mode\": %d,\n", st.popup_mode);
+    fprintf(f, "  \"default_metric\": %d,\n", st.default_metric);
+    fprintf(f, "  \"multi_window\": %s,\n", st.multi_window ? "true" : "false");
     fprintf(f, "  \"windows\": [\n");
     for (size_t i = 0; i < st.windows.size(); i++) {
         const WindowCfg& c = st.windows[i];
-        fprintf(f, "    {\"kind\":%d,\"io_view\":%d,\"topn\":%d,\"x\":%d,\"y\":%d,"
-                   "\"docked\":%d,\"dock_target\":%d}%s\n",
-                c.kind, c.io_view, c.topn, c.x, c.y, c.docked, c.dock_target,
+        fprintf(f, "    {\"kind\":%d,\"io_view\":%d,\"topn\":%d,\"x\":%d,\"y\":%d}%s\n",
+                c.kind, c.io_view, c.topn, c.x, c.y,
                 (i + 1 < st.windows.size()) ? "," : "");
     }
     fprintf(f, "  ]\n");
@@ -225,13 +238,15 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
         out = PtFromUtf8(json.substr(pos + 1, e - pos - 1));
     };
 
+    // v1 迁移源（局部承接，M6 §3.2：结构里已无 v1 残留成员）
+    int v1_metric = 0, v1_win_x = INT_MIN, v1_win_y = INT_MIN;
     geti("\"refresh_ms\"", st.refresh_ms);
     geti("\"topn\"", st.topn);
     geti("\"memory_basis\"", st.memory_basis);
     geti("\"io_view\"", st.io_view);
-    geti("\"metric\"", st.metric);          // v1 迁移源
-    geti("\"win_x\"", st.win_x);            // v1 迁移源
-    geti("\"win_y\"", st.win_y);            // v1 迁移源
+    geti("\"metric\"", v1_metric);
+    geti("\"win_x\"", v1_win_x);
+    geti("\"win_y\"", v1_win_y);
     geti("\"color_mode\"", st.color_mode);
     geti("\"popup_effect\"", st.popup_effect);
     geti("\"popup_opacity\"", st.popup_opacity);
@@ -240,11 +255,15 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     geti("\"vram_basis\"", st.vram_basis);
     getb("\"debug_logs\"", st.debug_logs);
     gets("\"lang\"", st.lang);
-    geti("\"dock_edge\"", st.dock_edge);
     getb("\"sensor_summary\"", st.sensor_summary);
+    geti("\"popup_mode\"", st.popup_mode);
+    geti("\"default_metric\"", st.default_metric);
+    getb("\"multi_window\"", st.multi_window);
+    int schema_read = 0;   // 无 schema 键 = v1/v2 旧文件，走迁移
+    geti("\"schema\"", schema_read);
 
-    // windows[] 段解析：定位 "windows" → [ → 逐 {…} 行按 key 读 7 个 int。
-    // 行内无嵌套对象/转义引号，find('}') 即行界（方案 §5.2）。
+    // windows[] 段解析：定位 "windows" → [ → 逐 {…} 行按 key 读 5 个 int
+    // （v3 起无 dock 字段）。行内无嵌套对象/转义引号，find('}') 即行界。
     size_t wpos = json.find("\"windows\"");
     if (wpos != std::string::npos) {
         size_t lb = json.find('[', wpos);
@@ -271,14 +290,24 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
                 c.topn = rowi("\"topn\"", 10);
                 c.x = rowi("\"x\"", INT_MIN);
                 c.y = rowi("\"y\"", INT_MIN);
-                c.docked = rowi("\"docked\"", 0);
-                c.dock_target = rowi("\"dock_target\"", 0);
                 st.windows.push_back(c);
                 cur = cb + 1;
             }
         }
     } else {
-        st.MigrateV1();   // 无 windows 键 = v1 配置 → 迁移
+        // 无 windows 键 = v1 配置 → 迁移（v1 → v2 原逻辑保留，产物再走
+        // 下方 v2→v3 推导，M6 §3.2 链式）
+        PtSettings::MigrateV1Into(st.windows, v1_metric, v1_win_x, v1_win_y,
+                                  st.io_view, st.topn);
+    }
+    // v2 → v3 迁移（读到 schema<=2 时，M6 §3.2）：
+    // 1. popup_mode=0（hover 是默认形态）、multi_window=(windows.size()>1)、
+    //    default_metric=windows[0].kind（空则 0）
+    // 2. windows[] 的 kind/io_view/topn/x/y 原样保留（x/y 作常驻位置记忆）
+    if (schema_read <= 2) {
+        st.popup_mode = 0;
+        st.multi_window = st.windows.size() > 1;
+        st.default_metric = st.windows.empty() ? 0 : st.windows[0].kind;
     }
     st.Clamp();
     return true;
