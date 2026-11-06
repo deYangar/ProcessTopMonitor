@@ -508,12 +508,28 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id >= 200 && id <= 202) {
             m_io_view = id - 200;
             m_cfg.io_view = m_io_view;
-            InvalidateRect(m_hwnd, nullptr, FALSE);
+            // 同拍重灌（问题②同类缺陷）：行数据/摘要立即按新视图重选，
+            // 不等下一拍——值区宽度随视图联动（问题③），走 Recalc 重排
+            {
+                MetricsSnapshot snap;
+                bool valid = false;
+                CProcessTopPlugin::Instance().CopySnapshot(snap, valid);
+                ApplySnapshotForCurrentView(snap);
+            }
+            RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
         } else if (id >= 600 && id <= 602) {
             // 行数（每窗独立，方案 §2.4）：600/601/602 → 5/10/15
             m_cfg.topn = 5 * (id - 599);
             m_topn = m_cfg.topn;
+            // 同拍重灌（问题②同类缺陷）：立即按新行数截断/补齐（快照供
+            // 15 行），重画不再用旧行集
+            {
+                MetricsSnapshot snap;
+                bool valid = false;
+                CProcessTopPlugin::Instance().CopySnapshot(snap, valid);
+                ApplySnapshotForCurrentView(snap);
+            }
             RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
         } else if (id >= 320 && id <= 324) {
@@ -571,6 +587,17 @@ void CTopListWindow::SetKind(MetricKind k) {
     // 方案 §3.3；cfg 即配置本体，标脏走节流落盘）
     WindowManager::Instance().RecomputeBoundMask();
     CProcessTopPlugin::Instance().m_settings_dirty = true;
+    // 同拍重灌（问题②治本）：旧实现直接 RecalcAndRepaint，那一帧
+    // m_rows/m_summary_value 还是旧指标的数值、格式化模板却已切新指标
+    // ——磁盘 IO 的字节速率被 %.1f%% 画成千万级 %。这里立即用当前快照
+    // 按新指标重灌（真冷启动维度 has_value=false 如实显示 hint），
+    // 不再出现旧指标数值
+    {
+        MetricsSnapshot snap;
+        bool valid = false;
+        CProcessTopPlugin::Instance().CopySnapshot(snap, valid);
+        ApplySnapshotForCurrentView(snap);
+    }
     RecalcAndRepaint(true);
 }
 
@@ -1225,11 +1252,11 @@ bool CTopListWindow::PumpIconExtraction(int count) {
 // data plumbing + dirty check
 // ============================================================
 
-void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind kind,
-                                        int topn, int io_view, bool first_tick) {
-    m_kind = kind;
-    m_topn = topn;
-    m_io_view = io_view;
+void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
+    // 快照 → 本窗显示数据灌装（问题②抽取）：kind/io_view/topn 取本窗当前
+    // 状态——SetKind/io_view/行数切换的那一拍就地调它重灌，消灭「m_rows
+    // 还是旧指标数值、格式化模板已切新指标」的中间态帧（磁盘 IO 字节
+    // 速率曾被 %.1f%% 画成 10195756.1%）
     m_cpu_total = snap.cpu_total_pct;
     m_mem_total = snap.mem_total;
     m_mem_used = snap.mem_used;
@@ -1283,6 +1310,14 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
         break;
     default: m_summary_value = snap.cpu_total_pct; break;
     }
+}
+
+void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind kind,
+                                        int topn, int io_view, bool first_tick) {
+    m_kind = kind;
+    m_topn = topn;
+    m_io_view = io_view;
+    ApplySnapshotForCurrentView(snap);
 
     // ---- dirty check: rebuild the (pid,count,value) signature and compare;
     // memory has no delta so its summary also participates (方案 §8.2: an

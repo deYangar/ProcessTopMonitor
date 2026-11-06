@@ -88,6 +88,11 @@ public:
     int GetIoView() const { return m_io_view; }   // plugin syncs it into settings
 
 private:
+    // 快照 → 本窗显示数据的全套灌装（kind/io_view/topn 取本窗当前状态，
+    // 问题②治本）：UpdateFromSnapshot 每拍走这里；SetKind/io_view/行数
+    // 切换的同拍重灌也走这里——切换帧不再出现「旧指标数值 × 新格式模板」
+    void ApplySnapshotForCurrentView(const MetricsSnapshot& snap);
+
     // ---- ULW pipeline (PNM-inherited) ----
     bool EnsureLayeredSurface(int w, int h);
     void ComposeLayeredSurface(int w, int h);
