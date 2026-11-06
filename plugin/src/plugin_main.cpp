@@ -879,30 +879,47 @@ void CProcessTopPlugin::RefreshTick() {
         have_etw = io_delta.valid;
     }
 
-    // 2b) GPU 按需启停（绑定位集不含 GPU/显存 → PDH 全关，方案 §3.3）。
-    // 关停时同步清空缓存结果，重开后的首拍不会拿旧数据冒充。
-    // 位集语义（M6 §4.2.5）：「存在」（配置内）窗口并集——hover 隐藏 ≠
-    // 关闭，窗随时弹回，采集保持预热
+    // 2b) GPU 迟停（问题①A 治本主项，方案 §3.3 语义升级）：绑定集不含
+    // GPU/显存 → 不立即停，连续 3 分钟无该维度窗口才停——迟停窗内切回
+    // = 0 冷启动（GPU 利用率是 cooked 计数器，冷启动需 2 次采样 + 分频
+    // ≈1-2s 的「等待首次采样…」全部来自反复 Start/Stop）。迟停期间
+    // m_gpu_last 保留（采集仍在跑，缓存天然新鲜；旧「切走即清缓存」的
+    // 正确性前提是「采集器已停」，迟停期不成立）；真停时照清，重开首拍
+    // 不拿旧数据冒充。位集语义（M6 §4.2.5）：「存在」（配置内）窗口并集
+    ULONGLONG now = GetTickCount64();
+    constexpr ULONGLONG kGpuIdleStopMs = 180000;   // 3 分钟
     int mask = WindowManager::Instance().BoundMask();
     bool gpu_bound = mask & (PtKindMask(MetricKind::Gpu) | PtKindMask(MetricKind::Vram));
     if (gpu_bound) {
         m_gpu.EnsureStarted();
-    } else {
-        m_gpu.EnsureStopped();
-        m_gpu_last = GpuTickData{};
+        m_gpu_idle_since = 0;
+    } else if (m_gpu.IsRunning()) {
+        if (m_gpu_idle_since == 0) m_gpu_idle_since = now;
+        if (now - m_gpu_idle_since >= kGpuIdleStopMs) {
+            m_gpu.EnsureStopped();
+            m_gpu_last = GpuTickData{};
+            m_gpu_idle_since = 0;
+        }
     }
 
-    // 2c) ETW 按需启停（方案 §4.2/§8.3）：无可见磁盘 IO 窗口 → 停会话，
-    // 内核侧零开销；首次出现 IO 窗口时启动（A/B 尝试，失败落 C 并如实
-    // 标注）。只在绑定状态变化时动作，避免 C 档每拍重试。
+    // 2c) ETW 迟停（问题①A，同款语义）：无磁盘 IO 窗口 → 3 分钟后才停
+    // 会话；真停走 StopAsync（问题①B——tick 线程零阻塞）。切回时
+    // IsRunning 检查幂等启动，C 档会话重试由 ConsumerLoop 自带 10s 循环
+    // 承担，不重复 Start
+    constexpr ULONGLONG kEtwIdleStopMs = 180000;   // 3 分钟
     bool io_bound = (mask & PtKindMask(MetricKind::DiskIo)) != 0;
-    if (io_bound != m_io_bound_prev) {
-        if (io_bound) m_etw.Start();
-        else m_etw.Stop();
-        m_io_bound_prev = io_bound;
+    if (io_bound) {
+        if (!m_etw.IsRunning()) m_etw.Start();
+        m_etw_idle_since = 0;
+    } else if (m_etw.IsRunning()) {
+        if (m_etw_idle_since == 0) m_etw_idle_since = now;
+        if (now - m_etw_idle_since >= kEtwIdleStopMs) {
+            m_etw.StopAsync();
+            m_etw_idle_since = 0;
+        }
     }
 
-    ULONGLONG now = GetTickCount64();
+    // （now 已在 2b 迟停判定前取得——同拍内取值一致）
     static ULONGLONG prev_wall = 0;   // tick-thread only (CAS-guarded)
     double dt = prev_wall ? (double)(now - prev_wall) / 1000.0 : 0.0;
     prev_wall = now;

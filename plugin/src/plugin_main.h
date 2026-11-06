@@ -136,7 +136,11 @@ private:
     bool m_refresh_timer_ok = false;
     int m_tick_count = 0;
     int m_gpu_tick_div = 0;              // GPU 采集分频（每 2 拍 ≈1s）
-    bool m_io_bound_prev = false;        // ETW 按需启停：上一拍是否有可见 IO 窗
+    // 迟停计时（问题①A，tick 线程私有）：0 = 绑定中/未启动；非 0 = 空闲
+    // 起点打点。连续 kXxxIdleStopMs 无该维度窗口才真停（GPU 冷启动 1-2s、
+    // ETW 冷启动 ~1s 且伴口径闪变——切换循环全部落在冷启动窗内）
+    ULONGLONG m_gpu_idle_since = 0;
+    ULONGLONG m_etw_idle_since = 0;
     ULONGLONG m_last_save_tick = 0;
 
     std::wstring m_tm_config_dir;
