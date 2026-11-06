@@ -13,8 +13,9 @@
 // Changed for PTM:
 //   - Multi-instance: HWND -> CTopListWindow* registry (PNM was a singleton).
 //   - Rows: one metric, N ranked rows (no upload/download sections).
-//   - Resident window: no hover state machine; title-bar drag to move,
-//     close button, wheel/quick-menu metric switching.
+//   - Close button removed (M6): window teardown goes through the context
+//     menu / programmatic Destroy(); Destroy() tears down the blur layer
+//     first so no acrylic ghost survives the content window.
 // ============================================================
 #include <windows.h>
 #include <string>
@@ -203,9 +204,7 @@ private:
     HPEN m_pen_separator = nullptr;
     bool m_pen_dark = true;
 
-    // hover state for title bar + close button (repaint on flip only)
-    bool m_hover_close = false;
-    RECT m_rc_close = {};
+    // hover state for title bar (repaint on flip only)
     bool m_tracking = false;
 
     // layout constants (96-DPI base, DPI-scaled members)

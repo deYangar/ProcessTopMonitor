@@ -210,6 +210,10 @@ bool CTopListWindow::Create(const POINT* suggested) {
 }
 
 void CTopListWindow::Destroy() {
+    // blur 层必须先于内容窗销毁（M6 问题②治本）：旧序只销内容窗，点击
+    // 穿透的 blur 靠下一拍 ReclaimDead 收尸——最后一窗关闭会先停定时器，
+    // blur 滞留桌面成亚克力残影
+    DestroyBlurLayer();
     if (m_hwnd && !g_shutting_down) {
         PtSafeDestroyWindow(m_hwnd);
         // m_hwnd 故意保留死句柄不置空：ReclaimDead 用 GetHwnd() &&
@@ -404,49 +408,26 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             TrackMouseEvent(&tme);
             m_tracking = true;
         }
-        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
-        bool hc = PtInRect(&m_rc_close, pt) != FALSE;
-        if (hc != m_hover_close) {
-            m_hover_close = hc;
-            InvalidateRect(m_hwnd, nullptr, FALSE);
-        }
         return 0;
     }
 
     case WM_MOUSELEAVE:
         m_tracking = false;
-        if (m_hover_close) {
-            m_hover_close = false;
-            InvalidateRect(m_hwnd, nullptr, FALSE);
-        }
         return 0;
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            POINT pt;
-            GetCursorPos(&pt);
-            ScreenToClient(m_hwnd, &pt);
-            SetCursor(LoadCursor(nullptr, PtInRect(&m_rc_close, pt) ? IDC_HAND : IDC_ARROW));
+            SetCursor(LoadCursor(nullptr, IDC_ARROW));
             return TRUE;
         }
         return DefWindowProcW(m_hwnd, msg, wp, lp);
 
     case WM_NCHITTEST: {
-        // 标题栏 = 系统托管拖动（ULW 下同样工作）；关闭按钮与内容区 = 客户区
+        // 标题栏 = 系统托管拖动（ULW 下同样工作）；内容区 = 客户区
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         ScreenToClient(m_hwnd, &pt);
-        if (PtInRect(&m_rc_close, pt)) return HTCLIENT;
         if (pt.y < TITLE_H) return HTCAPTION;
         return HTCLIENT;
-    }
-
-    case WM_LBUTTONDOWN: {
-        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
-        if (PtInRect(&m_rc_close, pt)) {
-            // 关闭语义：销毁本窗（plugin_main 持有实例指针负责 delete）
-            PostMessage(m_hwnd, WM_CLOSE, 0, 0);
-        }
-        return 0;
     }
 
     case WM_NCRBUTTONUP:
@@ -679,7 +660,6 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             }
         }
         // 菜单留下的 hover 状态复位（区域可能已变）
-        m_hover_close = false;
         InvalidateRect(m_hwnd, nullptr, FALSE);
         if (!toggle_taken) return;
         // 重开：光标位置不变，勾选态已刷新
@@ -1367,7 +1347,8 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
 }
 
 void CTopListWindow::DrawTitleBar(HDC hdc, int w, int y) {
-    // 标题：当前指标名（accent 色）+ 副标注（Top N）
+    // 标题：当前指标名（accent 色）。（M6：右上角 × 关闭键已删——关闭
+    // 走右键菜单；本函数由头部条取代是 C2 的事，此处保留标题布局）
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, GetAccentColor());
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
@@ -1375,13 +1356,6 @@ void CTopListWindow::DrawTitleBar(HDC hdc, int w, int y) {
     swprintf_s(title, 64, L"%s", MetricTitle());
     RECT rc = { PADDING, y, w - PADDING - IDX_W, y + TITLE_H };
     DrawTextW(hdc, title, -1, &rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-    // 关闭按钮 [×]，右侧
-    int btn = (int)(22 * m_dpi_scale);
-    m_rc_close = { w - PADDING - btn, y + (TITLE_H - btn) / 2, w - PADDING, y + (TITLE_H - btn) / 2 + btn };
-    SetTextColor(hdc, m_hover_close ? RGB(255, 120, 120) : GetTextColor());
-    RECT rcx = m_rc_close;
-    DrawTextW(hdc, L"\x2715", -1, &rcx, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
     SelectObject(hdc, hOld);
 }

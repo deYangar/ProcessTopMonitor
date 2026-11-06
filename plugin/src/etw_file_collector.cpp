@@ -317,8 +317,11 @@ void EtwFileCollector::ConsumerLoop() {
         m_own_session_handle = 0;
         LogLine(L"ProcessTrace rc=%lu, reconnecting in 2s", rc);
         SetStatus(FileIoGrade::C, L"session ended");
+        // 2s 重连等待按 100ms 步进查询 m_stop（M6 问题⑤治本）：Stop() 响应
+        // 2000ms→≤100ms，TM 退出收尾不再被裸睡拖到最坏 5s（写法同上方 C 档循环）
         if (m_stop.load()) break;
-        Sleep(2000);
+        for (int i = 0; i < 20 && !m_stop.load(); i++) Sleep(100);
+        if (m_stop.load()) break;
     }
     m_running = false;
 }
