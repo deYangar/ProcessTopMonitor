@@ -30,7 +30,7 @@ enum {
     IDC_IO_STATUS = 1050,     // IO 档位状态行
     IDC_IO_RETRY,             // IO 重试按钮
     IDC_CRASHDUMP_CHK = 1054, // 崩溃自动保存转储开关（2026-11-07 需求）
-    IDC_OPENDEBUG_BTN,        // 打开崩溃记录目录
+    IDC_OPENDEBUG_BTN,        // 打开日志目录（调试/崩溃记录共用）
     IDC_EFFECT_CBO = 1060,    // 效果
     IDC_OPACITY_TRK,          // 不透明度滑条
     IDC_OPACITY_VAL,          // 不透明度数值
@@ -392,8 +392,8 @@ void PtCreateControls(HWND hwnd) {
     }
     y += Sc(72) + Sc(12);
 
-    // ---- 崩溃诊断（2026-11-07 需求：开关 + 位置说明 + 查看入口）----
-    PtGroup(hwnd, TR(L"崩溃诊断"), M, y, GW, Sc(76));
+    // ---- 日志与诊断（2026-11-08 合并：调试日志开关并入，一个目录入口管全部）----
+    PtGroup(hwnd, TR(L"日志与诊断"), M, y, GW, Sc(100));
     {
         int iy = y + Sc(24);
         HWND chk = CreateWindowW(L"BUTTON",
@@ -403,26 +403,32 @@ void PtCreateControls(HWND hwnd) {
             (HMENU)(INT_PTR)IDC_CRASHDUMP_CHK, nullptr, nullptr);
         SendMessageW(chk, BM_SETCHECK, st.crash_dumps ? BST_CHECKED : BST_UNCHECKED, 0);
         PtFont(chk);
+        HWND dchk = CreateWindowW(L"BUTTON", TR(L"调试日志"),
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            M + Sc(12), iy + Sc(24), Sc(420), Sc(20), hwnd,
+            (HMENU)(INT_PTR)IDC_DEBUG_CHK, nullptr, nullptr);
+        SendMessageW(dchk, BM_SETCHECK, st.debug_logs ? BST_CHECKED : BST_UNCHECKED, 0);
+        PtFont(dchk);
         wchar_t dbg_dir[MAX_PATH] = L"";
         if (PTM_GetDebugDir(dbg_dir, MAX_PATH) && dbg_dir[0]) {
             HWND pl = CreateWindowW(L"STATIC", dbg_dir,
                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
-                M + Sc(110), iy + Sc(28), GW - Sc(230), Sc(20), hwnd,
+                M + Sc(110), iy + Sc(52), GW - Sc(230), Sc(20), hwnd,
                 nullptr, nullptr, nullptr);
             PtFont(pl);
         }
         HWND plbl = CreateWindowW(L"STATIC", TR(L"记录保存在："),
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            M + Sc(12), iy + Sc(28), Sc(96), Sc(20), hwnd,
+            M + Sc(12), iy + Sc(52), Sc(96), Sc(20), hwnd,
             nullptr, nullptr, nullptr);
         PtFont(plbl);
         HWND ob = CreateWindowW(L"BUTTON", TR(L"打开目录"),
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            M + GW - Sc(100), iy + Sc(24), Sc(84), Sc(24), hwnd,
+            M + GW - Sc(100), iy + Sc(48), Sc(84), Sc(24), hwnd,
             (HMENU)(INT_PTR)IDC_OPENDEBUG_BTN, nullptr, nullptr);
         PtFont(ob);
     }
-    y += Sc(76) + Sc(12);
+    y += Sc(100) + Sc(12);
 
     // ---- 显示（M6 §4.5：出现方式/默认指标/多窗口并排三行）----
     PtGroup(hwnd, TR(L"显示"), M, y, GW, Sc(88));
@@ -456,7 +462,7 @@ void PtCreateControls(HWND hwnd) {
     y += Sc(88) + Sc(12);
 
     // ---- 窗口与外观 ----
-    PtGroup(hwnd, TR(L"窗口与外观"), M, y, GW, Sc(118));
+    PtGroup(hwnd, TR(L"窗口与外观"), M, y, GW, Sc(88));
     {
         int iy = y + Sc(24);
         PtFont(PtLabel(hwnd, TR(L"效果"), M + Sc(12), iy + Sc(4), Sc(40), Sc(20)));
@@ -506,14 +512,8 @@ void PtCreateControls(HWND hwnd) {
             (HMENU)(INT_PTR)IDC_SENSOR_CHK, nullptr, nullptr);
         SendMessageW(s1, BM_SETCHECK, st.sensor_summary ? BST_CHECKED : BST_UNCHECKED, 0);
         PtFont(s1);
-        HWND s2 = CreateWindowW(L"BUTTON", TR(L"调试日志"),
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
-            M + Sc(12), iy2 + Sc(30), Sc(120), Sc(20), hwnd,
-            (HMENU)(INT_PTR)IDC_DEBUG_CHK, nullptr, nullptr);
-        SendMessageW(s2, BM_SETCHECK, st.debug_logs ? BST_CHECKED : BST_UNCHECKED, 0);
-        PtFont(s2);
     }
-    y += Sc(118) + Sc(16);
+    y += Sc(88) + Sc(16);
 
     // 初始滑条行状态：不透明档无浓度概念，整行置灰（PNM 同款）
     PtUpdateOpacityEnabled(hwnd, st.popup_effect);
@@ -660,8 +660,8 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == IDC_OPENDEBUG_BTN) {
-            // 崩溃记录查看入口：资源管理器打开 debug 目录（crash.log /
-            // crash.dmp / werdumps 都在这里），选中方便用户定位
+            // 日志查看入口：资源管理器打开 debug 目录（etw_file.log /
+            // crash.log / crash.dmp / werdumps 都在这里），选中方便用户定位
             wchar_t dbg_dir[MAX_PATH] = L"";
             if (PTM_GetDebugDir(dbg_dir, MAX_PATH) && dbg_dir[0])
                 ShellExecuteW(hwnd, L"open", dbg_dir, nullptr, nullptr, SW_SHOWNORMAL);
