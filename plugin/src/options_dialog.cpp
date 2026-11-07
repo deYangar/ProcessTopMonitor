@@ -45,6 +45,7 @@ namespace {
 struct PtDlgState {
     HWND dlg = nullptr;
     HFONT font = nullptr;
+    HFONT font_title = nullptr;   // 组框标题：微软雅黑 13px（2026-11-07 拍板）
     float dpi = 1.0f;
     int eng_rows = 0;                       // 引擎 checkbox 行数（动态）
     std::vector<std::wstring> engtypes;     // 打开时快照（确定时以此为准）
@@ -142,10 +143,13 @@ void PtApplyAppearanceToAll(int color_mode, int effect, int opacity) {
     });
 }
 
-// 组框：WS_GROUPBOX 按钮
+// 组框：WS_GROUPBOX 按钮。标题挂 13px 雅黑标题字体（此前组框漏设字体，
+// 板块名称显示为老式 System 字体，与其他控件不协调）
 HWND PtGroup(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
-    return CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                         x, y, w, h, parent, nullptr, nullptr, nullptr);
+    HWND gb = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                            x, y, w, h, parent, nullptr, nullptr, nullptr);
+    if (gb && g_st.font_title) SendMessageW(gb, WM_SETFONT, (WPARAM)g_st.font_title, TRUE);
+    return gb;
 }
 HWND PtLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
     return CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
@@ -638,6 +642,7 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         PtPreviewHide();   // 预览实例随对话框销毁（OK/取消/ESC/关闭全路径）
         if (g_st.font) { DeleteObject(g_st.font); g_st.font = nullptr; }
+        if (g_st.font_title) { DeleteObject(g_st.font_title); g_st.font_title = nullptr; }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -677,6 +682,13 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     g_st.font = CreateFontIndirectW(&ncm.lfMessageFont);
+    // 组框标题字体：微软雅黑 13px，随 DPI 缩放（96 基准，与其他控件 9pt
+    // 正文拉开层级；找不到雅黑时系统自动 fallback 近似字体）
+    g_st.font_title = CreateFontW(-(int)(13 * g_st.dpi + 0.5f), 0, 0, 0, FW_NORMAL,
+                                  FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                  L"Microsoft YaHei UI");
 
     int dlg_w = Sc(660), dlg_h = Sc(700);
     HWND hwnd = CreateWindowExW(
@@ -688,6 +700,7 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
         hParent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
         if (g_st.font) DeleteObject(g_st.font);
+        if (g_st.font_title) DeleteObject(g_st.font_title);
         return ITMPlugin::OR_OPTION_NOT_PROVIDED;
     }
 
