@@ -20,7 +20,12 @@
 // crash diagnostics (PNM-inherited, zero-CRT logging path)
 // ============================================================
 
+// 崩溃诊断总开关（设置页「崩溃诊断」，默认开）：进程内 handler 安装保持
+// 无条件，入口以旗标短路；WER LocalDumps 注册/撤销随开关即时生效
+static std::atomic<bool> s_crash_dumps_on{true};
+
 static LONG WINAPI PtmCrashHandler(EXCEPTION_POINTERS* ep) {
+    if (!s_crash_dumps_on.load()) return EXCEPTION_CONTINUE_SEARCH;   // 设置关=未安装
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     static const DWORD serious[] = {
         0xC0000005, 0xC000001D, 0xC000008C, 0xC0000094, 0xC00000FD,
@@ -114,6 +119,8 @@ static LONG WINAPI PtmCrashHandler(EXCEPTION_POINTERS* ep) {
 // CRT invalid-parameter handler: log + failfast exactly like the CRT would
 static void PtmInvalidParamHandler(const wchar_t* expr, const wchar_t* func,
                                    const wchar_t* file, unsigned line, uintptr_t) {
+    // 关=跳过日志（failfast 照旧，保持 CRT 语义不变）
+    if (!s_crash_dumps_on.load()) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     static volatile LONG s_in_handler = 0;
     if (InterlockedIncrement(&s_in_handler) > 1)
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
@@ -170,32 +177,66 @@ static void PtmInvalidParamHandler(const wchar_t* expr, const wchar_t* func,
     __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 
-// WER LocalDumps: kernel-level dumps independent of in-process handlers
-static void SetupWerLocalDumps() {
+// WER LocalDumps: kernel-level dumps independent of in-process handlers.
+// 开（on）：注册 DumpFolder=本插件 debug\werdumps（3 份 minidump 滚动）。
+// 关（off）：仅当当前 DumpFolder 指向本插件目录（注册的是我们写的值）时
+// 撤销三值——兄弟插件 PNM 若持有该键（指向它的目录）则原样保留，由 PNM
+// 自己管理；键本身留着，避免误删他人配置。
+static void ApplyWerLocalDumps(bool on) {
+    const wchar_t* subkey =
+        L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\TrafficMonitor.exe";
+    wchar_t our_dir[MAX_PATH] = L"";
+    if (PTM_GetDebugDir(our_dir, MAX_PATH) && our_dir[0])
+        wcscat_s(our_dir, L"\\werdumps");
+    if (on) {
+        HKEY hk = nullptr;
+        LSTATUS st = RegCreateKeyExW(HKEY_LOCAL_MACHINE, subkey,
+            0, nullptr, 0, KEY_SET_VALUE, nullptr, &hk, nullptr);
+        if (st != ERROR_SUCCESS) return;
+        if (our_dir[0]) {
+            CreateDirectoryW(our_dir, nullptr);
+            RegSetValueExW(hk, L"DumpFolder", 0, REG_SZ,
+                           (const BYTE*)our_dir, (DWORD)((wcslen(our_dir) + 1) * sizeof(wchar_t)));
+            DWORD type = 1;   // MiniDump（全量 dump 单次 300-400MB，PNM 实测教训）
+            RegSetValueExW(hk, L"DumpType", 0, REG_DWORD, (const BYTE*)&type, sizeof(type));
+            DWORD count = 3;
+            RegSetValueExW(hk, L"DumpCount", 0, REG_DWORD, (const BYTE*)&count, sizeof(count));
+        }
+        RegCloseKey(hk);
+        return;
+    }
+    // off: 只撤销自己写的值（DumpFolder 等于本插件路径才动手）
     HKEY hk = nullptr;
-    LSTATUS st = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
-        L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\TrafficMonitor.exe",
-        0, nullptr, 0, KEY_SET_VALUE, nullptr, &hk, nullptr);
+    LSTATUS st = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey,
+                               0, KEY_QUERY_VALUE | KEY_SET_VALUE, &hk);
     if (st != ERROR_SUCCESS) return;
-    wchar_t dump_dir[MAX_PATH] = L"";
-    if (PTM_GetDebugDir(dump_dir, MAX_PATH) && dump_dir[0]) {
-        wcscat_s(dump_dir, L"\\werdumps");
-        CreateDirectoryW(dump_dir, nullptr);
-        RegSetValueExW(hk, L"DumpFolder", 0, REG_SZ,
-                       (const BYTE*)dump_dir, (DWORD)((wcslen(dump_dir) + 1) * sizeof(wchar_t)));
-        DWORD type = 1;   // MiniDump
-        RegSetValueExW(hk, L"DumpType", 0, REG_DWORD, (const BYTE*)&type, sizeof(type));
-        DWORD count = 3;
-        RegSetValueExW(hk, L"DumpCount", 0, REG_DWORD, (const BYTE*)&count, sizeof(count));
+    wchar_t cur[MAX_PATH] = L"";
+    DWORD cb = sizeof(cur);
+    if (RegQueryValueExW(hk, L"DumpFolder", nullptr, nullptr, (BYTE*)cur, &cb) == ERROR_SUCCESS &&
+        _wcsicmp(cur, our_dir) == 0) {
+        RegDeleteValueW(hk, L"DumpFolder");
+        RegDeleteValueW(hk, L"DumpType");
+        RegDeleteValueW(hk, L"DumpCount");
     }
     RegCloseKey(hk);
+}
+
+// 崩溃诊断总开关实现见文件头部 s_crash_dumps_on；此处只是设置页/InitOnce
+// 的应用入口（旗标 + WER 注册同步翻转）
+void CProcessTopPlugin::SetCrashDumps(bool on) {
+    s_crash_dumps_on.store(on);
+    ApplyWerLocalDumps(on);
+}
+
+bool CProcessTopPlugin::CrashDumpsEnabled() {
+    return s_crash_dumps_on.load();
 }
 
 void CProcessTopPlugin::InitCrashHandlers() {
     SetUnhandledExceptionFilter(PtmCrashHandler);
     AddVectoredExceptionHandler(1, PtmCrashHandler);
     _set_invalid_parameter_handler(PtmInvalidParamHandler);
-    SetupWerLocalDumps();
+    ApplyWerLocalDumps(true);   // 旗标默认开；LoadSettings 后 SetCrashDumps 校正
 }
 
 // ============================================================
@@ -579,6 +620,7 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
 
     // settings first: everything below reads them
     PtLoadSettings(m_config_dir, m_settings);
+    SetCrashDumps(m_settings.crash_dumps);   // 校正 InitCrashHandlers 的默认开
     ApplySettingsToCollectors();
     EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
     m_gpu.ProbeGrade();   // OS-version gate: menu gray-state on G3 systems
@@ -1145,25 +1187,42 @@ void CProcessTopPlugin::GetIoStatusForDialog(wchar_t* out, size_t cap) {
     FileIoGrade g = m_etw.Grade();
     switch (g) {
     case FileIoGrade::A:
-        wcsncpy_s(out, cap, TR(L"A：精确口径（文件读写，ETW 会话 PTMFileIoSession）"), _TRUNCATE);
+        wcsncpy_s(out, cap, TR(L"√ 正在按文件读写精确统计（不含网络流量）"), _TRUNCATE);
         break;
     case FileIoGrade::B:
-        wcsncpy_s(out, cap, TR(L"B：精确口径（Win7 NT Kernel Logger）"), _TRUNCATE);
+        wcsncpy_s(out, cap, TR(L"√ 正在按文件读写精确统计（不含网络流量，兼容模式）"), _TRUNCATE);
         break;
     case FileIoGrade::C: {
-        wcsncpy_s(out, cap, TR(L"C：全句柄口径（含网络）"), _TRUNCATE);
-        // 原因追加（GetStatusText 的 "C: reason" 段）
+        // 2026-11-07 反馈重写：不露 A/B/C 档位与 ETW 会话名等内部术语；
+        // 面向用户的口径语义 + 中文原因 + 可操作指引（重试）
+        wcsncpy_s(out, cap, TR(L"△ 精确统计不可用，已降级为全口径（含网络流量）"), _TRUNCATE);
+        // 原因追加（GetStatusText 的 "C: reason" 段 → 中文映射）
         wchar_t base[160];
         m_etw.GetStatusText(base, 160);
         const wchar_t* p = wcschr(base, L':');
-        if (p && p[1] == L' ' && p[2] && wcslen(out) + 4 + wcslen(p + 2) < cap) {
-            wcscat_s(out, cap, TR(L"—— "));
-            wcscat_s(out, cap, p + 2);
+        if (p && p[1] == L' ' && p[2]) {
+            const wchar_t* reason = p + 2;
+            const wchar_t* zh = nullptr;
+            if (wcscmp(reason, L"need admin") == 0)
+                zh = TR(L"需要管理员权限（用管理员身份重启 TrafficMonitor）");
+            else if (wcscmp(reason, L"session collision") == 0)
+                zh = TR(L"上次会话残留占用（点「重试」接管）");
+            else if (wcscmp(reason, L"StartTrace failed") == 0 ||
+                     wcscmp(reason, L"OpenTrace failed") == 0)
+                zh = TR(L"系统会话启动失败（点「重试」）");
+            else if (wcscmp(reason, L"NT Kernel Logger busy") == 0)
+                zh = TR(L"系统会话被其他程序占用");
+            else if (wcscmp(reason, L"session ended") == 0)
+                zh = TR(L"会话已结束（点「重试」重建）");
+            if (zh && wcslen(out) + 4 + wcslen(zh) < cap) {
+                wcscat_s(out, cap, TR(L"—— "));
+                wcscat_s(out, cap, zh);
+            }
         }
         break;
     }
     default:
-        wcsncpy_s(out, cap, L"off", _TRUNCATE);
+        wcsncpy_s(out, cap, TR(L"未运行（当前没有磁盘 IO 窗口，自动停止）"), _TRUNCATE);
         break;
     }
     uint64_t lost = 0;

@@ -84,6 +84,9 @@ public:
     std::vector<std::wstring> EnumerateGpuEnginesForDialog();      // 运行中取快照，否则临时查询
     FileIoGrade RetryFileIoSession() { return m_etw.Start(); }     // 幂等重试
     void GetIoStatusForDialog(wchar_t* out, size_t cap);           // 档位文案 + 丢事件
+    // 崩溃诊断开关（设置页）：旗标 + WER LocalDumps 注册/撤销即时生效
+    void SetCrashDumps(bool on);
+    bool CrashDumpsEnabled();
 
     // ---- M6 hover 状态机 + pin（UI 线程；§4.3.2 状态字段照 PNM 命名）----
     bool GroupPinned() const { return m_group_pinned; }

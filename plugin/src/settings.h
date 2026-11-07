@@ -42,6 +42,7 @@ struct PtSettings {
     int vram_basis = 0;                  // 0=dedicated 1=dedicated+shared
     std::wstring lang = L"auto";   // auto or BCP-47
     bool debug_logs = false;
+    bool crash_dumps = true;       // 崩溃自动保存转储（crash.log/crash.dmp+WER），默认开
     bool sensor_summary = true;    // 头部条传感器摘要（M6 决策 3=A，默认 true）
 
     // ---- v3 新增（M6 §3.1）----
@@ -180,6 +181,7 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"gpu_cap_100\": %s,\n", st.gpu_cap_100 ? "true" : "false");
     fprintf(f, "  \"vram_basis\": %d,\n", st.vram_basis);
     fprintf(f, "  \"debug_logs\": %s,\n", st.debug_logs ? "true" : "false");
+    fprintf(f, "  \"crash_dumps\": %s,\n", st.crash_dumps ? "true" : "false");
     fprintf(f, "  \"lang\": \"%s\",\n", PtToUtf8(st.lang).c_str());
     fprintf(f, "  \"sensor_summary\": %s,\n", st.sensor_summary ? "true" : "false");
     fprintf(f, "  \"popup_mode\": %d,\n", st.popup_mode);
@@ -254,6 +256,7 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     getb("\"gpu_cap_100\"", st.gpu_cap_100);
     geti("\"vram_basis\"", st.vram_basis);
     getb("\"debug_logs\"", st.debug_logs);
+    getb("\"crash_dumps\"", st.crash_dumps);   // 无键 = 默认开（旧配置升级天然兼容）
     gets("\"lang\"", st.lang);
     getb("\"sensor_summary\"", st.sensor_summary);
     geti("\"popup_mode\"", st.popup_mode);

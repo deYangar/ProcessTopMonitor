@@ -8,6 +8,7 @@
 #include "utils.h"
 #include "i18n.h"
 #include <commctrl.h>
+#include <shellapi.h>   // ShellExecuteW：崩溃记录目录查看入口
 #include <algorithm>
 
 #pragma comment(lib, "comctl32.lib")
@@ -28,6 +29,8 @@ enum {
     IDC_PRESET_COMPUTE,       // 预设：计算
     IDC_IO_STATUS = 1050,     // IO 档位状态行
     IDC_IO_RETRY,             // IO 重试按钮
+    IDC_CRASHDUMP_CHK = 1054, // 崩溃自动保存转储开关（2026-11-07 需求）
+    IDC_OPENDEBUG_BTN,        // 打开崩溃记录目录
     IDC_EFFECT_CBO = 1060,    // 效果
     IDC_OPACITY_TRK,          // 不透明度滑条
     IDC_OPACITY_VAL,          // 不透明度数值
@@ -363,7 +366,11 @@ void PtCreateControls(HWND hwnd) {
     y += gpu_h + Sc(12);
 
     // ---- 磁盘 IO 采集 ----
-    PtGroup(hwnd, TR(L"磁盘 IO 采集"), M, y, GW, Sc(52));
+    // 2026-11-07 反馈：状态行原样暴露 A/B/C 档位与 ETW 会话名，用户
+    // 看不懂也看不出「这是什么设置」。改法：文案口语化（见
+    // GetIoStatusForDialog）+ 板块内补一行口径说明，讲清「统计什么、
+    // 什么时候降级、重试干什么」
+    PtGroup(hwnd, TR(L"磁盘 IO 采集"), M, y, GW, Sc(72));
     {
         int iy = y + Sc(22);
         HWND stc = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
@@ -375,9 +382,47 @@ void PtCreateControls(HWND hwnd) {
             M + GW - Sc(110), iy - Sc(4), Sc(84), Sc(24), hwnd,
             (HMENU)(INT_PTR)IDC_IO_RETRY, nullptr, nullptr);
         PtFont(rb);
+        HWND cap = CreateWindowW(L"STATIC",
+            TR(L"说明：按文件读写精确统计（不含网络）；系统不允许时自动降级为全口径（含网络），点「重试」恢复"),
+            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+            M + Sc(12), iy + Sc(26), GW - Sc(24), Sc(20), hwnd,
+            nullptr, nullptr, nullptr);
+        PtFont(cap);
         PtFillIoStatus(hwnd);
     }
-    y += Sc(52) + Sc(12);
+    y += Sc(72) + Sc(12);
+
+    // ---- 崩溃诊断（2026-11-07 需求：开关 + 位置说明 + 查看入口）----
+    PtGroup(hwnd, TR(L"崩溃诊断"), M, y, GW, Sc(76));
+    {
+        int iy = y + Sc(24);
+        HWND chk = CreateWindowW(L"BUTTON",
+            TR(L"崩溃时自动保存转储（用于定位崩溃原因，推荐开启）"),
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            M + Sc(12), iy, Sc(420), Sc(20), hwnd,
+            (HMENU)(INT_PTR)IDC_CRASHDUMP_CHK, nullptr, nullptr);
+        SendMessageW(chk, BM_SETCHECK, st.crash_dumps ? BST_CHECKED : BST_UNCHECKED, 0);
+        PtFont(chk);
+        wchar_t dbg_dir[MAX_PATH] = L"";
+        if (PTM_GetDebugDir(dbg_dir, MAX_PATH) && dbg_dir[0]) {
+            HWND pl = CreateWindowW(L"STATIC", dbg_dir,
+                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                M + Sc(110), iy + Sc(28), GW - Sc(230), Sc(20), hwnd,
+                nullptr, nullptr, nullptr);
+            PtFont(pl);
+        }
+        HWND plbl = CreateWindowW(L"STATIC", TR(L"记录保存在："),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            M + Sc(12), iy + Sc(28), Sc(96), Sc(20), hwnd,
+            nullptr, nullptr, nullptr);
+        PtFont(plbl);
+        HWND ob = CreateWindowW(L"BUTTON", TR(L"打开目录"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            M + GW - Sc(100), iy + Sc(24), Sc(84), Sc(24), hwnd,
+            (HMENU)(INT_PTR)IDC_OPENDEBUG_BTN, nullptr, nullptr);
+        PtFont(ob);
+    }
+    y += Sc(76) + Sc(12);
 
     // ---- 显示（M6 §4.5：出现方式/默认指标/多窗口并排三行）----
     PtGroup(hwnd, TR(L"显示"), M, y, GW, Sc(88));
@@ -551,6 +596,9 @@ void PtOnOk(HWND hwnd) {
                                    BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.sensor_summary = SendMessageW(GetDlgItem(hwnd, IDC_SENSOR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.debug_logs = SendMessageW(GetDlgItem(hwnd, IDC_DEBUG_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    // 崩溃转储开关：读回 + 即时生效（旗标/WER 注册当场翻转，不等重启）
+    st.crash_dumps = SendMessageW(GetDlgItem(hwnd, IDC_CRASHDUMP_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    plugin.SetCrashDumps(st.crash_dumps);
     int eff = PtCboSel(hwnd, IDC_EFFECT_CBO);
     if (eff >= 0) st.popup_effect = PtClampEffectForOS(eff);   // 低系统存档降级透明档
     int col = PtCboSel(hwnd, IDC_COLOR_CBO);
@@ -609,6 +657,14 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (id == IDC_IO_RETRY) {
             CProcessTopPlugin::Instance().RetryFileIoSession();
             PtFillIoStatus(hwnd);
+            return 0;
+        }
+        if (id == IDC_OPENDEBUG_BTN) {
+            // 崩溃记录查看入口：资源管理器打开 debug 目录（crash.log /
+            // crash.dmp / werdumps 都在这里），选中方便用户定位
+            wchar_t dbg_dir[MAX_PATH] = L"";
+            if (PTM_GetDebugDir(dbg_dir, MAX_PATH) && dbg_dir[0])
+                ShellExecuteW(hwnd, L"open", dbg_dir, nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
         if (id == IDC_PRESET_ALL || id == IDC_PRESET_D3D || id == IDC_PRESET_COMPUTE) {
