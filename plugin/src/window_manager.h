@@ -2,9 +2,12 @@
 // ============================================================
 // window_manager — 排行悬浮窗实例生命周期 + windows[] 配置持久化 +
 // 组显示控制（组布局 / 锚窗子类化跟随，M6 §4.2）
-// 单例（与插件单例同生命周期）。全部方法只在 TM 主线程调用，仅两处例外：
+// 单例（与插件单例同生命周期）。全部方法只在 TM 主线程（UI 线程）调用，
+// tick 线程仅有的例外都已收敛（2026-11-08 审查 A1 治本）：
 //   - BoundMask()：tick 线程原子读（GPU 按需启停判定）
-//   - ReclaimDead()：tick 线程调用，但收尸动作会转交 UI 线程（见实现）
+//   - PostTickSync()：tick 线程投递消息（原子读 watchdog HWND + PostMessage，
+//     不触碰 m_windows）——原 tick 侧的 ReclaimDead/PostToAll/CollectConfigs/
+//     Count 四触点全部由此转交 UI 线程执行
 // M6 职责变化：新增组显示控制 + 组布局 + 锚窗子类化；删除
 // ShowAll/HideAll/ToggleAll（被 plugin_main hover 状态机取代）与
 // OnWindowMoveEnded（移入窗口自身 WM_EXITSIZEMOVE）。
@@ -70,6 +73,14 @@ public:
     // 组隐藏时窗口 SW_HIDE 不停 timer；组长变化（首建/销毁）后重挂
     void EnsureHoverTimer();
 
+    // ---- tick→UI 消息驱动落点（A1 治本，2026-11-08 审查）----
+    // watchdog 窗在 InitOnce 即创建（UI 线程，message-only 常驻），tick
+    // 线程经 PostTickSync 把窗口侧动作（ReclaimDead/PostToAll/零窗停表）
+    // 全部转交 UI 线程执行——tick 线程对 m_windows vector 的 4 个触点
+    //（PostToAll/ReclaimDead/CollectConfigs/Count）从此归零
+    void EnsureWatchdog();
+    void PostTickSync();   // tick 线程：投 WM_PTM_TICK_SYNC 给 watchdog
+
     // ---- PNM 秩序兜底（问题④不对称秩序，UI 线程）----
     // HoverTick 每 ≥500ms 调：检测同进程 PNMTooltip_ 窗与 PTM 组的
     // 关系——PNM 压住正位且 PTM 还在理论矩形 → 重排让位；PNM 全部消失
@@ -98,8 +109,9 @@ private:
     // message-only 窗 + 原生注册 proc + 1s timer，发现组长窗 wndproc 被
     // 外部注入器剥掉 → 重装（防 hover timer 静默死亡导致弹窗永不消失）
     static LRESULT CALLBACK WatchdogProc(HWND, UINT, WPARAM, LPARAM);
-    void EnsureWatchdog();
-    HWND m_watchdog_hwnd = nullptr;
+    // HWND 由 UI 线程写一次（EnsureWatchdog）、tick 线程读（PostTickSync）
+    // ——指针宽度的原子访问，杜绝无同步读
+    std::atomic<HWND> m_watchdog_hwnd{nullptr};
     std::vector<std::unique_ptr<CTopListWindow>> m_windows;
     std::atomic<int> m_bound_mask{0};
     int m_cascade = 0;   // 级联偏移计数（新窗位置 = 工作区 10% 处 + 28*n）

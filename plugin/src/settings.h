@@ -163,7 +163,13 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     CreateDirectoryW(config_dir.c_str(), nullptr);
     wchar_t path[MAX_PATH];
     if (swprintf_s(path, MAX_PATH, L"%s\\settings.json", config_dir.c_str()) <= 0) return false;
-    FILE* f = _wfopen(path, L"w");
+    // 原子写（A2 治本，「活配置原子写」纪律落实到插件自身代码）：先写
+    // 同卷 tmp，fclose 落盘后 MoveFileEx(REPLACE_EXISTING) 原子替换——
+    // 任何时刻外部读 settings.json 都是完整旧版或完整新版，杜绝截断
+    // 半写形态（2026-11-08 部署事故同族失效）；写失败时原文件保持原样
+    wchar_t tmp[MAX_PATH];
+    if (swprintf_s(tmp, MAX_PATH, L"%s\\settings.json.tmp", config_dir.c_str()) <= 0) return false;
+    FILE* f = _wfopen(tmp, L"w");
     if (!f) return false;
     // M6 §3.2：schema 固定写 3；新增三键；windows[] 每行只写
     // {kind, io_view, topn, x, y}；dock_edge/docked/dock_target 与 v1 的
@@ -196,7 +202,14 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     }
     fprintf(f, "  ]\n");
     fprintf(f, "}\n");
-    fclose(f);
+    if (fclose(f) != 0) {
+        DeleteFileW(tmp);   // 写失败（磁盘满等）：原文件保持原样
+        return false;
+    }
+    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp);
+        return false;
+    }
     return true;
 }
 

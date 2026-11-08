@@ -67,6 +67,9 @@ public:
     void SaveSettingsIfDirty();
     void ApplySettingsToCollectors();    // memory basis / GPU scope / debug logs
     void SaveWindowConfigsNow();         // 拖动结束等即时落盘路径（缺陷①修复）
+    // watchdog TICK_SYNC 处理器调用（UI 线程）：全部窗口销毁 → 停刷新
+    // 定时器。异步删除（不等待正跑的 tick 回调），与回调内自停同语义
+    void StopRefreshTimerFromUi() { StopRefreshTimer(false); }
     // M4 选项对话框生效管线用的接缝（刷新率重启/语言切换/立即落盘）
     void RestartRefreshTimer();
     void ApplyLanguageNow();

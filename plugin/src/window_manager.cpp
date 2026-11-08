@@ -581,8 +581,9 @@ void WindowManager::EnsureWatchdog() {
     // message-only 窗（HWND_MESSAGE）+ 原生注册 proc（不经 GWLP_WNDPROC
     // 安装，EnumWindows 注入器扫描不可见）+ 1s timer。与组长窗同线程
     // 创建：WM_TIMER 及修复都跑在属主线程——从属主线程修复子类化是
-    // 文档安全路径
-    if (m_watchdog_hwnd) return;
+    // 文档安全路径。A1 治本后 InitOnce 即创建（不再等首建窗）：零窗
+    // 配置（悬浮窗模式退出）下 tick 仍在跑，TICK_SYNC 落点窗必须存在
+    if (m_watchdog_hwnd.load(std::memory_order_relaxed)) return;
     HINSTANCE inst = s_dll_hinst ? s_dll_hinst : (HINSTANCE)GetModuleHandleW(nullptr);
     wchar_t cls[64];
     swprintf_s(cls, 64, L"PTMWatchdog_%p", inst);
@@ -596,9 +597,20 @@ void WindowManager::EnsureWatchdog() {
         wc.lpszClassName = cls;
         RegisterClassExW(&wc);
     }
-    m_watchdog_hwnd = CreateWindowExW(0, cls, L"", WS_OVERLAPPED,
-                                      0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
-    if (m_watchdog_hwnd) SetTimer(m_watchdog_hwnd, 3, 1000, nullptr);
+    HWND created = CreateWindowExW(0, cls, L"", WS_OVERLAPPED,
+                                   0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
+    if (created) {
+        m_watchdog_hwnd.store(created, std::memory_order_release);
+        SetTimer(created, 3, 1000, nullptr);
+    }
+}
+
+void WindowManager::PostTickSync() {
+    // tick 线程唯一入口（A1）：只做原子读 + PostMessage，绝不触碰
+    // m_windows vector——窗口侧动作全部由 watchdog（UI 线程）的
+    // WM_PTM_TICK_SYNC 处理器代执行
+    HWND h = m_watchdog_hwnd.load(std::memory_order_acquire);
+    if (h) PostMessageW(h, WM_PTM_TICK_SYNC, 0, 0);
 }
 
 LRESULT CALLBACK WindowManager::WatchdogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -618,6 +630,25 @@ LRESULT CALLBACK WindowManager::WatchdogProc(HWND hwnd, UINT msg, WPARAM wp, LPA
                 SetTimer(leader, 2, 100, nullptr);
             }
         }
+        // A2 治本（落盘收敛 UI 线程）：1s 检查脏标志，节流钟在
+        // SaveSettingsIfDirty 内部（30s）；debug_logs 开关同步也在此
+        //（原 tick 侧 30s 块移入，读 m_settings 从此全在 UI 线程）
+        CProcessTopPlugin::Instance().SaveSettingsIfDirty();
+        EtwFileCollector::SetDebugLogs(
+            CProcessTopPlugin::Instance().m_settings.debug_logs);
+        return 0;
+    }
+    if (msg == WM_PTM_TICK_SYNC) {
+        if (g_shutting_down) return 0;   // DLL 卸载期不做任何窗口操作
+        // tick 线程转交的窗口侧同步动作（A1）：三步原本散在 RefreshTick
+        // 第 5/6 段由 tick 线程直调——与 UI 增删窗（push_back 扩容/erase
+        // 搬移）并发遍历 vector 是堆损坏竞态。此处已是 UI 线程，安全
+        auto& mgr = Instance();
+        mgr.ReclaimDead();                          // 已在属主线程：真删分支
+        mgr.PostToAll(WM_PTM_REFRESH, 0, 0);        // 各窗自行拉快照刷新
+        // 全部窗口销毁（windows 清空）→ 定时器停（M6 §4.2.5）。异步删除
+        //（不等待正跑的 tick 回调），与原回调内自停同语义
+        if (mgr.Count() == 0) CProcessTopPlugin::Instance().StopRefreshTimerFromUi();
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -697,9 +728,9 @@ void WindowManager::ReclaimDead() {
         if (w->GetHwnd() && !IsWindow(w->GetHwnd())) { any_dead = true; break; }
     }
     if (!any_dead) return;
-    // erase/reindex 会与 UI 线程的菜单遍历并发：tick 线程调进来时先转交
-    // UI 线程（WM_APP 段消息），由 WM_PTM_RECLAIM 处理器再入本函数真删；
-    // 已在 UI 线程（或无活窗可转交且无并发方）则直接清
+    // A1 治本后调用方全部已在 UI 线程（watchdog 的 TICK_SYNC 处理器 /
+    // 窗口 WM_PTM_RECLAIM 处理器），下方转交分支是防御性遗留（若未来
+    // 再次出现跨线程调用方，仍安全转交属主线程再删）
     if (GetCurrentThreadId() != m_ui_tid) {
         for (auto& w : m_windows) {
             if (w->GetHwnd() && IsWindow(w->GetHwnd())) {

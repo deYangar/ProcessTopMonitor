@@ -648,6 +648,11 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     // 由 RefreshTick 按可见窗口绑定位集决定——无磁盘 IO 窗口时零内核开销
     // （会话建立 ~10ms，首次切到 IO 视图时启动，可接受）
 
+    // watchdog 窗先行（A1）：InitOnce 即创建（零窗配置下 tick 也在跑，
+    // TICK_SYNC 的落点窗必须先存在），tick 线程的窗口侧动作全部经它
+    // 回到 UI 线程执行
+    WindowManager::Instance().EnsureWatchdog();
+
     // high-frequency refresh timer (independent of TM's 1s tick)
     StartRefreshTimer();
 
@@ -843,19 +848,26 @@ void CProcessTopPlugin::HoverTick() {
 }
 
 void CProcessTopPlugin::SaveSettingsIfDirty() {
-    ULONGLONG now = GetTickCount64();
-    if (now - m_last_save_tick < 30000 && !m_settings_dirty) return;
-    m_last_save_tick = now;
+    // UI 线程（watchdog 1s timer 驱动，A2 治本；tick 侧调用点已删）。
+    // 先判脏再判钟（C1 修复）：旧序 `<30s && !dirty` 只挡「不脏」分支，
+    // 脏标志为真时随时落盘——30s 节流名存实亡，仅靠 RefreshTick 外层
+    // 恰好又门了一道才没暴露。两行换序后语义自立，新增调用方无坑
     if (!m_settings_dirty) return;
+    ULONGLONG now = GetTickCount64();
+    if (now - m_last_save_tick < 30000) return;
+    m_last_save_tick = now;
     SaveWindowConfigsNow();
     m_settings_dirty = false;
 }
 
 void CProcessTopPlugin::SaveWindowConfigsNow() {
     // 窗口配置（含位置，拖动结束时已写进各自 cfg）全量收走落盘——
-    // 缺陷①（M5/A1）的治本路径：不等 30s 节流
+    // 缺陷①（M5/A1）的治本路径：不等 30s 节流。全部调用方（拖动结束 /
+    // 选项确定 / watchdog 节流）都在 UI 线程，双线程并发写 settings.json
+    // 的竞态（A2）随之消除；节流钟同步防「立即落盘后 30s 内又落一次」
     m_settings.windows = WindowManager::Instance().CollectConfigs();
     PtSaveSettings(m_config_dir, m_settings);
+    m_last_save_tick = GetTickCount64();
 }
 
 // ---- tooltip (double-buffered publish, PNM discipline) ----
@@ -1060,21 +1072,17 @@ void CProcessTopPlugin::RefreshTick() {
 
     BuildTooltip();
 
-    // 5) window refresh (posted: window pulls the snapshot on ITS OWN thread)
-    WindowManager::Instance().ReclaimDead();   // × 钮销毁的窗口对象回收
-    WindowManager::Instance().PostToAll(WM_PTM_REFRESH, 0, 0);
+    // 5) window refresh — 全部转交 UI 线程（A1 治本，2026-11-08 审查）：
+    // tick 线程对 m_windows 的三个触点（ReclaimDead 扫描 / PostToAll 遍
+    // 历 / Count 读 size）与 UI 增删窗（push_back 扩容/erase 搬移）并发
+    // = 堆损坏竞态。投递 TICK_SYNC 给 watchdog 窗（UI 线程），由其消息
+    // 处理器代执行收尸 + 刷新广播 + 零窗停表
+    WindowManager::Instance().PostTickSync();
 
-    // 6) throttled settings persistence + debug-log sync。
-    // 墙钟 30s 节流（原 tick 计数 %60 在负载下 tick 走得慢，首槽实测
-    // ~62s——cfg 变更落盘窗口不可控；墙钟才是「30s 节流」的诚实实现）
-    if (now - m_last_save_tick >= 30000) {
-        SaveSettingsIfDirty();
-        EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
-    }
-    // 全部窗口销毁（windows 清空）→ 定时器停（M6 §4.2.5：hover 隐藏不
-    // 停采集，只有窗销毁才停）：CPU 归零，任务栏 item 退化为 TM tick 惰
-    // 性读缓存；item 重建窗时由 AddWindow 重新拉起定时器
-    if (WindowManager::Instance().Count() == 0) StopRefreshTimer(false);   // 回调内自停：不能等待自己
+    // 6) settings 落盘已收敛 UI 线程（A2 治本）：watchdog 的 1s timer
+    // 检查脏标志 + 30s 节流落盘（SaveSettingsIfDirty），debug_logs 同步
+    // 一并移入——tick 线程从此不写 settings.json（消除 UI/tick 双线程
+    // _wfopen 截断+fprintf 交错的文件损坏竞态）
     m_refresh_busy.store(false);
 }
 

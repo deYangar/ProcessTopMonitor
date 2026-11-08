@@ -51,6 +51,10 @@ inline bool PTM_GetDebugDir(wchar_t* buf, size_t cap) {
 // ——跨 DLL 单向弱通知，PTM 未加载/无窗时自然无人处理；PNM 侧以裸
 // 常量 WM_APP+8 对齐（两 DLL 不共享头文件），幂等无副作用
 #define WM_PTM_YIELD (WM_APP + 8)
+// tick 线程 → watchdog 窗（UI 线程）：代执行窗口侧同步动作（死窗收尸 +
+// 刷新广播 + 零窗停表，A1 治本——tick 线程不再触碰 m_windows vector，
+// 与 WM_PTM_RECLAIM 同构，触发点也从 tick 侧移到 UI 消息驱动）
+#define WM_PTM_TICK_SYNC (WM_APP + 9)
 
 // Measure text width (pixels) with a given font. DPI-native by definition.
 inline int PTM_MeasureText(HDC hdc, HFONT hFont, const wchar_t* text) {
