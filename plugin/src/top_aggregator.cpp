@@ -22,7 +22,6 @@ struct Acc {
 void TopAggregator::Build(const CpuMemIoMetrics& m,
                           const EtwFileCollector::IoDelta* io_delta,
                           const GpuTickData* gpu,
-                          double dt,
                           const AggregateSettings& cfg,
                           MetricsCollector& mc,
                           MetricsSnapshot& out) {
@@ -34,6 +33,10 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     out.mem_used = m.mem_used;
     out.stamp = GetTickCount64();
 
+    // 精确口径速率分母（方案三窗口对齐）：handoff 真实窗口，tick 假 dt
+    // 不再参与——首窗几十 ms 的高估/低估、稳态 handoff 时机错位一并根治
+    double io_dt = io_delta ? (double)io_delta->window_us / 1e6 : 0.0;
+
     // ---- merge rows by process name ----
     // Empty name (protected process) -> "<pid>" placeholder, one row each
     // (they are distinct processes even if unnamed). Same-name merge sums
@@ -42,7 +45,7 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     std::vector<Acc> merged;
     std::unordered_map<std::wstring, size_t> by_name;
     merged.reserve(m.procs.size());
-    bool etw_exact = io_delta && io_delta->valid && dt > 0;
+    bool etw_exact = io_delta && io_delta->valid && io_dt > 0;
 
     for (const auto& p : m.procs) {
         double io_r = p.io_read_bps, io_w = p.io_write_bps;
@@ -51,8 +54,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             io_r = io_w = 0;
             auto it = io_delta->per_pid.find(p.pid);
             if (it != io_delta->per_pid.end()) {
-                io_r = (double)it->second.first / dt;
-                io_w = (double)it->second.second / dt;
+                io_r = (double)it->second.first / io_dt;
+                io_w = (double)it->second.second / io_dt;
             }
         }
         double gpu_pct = 0;
@@ -117,8 +120,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
                 swprintf_s(tmp, L"<PID %lu>", kv.first);
                 nm = tmp;
             }
-            double r = (double)kv.second.first / dt;
-            double w = (double)kv.second.second / dt;
+            double r = (double)kv.second.first / io_dt;
+            double w = (double)kv.second.second / io_dt;
             auto it = by_name.find(nm);
             if (it == by_name.end()) {
                 by_name[nm] = merged.size();
@@ -194,8 +197,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     if (etw_exact) {
         uint64_t r = 0, w = 0;
         for (const auto& kv : io_delta->per_pid) { r += kv.second.first; w += kv.second.second; }
-        out.io_read_total_bps = (double)r / dt;
-        out.io_write_total_bps = (double)w / dt;
+        out.io_read_total_bps = (double)r / io_dt;
+        out.io_write_total_bps = (double)w / io_dt;
     } else {
         double r = 0, w = 0;
         for (const auto& p : m.procs) { r += p.io_read_bps; w += p.io_write_bps; }

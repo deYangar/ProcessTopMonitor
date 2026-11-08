@@ -54,6 +54,7 @@ public:
     // before unload (private members; this wrapper is the public seam)
     void ShutdownForDllUnload() {
         StopRefreshTimer();
+        StopKickTimer();
         m_etw.Stop();
         m_gpu.EnsureStopped();
         // 锚窗子类化还原：TM 主窗通常活得比本 DLL 久，留着 AnchorProc
@@ -72,6 +73,14 @@ public:
     // M6 §4.5：popup_mode/multi_window/default_metric 三项的生效函数
     //（选项对话框「确定」管线集中调用，UI 线程）
     void ApplyWindowMode();
+
+    // 方案一「开窗即拍」（2026-11-08 IO/GPU 预热提速）：在「用户刚要看」
+    // 的时刻（AddWindow / 指标切换 / ShowGroupAt 弹回）用 one-shot
+    // timer（due=0）立即补一拍 RefreshTick——首帧到首拍的 0~refresh_ms
+    // 间隙由此消除，GPU「采样预热中」可见时长 500ms → ≤50ms（冷启动
+    // 补拍在触发的这一拍内完成）。UI 线程调用；与周期 timer 的并发投递
+    // 由 RefreshTick 的 m_refresh_busy CAS 防重入兜住
+    void KickRefreshTick();
 
     // GPU 口径（窗口口径菜单读写，均 UI 线程）
     GpuScopeConfig GpuScope() const { return m_settings.GpuScope(); }
@@ -137,6 +146,8 @@ private:
     bool m_inited = false;
     HANDLE m_refresh_timer = nullptr;
     bool m_refresh_timer_ok = false;
+    HANDLE m_kick_timer = nullptr;   // 方案一：one-shot 补拍 timer（复用式，
+                                     // 仅 UI 线程触达；Shutdown/析构统一删除）
     int m_tick_count = 0;
     int m_gpu_tick_div = 0;              // GPU 采集分频（每 2 拍 ≈1s）
     // 迟停计时（问题①A，tick 线程私有）：0 = 绑定中/未启动；非 0 = 空闲
@@ -157,6 +168,7 @@ private:
     static void CALLBACK RefreshTimerProc(void* param, BOOLEAN timer_or_wait);
     void StartRefreshTimer();
     void StopRefreshTimer(bool wait = true);   // wait=false：定时器回调内自停（防自死锁）
+    void StopKickTimer();                      // 方案一：kick timer 统一删除点
     void CheckLanguageChange();
     void BuildTooltip();                 // 双缓冲 tooltip 文本
     wchar_t m_tooltip[2][2048] = { L"", L"" };

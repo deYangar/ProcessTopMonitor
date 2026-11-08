@@ -711,6 +711,10 @@ void CTopListWindow::SetKind(MetricKind k) {
         CProcessTopPlugin::Instance().CopySnapshot(snap, valid);
         ApplySnapshotForCurrentView(snap);
     }
+    // 开窗即拍（方案一）：指标切换后立即补一拍——新维度若是真停维度
+    //（GPU 采集停了 3 分钟+），冷启动补拍（EnsureStarted 基准拍 + 二次
+    // 采样）在这一拍内完成，「采样预热中」可见时长 0~refresh_ms → ≤50ms
+    CProcessTopPlugin::Instance().KickRefreshTick();
     RecalcAndRepaint(true);
 }
 

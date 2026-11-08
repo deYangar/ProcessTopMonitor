@@ -131,6 +131,16 @@ FileIoGrade EtwFileCollector::Start() {
     if (m_running.load()) return Grade();
     s_self = this;
     m_stop = false;
+    // 窗口记账（方案三）：QPC 频率取一次；窗口起点由首个会话的
+    // 「首拍就绪 handoff」推齐（见 ConsumerLoop）
+    if (!m_qpc_freq) {
+        LARGE_INTEGER f;
+        if (QueryPerformanceFrequency(&f) && f.QuadPart > 0)
+            m_qpc_freq = f.QuadPart;
+        else
+            m_qpc_freq = 1;   // 防御：QPC 不可用（实践中不发生），窗口退化为 0
+    }
+    m_window_open_qpc = 0;
 
     // payload pointer width = kernel bitness (kernel sessions are not
     // wow64-translated — an x86 plugin on x64 sees 8-byte pointers)
@@ -236,6 +246,12 @@ void EtwFileCollector::ConsumerLoop() {
         win8_plus = false;
     bool can_kernel_session = PtEnableSystemProfilePrivilege();   // one-shot, consumer thread
 
+    // C 档快重试配额（方案二两级退避）：落 C 后先 250ms×4（1s 内重试
+    // 四次），仍未成功回 10s 慢档——「回到 A 档」的可见延迟从 10s+ 压到
+    // ≤1.5s；need admin 这类真不可恢复场景行为不变（只是恢复探测更勤），
+    // 会话成功重建后配额重置（下次落 C 重新快重试）
+    int c_fast_left = 4;
+
     while (!m_stop.load()) {
         TRACEHANDLE consumer = INVALID_PROCESSTRACE_HANDLE;
         bool own_session = false;
@@ -303,14 +319,21 @@ void EtwFileCollector::ConsumerLoop() {
             LogLine(L"StartTrace ACCESS_DENIED (grade C)");
         } else if (sr == ERROR_ALREADY_EXISTS) {
             // A-grade session name collision: stale leftover from a previous
-            // crash of ours. Safe to stop (it's OUR name) and retry once.
+            // crash of ours. Safe to stop (it's OUR name) and retry.
+            // ControlTrace STOP 是异步下线：旧会话 buffers flush 需要时间，
+            // 二次 StartTrace 容易再撞 ALREADY_EXISTS（残留会话场景的主要
+            // 形态，旧「只重试一次」撞上即落 C 档）——方案二：撞上睡 150ms
+            // 等下线再试第三次，把残留场景在 Start() 内一次治好。
             // Note: newer Windows also reports ALREADY_EXISTS to a NON-elevated
             // StartTrace (do not leak session existence) — if the stop attempt
             // is denied, the real reason is missing admin rights.
             ULONG st = PtStopSession(0, kSessionName);
             LogLine(L"session exists, stop rc=%lu", st);
             if (st == ERROR_SUCCESS) {
-                sr = StartTraceW(&session, logger_name, props);
+                for (int attempt = 0; attempt < 2 && sr == ERROR_ALREADY_EXISTS; attempt++) {
+                    if (attempt) Sleep(150);   // 第三次尝试前等异步下线
+                    sr = StartTraceW(&session, logger_name, props);
+                }
                 if (sr == ERROR_SUCCESS) {
                     own_session = true;
                     session_handle = session;
@@ -338,15 +361,16 @@ void EtwFileCollector::ConsumerLoop() {
 
         if (consumer == INVALID_PROCESSTRACE_HANDLE) {
             // C grade: stay alive so a later Start() (after TM restarts
-            // elevated) can retry — recheck every 10s (运行期档位重协商)
+            // elevated) can retry（运行期档位重协商）——两级退避（方案二）
             if (m_stop.load()) break;
-            for (int i = 0; i < 100 && !m_stop.load(); i++) Sleep(100);
-            if (!m_stop.load() && Grade() == FileIoGrade::C) {
-                // retry the session attempt (A/B) once per wait cycle
-                continue;
+            if (c_fast_left > 0) {
+                c_fast_left--;
+                for (int i = 0; i < 25 && !m_stop.load(); i++) Sleep(10);   // 250ms 快档
+            } else {
+                for (int i = 0; i < 100 && !m_stop.load(); i++) Sleep(100); // 10s 慢档
             }
             if (m_stop.load()) break;
-            continue;
+            continue;   // retry the session attempt (A/B)
         }
 
         m_own_session = own_session;
@@ -355,6 +379,23 @@ void EtwFileCollector::ConsumerLoop() {
         m_cur_consumer = consumer;
         m_events_lost = 0;
         m_events_lost_last_query = 0;
+        c_fast_left = 4;   // 会话成功重建：C 档快重试配额重置（方案二）
+        m_log_was_valid = false;   // 新会话：接管转换日志从头记
+
+        // 首拍就绪信号（方案三第 3 条）：进 ProcessTrace 前主动 handoff 一次
+        //（窗口=0，配合完整窗口规则天然不接管）——把 handoff 时钟起点推齐
+        // 到「会话已就绪」时刻，否则起点要等第一批事件或 1s FlushTimer，
+        // 首个完整窗口迟迟不闭合；同时服务 tick 可能挂着的 pending 请求
+        //（valid=false → 该拍继续 fallback 全口径，数据连续不闪 0）。
+        // 上个会话残留的未交付 acc 属旧窗口语义，随新会话起点一并作废
+        m_acc.clear();
+        {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            m_window_open_qpc = now.QuadPart;
+        }
+        LogLine(L"session ready, window clock aligned (ready handoff)");
+        DoHandoffLocked();
 
         ULONG rc = ProcessTrace(&consumer, 1, nullptr, nullptr);
         m_cur_consumer = INVALID_PROCESSTRACE_HANDLE;
@@ -364,22 +405,45 @@ void EtwFileCollector::ConsumerLoop() {
         if (own_session && session_handle)
             PtStopSession(session_handle, nullptr);
         m_own_session_handle = 0;
-        LogLine(L"ProcessTrace rc=%lu, reconnecting in 2s", rc);
+        LogLine(L"ProcessTrace rc=%lu, reconnecting in 500ms", rc);
         SetStatus(FileIoGrade::C, L"session ended");
-        // 2s 重连等待按 100ms 步进查询 m_stop（M6 问题⑤治本）：Stop() 响应
-        // 2000ms→≤100ms，TM 退出收尾不再被裸睡拖到最坏 5s（写法同上方 C 档循环）
+        // 重连窗 2s→500ms（方案二）：意外断流的恢复可见延迟减半再减半；
+        // 等待按 100ms 步进查询 m_stop（M6 问题⑤治本）：Stop() 响应
+        // ≤100ms，TM 退出收尾不被裸睡拖住
         if (m_stop.load()) break;
-        for (int i = 0; i < 20 && !m_stop.load(); i++) Sleep(100);
+        for (int i = 0; i < 5 && !m_stop.load(); i++) Sleep(100);
         if (m_stop.load()) break;
     }
     m_running = false;
 }
 
 void EtwFileCollector::DoHandoffLocked() {
-    // consumer thread only. m_acc -> m_out swap (O(1)); the previous out
-    // content was already consumed by the tick thread's move.
-    m_out.swap(m_acc);
-    m_acc.clear();   // moved-in old out: ensure clean
+    // consumer thread only. 窗口记账（方案三）：每次 handoff 记 QPC，
+    // window = 本次 handoff − 上次 handoff（首次 = 会话启动时刻起算，
+    // m_window_open_qpc 由首拍就绪信号推齐）。m_out 是累计式：字节与窗口
+    // 一起 += 进 m_out，tick 消费（TakeDelta 读走清零）前不清——「窗口不
+    // 完整不接管」的字节跨窗口累计，永不断账（旧 swap 实现在 tick 超时
+    // 后 handoff 迟到的场景会丢一窗数据）。空闲时 m_acc 为空、循环零成本
+    if (m_window_open_qpc && m_qpc_freq > 0) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        int64_t delta = now.QuadPart - m_window_open_qpc;
+        if (delta > 0)
+            m_out_window_us += (uint64_t)(delta * 1000000 / m_qpc_freq);
+        m_window_open_qpc = now.QuadPart;
+    }
+    if (!m_acc.empty()) {
+        if (m_out.empty()) {
+            m_out.swap(m_acc);          // 快路径：空 out 直接 swap（O(1)）
+        } else {
+            for (auto& kv : m_acc) {     // 累计路径：并入未消费的 out
+                auto& o = m_out[kv.first];
+                o.read += kv.second.read;
+                o.write += kv.second.write;
+            }
+            m_acc.clear();
+        }
+    }
     m_take_req.store(false, std::memory_order_release);
     m_take_seq.fetch_add(1, std::memory_order_release);
 }
@@ -461,9 +525,10 @@ void EtwFileCollector::QueryEventsLost() {
     if (rc == ERROR_SUCCESS) m_events_lost = p->EventsLost;
 }
 
-void EtwFileCollector::TakeDelta(IoDelta& out) {
+void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
     out.per_pid.clear();
     out.valid = false;
+    out.window_us = 0;
     if (!m_running.load()) return;
 
     uint64_t seq0 = m_take_seq.load(std::memory_order_acquire);
@@ -473,13 +538,33 @@ void EtwFileCollector::TakeDelta(IoDelta& out) {
     // ~100ms worst case; the tick cadence is >=250ms so this never overlaps.
     for (int i = 0; i < 100; i++) {
         if (m_take_seq.load(std::memory_order_acquire) != seq0) {
+            out.window_us = m_out_window_us;
             out.per_pid.reserve(m_out.size());
             for (auto& kv : m_out) {
                 if (kv.second.read || kv.second.write)
                     out.per_pid[kv.first] = { kv.second.read, kv.second.write };
             }
-            m_out.clear();
-            out.valid = true;
+            // 完整窗口才接管（方案三）：窗口短于阈值（tick 间隔的一半）
+            // = 数据还没覆盖一个正常采样窗——不完整的窗口冒充精确口径
+            // 正是 C→A 切换瞬间全 0 闪烁的根子（per_pid 空窗被当成真零）。
+            // 不接管时字节/窗口**不清零**，留在 m_out 累计到下个窗口合并
+            // 交付，速率按合并后的真实窗口计算，永不断账
+            out.valid = (out.window_us >= min_window_us);
+            if (out.valid) {
+                m_out.clear();
+                m_out_window_us = 0;
+            }
+            // 接管转换点日志（方案三验证证据，仅 debug_logs 开时落盘）：
+            // 让位（窗口不完整→fallback）与接管（首个完整窗口）的切换
+            // 各打一条，稳态静默
+            if (s_debug_logs.load() && out.valid != m_log_was_valid) {
+                LogLine(L"window %s: win=%lluus pids=%u (threshold %lluus)",
+                        out.valid ? L"TAKEOVER" : L"YIELD",
+                        (unsigned long long)out.window_us,
+                        (unsigned)out.per_pid.size(),
+                        (unsigned long long)min_window_us);
+                m_log_was_valid = out.valid;
+            }
             QueryEventsLost();
             out.events_lost = m_events_lost;
             return;
@@ -489,4 +574,5 @@ void EtwFileCollector::TakeDelta(IoDelta& out) {
     // timeout: consumer silent (idle system, buffer callback not yet fired).
     // Do NOT read m_out (the handoff may still land concurrently) — caller
     // keeps its previous rates; the pending request is served next tick.
+    //（累计式 handoff 下本拍等待期的字节与窗口自动并入下次交付，无丢失）
 }

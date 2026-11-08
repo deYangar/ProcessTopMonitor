@@ -69,14 +69,16 @@ class MetricsCollector;
 class TopAggregator {
 public:
     // Runs on the tick thread. io_delta: this tick's exact ETW increments
-    // (valid=true only in grade A/B); when invalid the C-grade all-handle
-    // speeds from the snapshot are used and io_grade says so honestly.
+    // (valid=true only in grade A/B AND the handoff window is complete,
+    // 方案三); when invalid the C-grade all-handle speeds from the snapshot
+    // are used and io_grade says so honestly. 精确口径速率分母 =
+    // io_delta->window_us（handoff 真实窗口），不再接受 tick 假 dt——
+    // 窗口错位（首窗几十 ms / 稳态 handoff ≠ tick 间隔）的低估由此根治。
     // gpu: GPU/VRAM collection (nullptr = dimension off/not bound this tick).
     // mc: name-cache owner for short-lived process fallback naming.
     void Build(const CpuMemIoMetrics& m,
                const EtwFileCollector::IoDelta* io_delta,
                const GpuTickData* gpu,
-               double dt,
                const AggregateSettings& cfg,
                MetricsCollector& mc,
                MetricsSnapshot& out);

@@ -187,6 +187,9 @@ int WindowManager::AddWindow(const WindowCfg& cfg) {
     RecomputeBoundMask();
     // 从「零窗」恢复时重启定时器（全部关闭后定时器已停，方案 §8.3）
     if (Count() == 1) CProcessTopPlugin::Instance().RestartRefreshTimer();
+    // 开窗即拍（方案一）：不等下个周期，立即补一拍——新绑维度的采集
+    //（GPU 冷启动补拍/ETW 会话建立）当拍启动，首帧数据尽快就位
+    CProcessTopPlugin::Instance().KickRefreshTick();
     EnsureHoverTimer();   // hover 状态机 timer 挂组长窗（首建/重组，M6 §4.3.2）
     return (int)m_windows.size() - 1;
 }
@@ -220,6 +223,10 @@ void WindowManager::ShowGroupAt(const RECT& anchor, HWND follow_wnd) {
     LayoutGroup(anchor);
     // 弹回即新：摆位上屏后立即灌一次快照（隐藏期数据已保鲜）
     CProcessTopPlugin::Instance().TopListRefreshFromSnapshot();
+    // 开窗即拍（方案一）：弹回时刻立即补一拍——真停后弹回的冷启动
+    //（m_gpu_last 已清空、ETW 会话已停）在用户看到的这一刻就开始，
+    // 不等下个周期（refresh_ms 最长 2s）
+    CProcessTopPlugin::Instance().KickRefreshTick();
     if (follow_wnd) SetAnchorFollow(follow_wnd);
 }
 

@@ -25,8 +25,12 @@
 // Handoff: the ProcessTrace callback thread owns a private accumulator map
 // (lock-free in the callback). The tick thread requests a handoff via an
 // atomic flag; the consumer thread (event callback or the periodic buffer
-// callback) moves the accumulator into the out map and bumps a sequence —
-// single-writer handoff, zero locks on the hot path (技术方案 §5.1).
+// callback) ACCUMULATES into the out map and bumps a sequence — single-
+// writer handoff, zero locks on the hot path (技术方案 §5.1).
+// 2026-11-08 方案三改造：handoff 带窗口记账（QPC），交付 = 字节+窗口
+// 累计进 m_out；tick 侧「完整窗口才接管」——窗口 < 半个 tick 间隔的交付
+// 不置 valid（caller 继续全口径 fallback），字节留在 m_out 与后续窗口
+// 合并，速率永远除真实窗口而不是 tick 假 dt。
 // ============================================================
 #include <windows.h>
 #include <evntrace.h>
@@ -49,7 +53,11 @@ public:
     struct IoDelta {
         std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> per_pid; // pid -> (read,write)
         uint64_t events_lost = 0;
-        bool valid = false;    // false: consumer had nothing to hand over yet
+        // 本次交付覆盖的真实窗口长度（上次被消费的 handoff → 本次 handoff，
+        // µs；方案三窗口记账）——Build 的速率分母，不再除 tick 假 dt
+        uint64_t window_us = 0;
+        bool valid = false;    // false: consumer had nothing to hand over yet,
+                               // or the window was incomplete (< min_window_us)
     };
 
     EtwFileCollector() = default;
@@ -72,9 +80,12 @@ public:
     // Thread-safe.
     void GetStatusText(wchar_t* out, size_t cap) const;
 
-    // Tick thread. Bounded wait (~100ms worst case); returns false when the
-    // consumer handed nothing over (keep last rates, do not zero them out).
-    void TakeDelta(IoDelta& out);
+    // Tick thread. Bounded wait (~100ms worst case); valid=false when the
+    // consumer handed nothing over OR the handed window is shorter than
+    // min_window_us (incomplete window — caller falls back to the all-handle
+    // counters; the bytes are NOT lost, they stay accrued for the next
+    // handoff. 方案三「完整窗口才接管」).
+    void TakeDelta(IoDelta& out, uint64_t min_window_us);
 
     // Debug-log master switch (default OFF). etw_file.log generation only.
     static void SetDebugLogs(bool on) { s_debug_logs.store(on); }
@@ -109,6 +120,14 @@ private:
     std::atomic<uint64_t> m_take_seq{0};
     std::unordered_map<DWORD, Acc> m_acc;      // consumer thread private
     std::unordered_map<DWORD, Acc> m_out;      // handed off; tick reads after seq bump
+    // 窗口记账（方案三）：m_out 改累计式——tick 不消费（超时/窗口不完整）
+    // 时字节与窗口都留在 m_out 继续累计，跨短窗口合并成完整窗口交付，
+    // 字节永不断账。m_out_window_us 由 consumer +=、tick 消费时清零
+    //（并发安全同 m_out：tick 只在 seq bump 后读，读期间无新 handoff）
+    uint64_t m_out_window_us = 0;
+    int64_t m_window_open_qpc = 0;   // 当前窗口起点 QPC（consumer 线程私有；
+                                     // 0 = 无窗口，首次 handoff 从会话启动起算）
+    int64_t m_qpc_freq = 0;          // QPC 频率（Start 时取一次）
 
     // ---- grade status (written on consumer thread, read anywhere) ----
     mutable std::mutex m_status_mutex;
@@ -129,4 +148,6 @@ private:
 
     // diagnostics
     uint64_t m_ev_seen = 0, m_ev_kept = 0, m_ev_short = 0;
+    bool m_log_was_valid = false;   // 上次 TakeDelta 的接管态（转换点日志用，
+                                    // tick 线程私有）；会话重启时重置
 };

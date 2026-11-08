@@ -540,6 +540,7 @@ CProcessTopPlugin::CProcessTopPlugin() {
 
 CProcessTopPlugin::~CProcessTopPlugin() {
     StopRefreshTimer();
+    StopKickTimer();
     if (m_lock_inited) {
         DeleteCriticalSection(&m_data_lock);
         m_lock_inited = false;
@@ -920,13 +921,21 @@ void CProcessTopPlugin::RefreshTick() {
     CpuMemIoMetrics m;
     m_metrics.Tick(m);
 
-    // 2) ETW exact file IO (A/B grades); C grade falls back to counters
+    // 2) ETW exact file IO (A/B grades); C grade falls back to counters.
+    // 完整窗口才接管（方案三）：handoff 窗口短于半个 tick 间隔的交付不置
+    // valid，该拍继续全口径 fallback——C→A 切换瞬间数据连续（全口径 →
+    // 全口径 → 首个完整窗口的精确值），不闪 0；字节留在 collector 累计
     EtwFileCollector::IoDelta io_delta;
     bool have_etw = false;
-    FileIoGrade grade = m_etw.Grade();
-    if (m_etw.IsRunning() && (grade == FileIoGrade::A || grade == FileIoGrade::B)) {
-        m_etw.TakeDelta(io_delta);
-        have_etw = io_delta.valid;
+    {
+        FileIoGrade grade = m_etw.Grade();
+        if (m_etw.IsRunning() && (grade == FileIoGrade::A || grade == FileIoGrade::B)) {
+            int rms = m_settings.refresh_ms;
+            if (rms < 250) rms = 250;
+            if (rms > 2000) rms = 2000;
+            m_etw.TakeDelta(io_delta, (uint64_t)rms * 500);   // µs = ms*1000/2
+            have_etw = io_delta.valid;
+        }
     }
 
     // 2b) GPU 迟停（问题①A 治本主项，方案 §3.3 语义升级）：绑定集不含
@@ -991,14 +1000,9 @@ void CProcessTopPlugin::RefreshTick() {
         }
     }
 
-    // （now 已在 2b 迟停判定前取得——同拍内取值一致）
-    static ULONGLONG prev_wall = 0;   // tick-thread only (CAS-guarded)
-    double dt = prev_wall ? (double)(now - prev_wall) / 1000.0 : 0.0;
-    prev_wall = now;
-    if (dt < 0.05) dt = 0.05;
-    if (dt > 10.0) dt = 10.0;
-
     // 3) aggregate: merge + sort + TopN
+    //（IO 速率分母 = ETW handoff 真实窗口，方案三窗口对齐——tick 假 dt
+    // 的计算与传参已随旧口径一起移除；CPU/内存速率由 metrics 自带差分）
     AggregateSettings agg;
     // 多窗模式：快照视图按最大行数（15）供数，各窗在自己的
     // UpdateFromSnapshot 里按 cfg.topn 截断——全局 topn 只是新窗默认值
@@ -1021,7 +1025,7 @@ void CProcessTopPlugin::RefreshTick() {
     MetricsSnapshot snap;
     m_aggregator.Build(m, have_etw ? &io_delta : nullptr,
                        m_gpu.IsRunning() ? &gpu_data : nullptr,
-                       dt, agg, m_metrics, snap);
+                       agg, m_metrics, snap);
     if (m_etw.IsRunning()) snap.io_grade = m_etw.Grade();   // true grade (A/B/C)
     snap.gpu_grade = m_gpu.Grade();                          // true grade even when off
     snap.tm_gpu_usage = m_tm_gpu_usage.load();
@@ -1097,6 +1101,36 @@ void CProcessTopPlugin::StopRefreshTimer(bool wait) {
         m_refresh_timer = nullptr;
     }
     m_refresh_timer_ok = false;
+}
+
+void CProcessTopPlugin::KickRefreshTick() {
+    // 方案一「开窗即拍」：one-shot（due=0, period=0）补一拍。句柄复用式
+    // ——CreateTimerQueueTimer 传入非空 *phNewTimer 且为有效句柄时是
+    // 「重置既有 timer」而非新建：已触发的 one-shot 被复活重排 due=0，
+    // 未触发的重新排队，全程只有一个句柄，零泄漏；也不在回调里删自己
+    //（due=0 时回调可能先于 Create 返回执行，自删模式有拿不到句柄的窗口）
+    // 只从 UI 线程调用（三个触发点都在 UI 线程），m_kick_timer 无竞争；
+    // ShutdownForDllUnload/析构统一删除。并发投递的安全性：RefreshTick
+    // 自带 m_refresh_busy CAS 防重入，kick 与周期 timer 撞车最多丢一拍
+    //（下个周期补上），不会重入
+    if (m_kick_timer) {
+        CreateTimerQueueTimer(&m_kick_timer, nullptr, RefreshTimerProc, this,
+                              0, 0, WT_EXECUTELONGFUNCTION);
+    } else {
+        HANDLE h = nullptr;
+        if (CreateTimerQueueTimer(&h, nullptr, RefreshTimerProc, this,
+                                  0, 0, WT_EXECUTELONGFUNCTION)) {
+            m_kick_timer = h;
+        }
+    }
+}
+
+void CProcessTopPlugin::StopKickTimer() {
+    // 回调可能正在跑：异步删除（不等待），RefreshTick 的 CAS 保证状态一致
+    if (m_kick_timer) {
+        DeleteTimerQueueTimer(nullptr, m_kick_timer, nullptr);
+        m_kick_timer = nullptr;
+    }
 }
 
 void CProcessTopPlugin::CheckLanguageChange() {
