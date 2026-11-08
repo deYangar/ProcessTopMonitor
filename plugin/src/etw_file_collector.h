@@ -67,6 +67,13 @@ public:
     // blocks the caller for long (consumer thread does the session work).
     FileIoGrade Start();
     void Stop();
+    // DllMain PROCESS_DETACH 专用「尽力而为停」（A4，2026-11-08 审查）：
+    // ExitProcess 先杀其它线程再进 DETACH——消费者/reaper 若死在持
+    // m_status_mutex 的半路，完整 Stop() 的 SetStatus/join 会在 DllMain
+    // 里永久等一把被弃的锁（TM 退出挂死）或被 3s 等待拖住。此路径只
+    // 发停信号 + 解锁 ProcessTrace（停会话/CloseTrace），线程对象 detach
+    // 后随进程退出整体回收，全程零锁零等待
+    void StopForUnload();
     // Async stop (tick thread, 问题①B)：只发停信号 + 解锁 ProcessTrace，
     // join/收尾交给一次性收尸线程——tick 线程绝不同步等 3s（旧 Stop 的
     // join 会卡住 m_refresh_busy 门闩、全部维度数据停更）。m_running 仍由

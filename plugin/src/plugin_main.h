@@ -54,8 +54,10 @@ public:
     // before unload (private members; this wrapper is the public seam)
     void ShutdownForDllUnload() {
         StopRefreshTimer();
-        StopKickTimer();
-        m_etw.Stop();
+        StopKickTimer(true);
+        // A4：DllMain 路径走「尽力而为停」——ExitProcess 已杀其它线程，
+        // 完整 Stop 的 SetStatus/join 可能等一把被弃的锁（TM 退出挂死）
+        m_etw.StopForUnload();
         m_gpu.EnsureStopped();
         // 锚窗子类化还原：TM 主窗通常活得比本 DLL 久，留着 AnchorProc
         // 会在 DLL 卸载后炸宿主（PNM 同款纪律）
@@ -171,7 +173,11 @@ private:
     static void CALLBACK RefreshTimerProc(void* param, BOOLEAN timer_or_wait);
     void StartRefreshTimer();
     void StopRefreshTimer(bool wait = true);   // wait=false：定时器回调内自停（防自死锁）
-    void StopKickTimer();                      // 方案一：kick timer 统一删除点
+    // A3：wait=true（默认，DllMain/析构路径）传 INVALID_HANDLE_VALUE 同步
+    // 等待回调收尾——异步删除在 DLL 卸载场景下回调可能跑已解除映射的
+    // 代码（kick 是 one-shot，等待上限一拍内）；wait 语义与
+    // StopRefreshTimer 对齐
+    void StopKickTimer(bool wait = true);
     void CheckLanguageChange();
     void BuildTooltip();                 // 双缓冲 tooltip 文本
     wchar_t m_tooltip[2][2048] = { L"", L"" };

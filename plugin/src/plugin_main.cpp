@@ -1133,10 +1133,17 @@ void CProcessTopPlugin::KickRefreshTick() {
     }
 }
 
-void CProcessTopPlugin::StopKickTimer() {
-    // 回调可能正在跑：异步删除（不等待），RefreshTick 的 CAS 保证状态一致
+void CProcessTopPlugin::StopKickTimer(bool wait) {
+    // A3（2026-11-08 审查）：wait=true 同步等待回调收尾——原实现恒传
+    // nullptr 异步删除，DLL 卸载（DllMain DETACH/静态析构）路径若恰有
+    // 一次 due=0 的 kick 补拍在飞，DllMain 返回、DLL 解除映射后回调
+    // 继续跑已卸载的 RefreshTimerProc → 宿主崩溃（同路径的
+    // StopRefreshTimer 一直用 INVALID_HANDLE_VALUE，kick 与之对齐）。
+    // kick 是 one-shot，等待上限一拍内；wait=false 保留给回调内自停场景
+    //（当前无此调用方，留对称接口）
     if (m_kick_timer) {
-        DeleteTimerQueueTimer(nullptr, m_kick_timer, nullptr);
+        DeleteTimerQueueTimer(nullptr, m_kick_timer,
+                              wait ? INVALID_HANDLE_VALUE : nullptr);
         m_kick_timer = nullptr;
     }
 }

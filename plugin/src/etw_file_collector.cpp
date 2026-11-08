@@ -9,6 +9,9 @@
 EtwFileCollector* EtwFileCollector::s_self = nullptr;
 std::atomic<bool> EtwFileCollector::s_debug_logs{false};
 
+// defined in top_list_window.cpp (DLL shutdown flag, set in DllMain first)
+extern volatile bool g_shutting_down;
+
 // Kernel-session StartTrace requires SeSystemProfilePrivilege — admin-group
 // members hold it DISABLED by default; it must be enabled explicitly
 // (logman/xperf do the same). No-op for non-admin callers (fails, and the
@@ -46,7 +49,12 @@ static const uint8_t kFileEvtWrite = 68;   // MSDN FileIo table: "File write"
 // session is never touched.
 static const wchar_t* kSessionName = L"PTMFileIoSession";
 
-EtwFileCollector::~EtwFileCollector() { Stop(); }
+EtwFileCollector::~EtwFileCollector() {
+    // A4：静态析构（DLL 卸载链）在 ExitProcess 杀线程之后跑——完整
+    // Stop() 的 SetStatus/join 可能踩被弃的锁；卸载路径走尽力而为停
+    if (g_shutting_down) StopForUnload();
+    else Stop();
+}
 
 void EtwFileCollector::LogLine(const wchar_t* fmt, ...) {
     if (!s_debug_logs.load()) return;
@@ -70,9 +78,13 @@ void EtwFileCollector::LogLine(const wchar_t* fmt, ...) {
 }
 
 void EtwFileCollector::SetStatus(FileIoGrade g, const wchar_t* why) {
-    std::lock_guard<std::mutex> lk(m_status_mutex);
+    // A4 加固：TryLock + 放弃——所有调用点都是「尽力更新档位状态」语义
+    //（消费者线程下一轮循环会重写），持锁方忙/锁被弃时放弃本次更新，
+    // 杜绝任何路径（含进程退出收尾）在这把锁上阻塞
+    if (!m_status_mutex.try_lock()) return;
     m_grade = g;
     m_grade_reason = why ? why : L"";
+    m_status_mutex.unlock();
 }
 
 FileIoGrade EtwFileCollector::Grade() const {
@@ -127,6 +139,14 @@ FileIoGrade EtwFileCollector::Start() {
     // Start 本身允许 ~1s 的档位等待（现状），此处最多再叠收尸剩余时间
     if (m_reaper.joinable()) {
         try { m_reaper.join(); } catch (...) { m_reaper.detach(); }
+    }
+    // A5（2026-11-08 审查）：reaper 创建失败的漏网路径——StopAsync 里
+    // std::thread 构造抛出被 catch(...) 吞掉且消费者已自行退出
+    //（m_running=false、m_thread 仍 joinable）时，下面 m_thread =
+    // std::thread(...) 对 joinable 对象 move-assign = std::terminate 直接
+    // 杀宿主。先 join 再赋值，三行治本
+    if (m_thread.joinable()) {
+        try { m_thread.join(); } catch (...) { m_thread.detach(); }
     }
     if (m_running.load()) return Grade();
     s_self = this;
@@ -198,6 +218,24 @@ void EtwFileCollector::Stop() {
     }
     m_running = false;
     SetStatus(FileIoGrade::Off, L"");
+}
+
+void EtwFileCollector::StopForUnload() {
+    // DllMain PROCESS_DETACH / 静态析构路径（A4）：零锁零 join。ExitProcess
+    // 已终止其它线程——消费者/reaper 的执行体已死，joinable 的
+    // std::thread 对象若原样析构会 std::terminate（joinable 析构=杀宿主），
+    // 对已死线程 detach 立即返回、对象进入安全态。m_own_session_handle/
+    // m_cur_consumer 是尽力读（消费者线程写，无同步）——读到哪个分支都
+    // 只是「发一次停信号/关一次句柄」，进程退出语境下足够
+    m_stop = true;
+    if (m_own_session_handle) {
+        PtStopSession(m_own_session_handle, nullptr);
+    } else {
+        TRACEHANDLE h = m_cur_consumer.load();
+        if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
+    }
+    if (m_reaper.joinable()) m_reaper.detach();
+    if (m_thread.joinable()) m_thread.detach();
 }
 
 void EtwFileCollector::StopAsync() {
