@@ -229,9 +229,11 @@ private:
     bool m_affinity_ok = true;
     bool m_steady_probe_fast = false;
 
-    // icons: pid -> icon or nullptr (negative cache; ICON_SIZE is fixed so
-    // the pid alone is the key)
-    std::unordered_map<DWORD, HICON> m_icon_cache;
+    // icons: exe 路径（小写归一）-> HICON or nullptr（负缓存；B1 治本——
+    // 图标语义由 exe 路径决定，同 exe 的换新 pid（浏览器/Electron 子进程
+    // 持续生灭）天然共享一份 HICON，不再按 pid 无界重建逼向 10000 GDI
+    // 句柄上限）。pending 仍按 pid 挂（每 pid 一次提取动作）
+    std::unordered_map<std::wstring, HICON> m_icon_cache;
     std::vector<DWORD> m_icon_pending;
     std::unordered_map<DWORD, std::wstring> m_path_cache;   // pid -> exe path
     std::unordered_set<std::string> m_path_missed;          // unresolvable, don't retry

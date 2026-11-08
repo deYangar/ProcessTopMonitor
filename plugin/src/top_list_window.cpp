@@ -1314,6 +1314,14 @@ std::wstring PtImageNameFromPath(const std::wstring& path) {
     size_t slash = path.find_last_of(L"\\/");
     return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
+// 图标缓存键归一（B1）：Windows 路径大小写不敏感，同一 exe 经不同进程
+// 查询可能拿到不同大小写形态（C:\Windows vs c:\windows）——小写化后
+// 才真正一份 HICON
+std::wstring PtIconKey(const std::wstring& path) {
+    std::wstring o = path;
+    for (auto& c : o) c = (wchar_t)towlower(c);
+    return o;
+}
 } // namespace
 
 // exe 路径懒解析：快照行只带 pid+name，路径在 UI 线程按需查（活进程
@@ -1350,21 +1358,26 @@ void CTopListWindow::ResolvePendingPaths() {
 HICON CTopListWindow::LookupIcon(const std::wstring& name, DWORD pid) {
     (void)name;
     if (!pid) return nullptr;
-    auto it = m_icon_cache.find(pid);
-    if (it != m_icon_cache.end()) return it->second;
-    // dedupe pending queue
+    // B1 治本：图标缓存键 = exe 路径（小写归一）——同名 exe 换新 pid
+    //（Chrome/Electron 类子进程持续生灭）直接命中既有 HICON，GDI 句柄
+    // 不再按 pid 无界增长。路径未解析时挂 pending 等 ResolvePendingPaths
+    auto pit = m_path_cache.find(pid);
+    if (pit == m_path_cache.end() || pit->second.empty()) {
+        for (DWORD q : m_icon_pending)
+            if (q == pid) return nullptr;
+        m_icon_pending.push_back(pid);
+        return nullptr;
+    }
+    auto it = m_icon_cache.find(PtIconKey(pit->second));
+    if (it != m_icon_cache.end()) return it->second;   // 含 nullptr 负缓存
     for (DWORD q : m_icon_pending)
         if (q == pid) return nullptr;
     m_icon_pending.push_back(pid);
     return nullptr;
 }
 
-HICON CTopListWindow::ExtractIconFor(const std::wstring& name, DWORD pid) {
-    (void)name;
-    // resolve path via the row cache (filled by ResolvePendingPaths)
-    std::wstring path;
-    auto it = m_path_cache.find(pid);
-    if (it != m_path_cache.end()) path = it->second;
+HICON CTopListWindow::ExtractIconFor(const std::wstring& path, DWORD pid) {
+    (void)pid;
     if (path.empty()) return nullptr;
 
     bool net = PtIsNetworkPath(path);
@@ -1413,7 +1426,15 @@ bool CTopListWindow::PumpIconExtraction(int count) {
     while (count-- > 0 && !m_icon_pending.empty()) {
         DWORD pid = m_icon_pending.front();
         m_icon_pending.erase(m_icon_pending.begin());
-        m_icon_cache[pid] = ExtractIconFor(L"", pid);
+        // pending 按 pid 挂、缓存按路径存：同 exe 的另一 pid 已提取过就
+        // 直接复用（B1 天然去重）；路径尚未解析（ResolvePendingPaths 是
+        // 200ms timer，可能晚于图标 pending）则丢弃本条，LookupIcon 下
+        // 轮会带着已就绪的路径重挂
+        auto pit = m_path_cache.find(pid);
+        if (pit == m_path_cache.end() || pit->second.empty()) continue;
+        std::wstring key = PtIconKey(pit->second);
+        if (m_icon_cache.count(key)) continue;
+        m_icon_cache[key] = ExtractIconFor(pit->second, pid);
         produced = true;
     }
     return produced;
