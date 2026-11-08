@@ -236,7 +236,9 @@ private:
     std::unordered_map<std::wstring, HICON> m_icon_cache;
     std::vector<DWORD> m_icon_pending;
     std::unordered_map<DWORD, std::wstring> m_path_cache;   // pid -> exe path
-    std::unordered_set<std::string> m_path_missed;          // unresolvable, don't retry
+    // 解析失败的负缓存（C3）：键=pid——同映像名的其它 pid 不连坐，
+    // 瞬时失败（进程创建/退出窗口期）只影响该 pid 本身
+    std::unordered_set<DWORD> m_path_missed;
 
     // cached GDI objects
     HFONT m_font_normal = nullptr;

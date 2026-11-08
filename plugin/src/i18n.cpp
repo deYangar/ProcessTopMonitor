@@ -213,11 +213,12 @@ bool ScanLangFiles(const std::wstring& dir) {
         info.bcp47 = bcp47;
         info.display_name = display.empty() ? file_name : display;
         info.file_name = file_name;
-        // 文件修改时间（100ns 间隔，自 1601-01-01）
+        // 文件修改时间（100ns 间隔，自 1601-01-01）+ 大小（B2 元数据快比对）
         ULARGE_INTEGER li;
         li.LowPart = fd.ftLastWriteTime.dwLowDateTime;
         li.HighPart = fd.ftLastWriteTime.dwHighDateTime;
         info.mtime = li.QuadPart;
+        info.fsize = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         list.push_back(info);
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
@@ -226,6 +227,40 @@ bool ScanLangFiles(const std::wstring& dir) {
     g_lang_dir = dir;
     g_lang_list = std::move(list);
     ReleaseSRWLockExclusive(&g_lock);
+    return true;
+}
+
+bool LangFilesUnchanged(const std::wstring& dir, const std::vector<LangInfo>& known) {
+    // B2：纯元数据比对（零文件读取）。枚举 *.ini 的 (name, mtime, size)
+    // 与 known 逐一双向核对——数量不等/出现新文件/已知文件消失/任一
+    // 元数据变化都返回 false；枚举失败也返回 false（保守：调用方走
+    // 全量重建路径，行为与旧实现一致）
+    std::wstring pattern = dir + L"\\*.ini";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+    struct Meta { std::wstring name; unsigned long long mtime, fsize; };
+    std::vector<Meta> cur;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        Meta m;
+        m.name = fd.cFileName;
+        ULARGE_INTEGER li;
+        li.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        li.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        m.mtime = li.QuadPart;
+        m.fsize = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        cur.push_back(std::move(m));
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+    if (cur.size() != known.size()) return false;
+    for (const auto& c : cur) {
+        const LangInfo* hit = nullptr;
+        for (const auto& k : known) {
+            if (k.file_name == c.name) { hit = &k; break; }
+        }
+        if (!hit || hit->mtime != c.mtime || hit->fsize != c.fsize) return false;
+    }
     return true;
 }
 
@@ -343,13 +378,17 @@ bool CheckAndReload(const std::wstring& tm_lang) {
     // 快照旧状态（共享锁）→ 目录 rescan（无锁 IO）→ 有变化才换入（排他锁）。
     // 旧版直接 ScanLangFiles 重建 g_lang_list：定时器线程与 UI 线程的
     // GetLangList()/TR() 无锁并发即堆损坏 0xc0000374。
+    // B2：rescan 前先做元数据快比对（LangFilesUnchanged，零文件读取）——
+    // CheckAndReload 每拍（250ms~2s）都在跑，目录文件 99.9% 时间没变，
+    // 旧实现为此每拍把所有 ini 读入内存并解析 [general]
     std::vector<LangInfo> old_list;
     std::wstring old_tm, dir;
     AcquireSRWLockShared(&g_lock);
     old_list = g_lang_list; old_tm = g_tm_lang; dir = g_lang_dir;
     ReleaseSRWLockShared(&g_lock);
     if (dir.empty()) return false;   // 尚未 InitOnce：无语言目录可扫描
-    if (!ScanLangFiles(dir)) {
+    bool files_same = LangFilesUnchanged(dir, old_list);
+    if (!files_same && !ScanLangFiles(dir)) {
         if (old_list.empty()) return false;
         // 目录不可读但旧表非空：保持旧表，仅检查 TM 语言变化
         if (ToLower(tm_lang) == ToLower(old_tm)) return false;

@@ -486,8 +486,18 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_DPICHANGED: {
+        // C2（2026-11-08 审查）：按系统建议矩形重定位（lp 指向新 DPI 下
+        // 的建议窗口矩形）——旧实现忽略它，跨 DPI 屏拖动时窗口靠后续
+        // Reposition 工作区 clamp 兜底，切屏瞬间半拍偏位；另删掉旧
+        //「条件调用+无条件调用」连写（前者恒冗余，UpdateDpiScale 自带
+        // m_dpi_inited 与 0.01 容差幂等）。SetWindowPos 触发
+        // WM_WINDOWPOSCHANGED，blur 层同帧成对跟随
         RECT* prc = (RECT*)lp;
-        if (prc && !m_dpi_inited) UpdateDpiScale();
+        if (prc) {
+            SetWindowPos(m_hwnd, nullptr, prc->left, prc->top,
+                         prc->right - prc->left, prc->bottom - prc->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         UpdateDpiScale();
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
@@ -1335,12 +1345,14 @@ void CTopListWindow::ResolvePendingPaths() {
             continue;
         }
         // only known-image-name rows resolve; failed lookups go to the
-        // negative cache so dead/swept pids don't retry every 200ms
-        std::string misskey = PtToUtf8(r.name);
-        if (m_path_missed.count(misskey)) continue;
+        // negative cache so dead/swept pids don't retry every 200ms.
+        // C3：负缓存键改 pid——旧键是映像名，一个受保护/正在退出的同名
+        // 进程解析失败会让 svchost.exe/chrome.exe 这类高重名映像的全部
+        // pid 永不重试（同名连坐）；pid 键下瞬时失败只影响该 pid 本身
+        if (m_path_missed.count(r.pid)) continue;
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, r.pid);
         if (!h) {
-            m_path_missed.insert(misskey);
+            m_path_missed.insert(r.pid);
             continue;
         }
         wchar_t buf[1024] = L"";
@@ -1349,7 +1361,7 @@ void CTopListWindow::ResolvePendingPaths() {
             r.exe_path = buf;
             m_path_cache[r.pid] = r.exe_path;
         } else {
-            m_path_missed.insert(misskey);
+            m_path_missed.insert(r.pid);
         }
         CloseHandle(h);
     }

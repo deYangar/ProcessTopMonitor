@@ -1087,15 +1087,26 @@ void CProcessTopPlugin::RefreshTick() {
 }
 
 void CProcessTopPlugin::StartRefreshTimer() {
-    StopRefreshTimer();
+    // C5（2026-11-08 审查）：替换策略——先建新 timer（新周期立即生效），
+    // 成功后再异步删旧 timer。旧实现「Stop(wait=true) 再 Create」会让
+    // UI 线程（菜单加窗/选项确定改刷新率）同步等待正跑的 RefreshTick
+    // 收尾——tick 可能阻塞在 ETW Start（~1s，残留会话 +150ms×2）、
+    // reaper join（≤3s）或 GPU 冷启动 Sleep(50)，用户可感知冻结。新 timer
+    // 建失败时保留旧 timer（降级不裸奔，旧周期继续跑）
+    //（m_refresh_timer 全部触达点在 UI 线程：InitOnce/RestartRefreshTimer
+    // 与 watchdog TICK_SYNC 的零窗停表，无并发写）
     int ms = m_settings.refresh_ms;
     if (ms < 250) ms = 250;
     if (ms > 2000) ms = 2000;
     HANDLE h = nullptr;
-    if (CreateTimerQueueTimer(&h, nullptr, RefreshTimerProc, this, ms, ms,
-                              WT_EXECUTELONGFUNCTION)) {
-        m_refresh_timer = h;
-        m_refresh_timer_ok = true;
+    if (!CreateTimerQueueTimer(&h, nullptr, RefreshTimerProc, this, ms, ms,
+                               WT_EXECUTELONGFUNCTION))
+        return;
+    HANDLE old = m_refresh_timer;
+    m_refresh_timer = h;
+    m_refresh_timer_ok = true;
+    if (old) {
+        DeleteTimerQueueTimer(nullptr, old, nullptr);   // 异步删：不等待旧回调
     }
 }
 

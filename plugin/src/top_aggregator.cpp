@@ -128,13 +128,15 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
                 Acc a;
                 a.name = nm;
                 a.main_pid = 0;         // gone: no icon / no file location
-                a.count = 1;
+                a.count = 0;            // C4：死 pid 不计入 count（下同）——
+                                       // merged 是全部 7 个视图共享数据源，
+                                       // 计入会让 cpu/mem/gpu 视图的
+                                       //「×N」合并数含已退出进程
                 a.io_r = r;
                 a.io_w = w;
                 merged.push_back(std::move(a));
             } else {
                 Acc& a = merged[it->second];
-                a.count++;
                 a.io_r += r;
                 a.io_w += w;
             }

@@ -15,15 +15,23 @@ struct LangInfo {
     std::wstring display_name; // 显示名，如 English / 简体中文 / 日本語
     std::wstring file_name;    // 文件名，如 English.ini
     unsigned long long mtime = 0;  // 文件修改时间（用于检测内容变化）
+    unsigned long long fsize = 0;  // 文件大小（与 mtime 一起做元数据快比对）
     bool operator==(const LangInfo& o) const {
         return bcp47 == o.bcp47 && display_name == o.display_name &&
-               file_name == o.file_name && mtime == o.mtime;
+               file_name == o.file_name && mtime == o.mtime && fsize == o.fsize;
     }
 };
 
 // 扫描语言目录（dir\*.ini），建立语言列表。成功返回 true。
 // 文件名不限，以 ini 内 [general] 的 BCP_47 / DISPLAY_NAME 为准。
 bool ScanLangFiles(const std::wstring& dir);
+
+// 元数据快比对（B2）：只枚举 FindFirstFile 的文件名/mtime/大小，与已知
+// 列表全部一致返回 true（零文件读取）。CheckAndReload 每 tick 先走这里，
+// 未变就不进 ScanLangFiles（旧实现每 tick 全量读入并解析所有 ini 的
+// [general]，只为对比 mtime）。枚举失败/任何差异返回 false（调用方走
+// 全量重建）。
+bool LangFilesUnchanged(const std::wstring& dir, const std::vector<LangInfo>& known);
 
 // 设置语言模式："auto" = 跟随 TM 主程序语言；其他值 = 具体 BCP-47 标签（手动选择）。
 // 线程安全：内部加锁（定时器线程 CheckAndReload vs UI 线程读取并发）。
