@@ -24,7 +24,10 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <memory>
 #include <cstdint>
+
+struct CoreClassMap;   // core_class_mapper.h（弱引用注入，避免头依赖）
 
 struct ProcMetric {
     DWORD pid = 0;
@@ -47,6 +50,10 @@ struct CpuMemIoMetrics {
     // 宿主 MonitorInfo.cpu_freq 只有整数 GHz（float 截断），拿不到小数位，
     // 摘要行要 "4.9GHz" 必须自测（M5 用户反馈修复）。
     int cpu_freq_mhz = 0;
+    // 系统级核群占用率（核型拆分方案 §4.5，一期）：各核群自身容量口径
+    //（「P 38」读作 P 核群忙 38%）。-1 = 同构/首拍/NtQSI 失败。
+    // [1] = P/VCache 群，[0] = E/StdCcd 群
+    double cpu_split_total_pct[2] = { -1, -1 };
     std::vector<ProcMetric> procs;     // idle/system excluded, all others
 };
 
@@ -57,6 +64,17 @@ public:
 
     void SetMemBasisWorkingSet(bool ws) { m_mem_ws = ws; }
     bool MemBasisWorkingSet() const { return m_mem_ws; }
+
+    // 核型分类表注入（Start 时一次，tick 线程调用）。异构时 Tick 内跑
+    // 第二次 NtQSI(SystemProcessorPerformanceInformation) 出核群占用率
+    //（核型拆分方案 §4.5）；nullptr/同构 = 不跑，cpu_split_total_pct 恒 -1
+    void SetCoreClassMap(const struct CoreClassMap* ccm) { m_ccm = ccm; }
+
+    // 本拍从 SPI 尾部线程数组构建的 tid→pid 表（核型样本归因数据源，
+    // §4.2 探针定案路线；tick 线程调 Take 转交 ETW collector，空 = 未构建）
+    std::shared_ptr<const std::unordered_map<DWORD, DWORD>> TakeThreadTable() {
+        return m_thread_table;
+    }
 
     // Process-name cache, "name never expires" policy: pid -> last known
     // name/path survives process exit (short-lived processes keep a name in
@@ -69,11 +87,27 @@ private:
     // 同款）。尾部线程数组不解析——按 NextEntryOffset 步进。
     // UNICODE_STRING 手工定义（WIN32_LEAN_AND_MEAN 排除了 winternl.h，
     // 自带声明会与宿主环境可能的 winternl 引用冲突，取独立名字）
+    // 2026-11-09 核型拆分：尾部线程数组开始解析（tid→pid 表，§4.2）
 #pragma pack(push, 8)
     struct PtUnicodeString {
         USHORT Length;
         USHORT MaximumLength;
         wchar_t* Buffer;   // x64: 2+2+pad4+8 = 16, x86: 2+2+4 = 8 — NT layout
+    };
+    // SYSTEM_THREAD_INFORMATION（SPI 之后紧跟的数组元素，NT 布局）
+    struct SysThreadInfo {
+        LARGE_INTEGER KernelTime;
+        LARGE_INTEGER UserTime;
+        LARGE_INTEGER CreateTime;
+        ULONG WaitTime;                 // +4 pad on x64
+        void* StartAddress;
+        HANDLE UniqueProcess;           // CLIENT_ID
+        HANDLE UniqueThread;
+        LONG Priority;
+        LONG BasePriority;
+        ULONG ContextSwitches;
+        ULONG ThreadState;
+        ULONG WaitReason;               // 尾部 pad to 8（x64: 80B / x86: 64B）
     };
     struct SPI {
         ULONG NextEntryOffset;
@@ -122,6 +156,22 @@ private:
     bool Snapshot();                   // fills m_raw / returns false on failure
     void Remember(DWORD pid, const std::wstring& name);
     int QueryCpuFreqMhz();             // tick thread; PDH 当前频率（MHz）
+    void TickCoreClassTotals(CpuMemIoMetrics& out, double dt);  // §4.5 系统级 P/E
+
+    // SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION（info class 8）手写布局：
+    // 按编译位宽步进（x64 sizeof 48 / x86 sizeof 44，WOW64 thunk 返回
+    // 匹配位宽的视图——与 SPI 同款约定）。数组每核一条，跨组 group-major
+    // 连续 = 绝对 LP 号空间（§3.2）
+#pragma pack(push, 8)
+    struct SPPI {
+        LARGE_INTEGER IdleTime;
+        LARGE_INTEGER KernelTime;
+        LARGE_INTEGER UserTime;
+        LARGE_INTEGER DpcTime;
+        LARGE_INTEGER InterruptTime;
+        ULONG InterruptCount;
+    };
+#pragma pack(pop)
 
     // CPU 频率自测（tick thread only）
     void* m_freq_query = nullptr;      // PDH_HQUERY
@@ -145,6 +195,14 @@ private:
     bool m_have_prev = false;
     ULONGLONG m_prev_wall = 0;
     bool m_mem_ws = false;
+
+    // ---- 核型拆分（§4.5）----
+    const struct CoreClassMap* m_ccm = nullptr;   // Start 时注入（弱引用）
+    std::vector<BYTE> m_sppi_buf;                 // NtQSI class 8 缓冲（复用）
+    std::vector<uint64_t> m_prev_idle_core;       // 每核 Idle 基线（绝对 LP 号索引）
+    bool m_have_prev_idle_core = false;
+    // 本拍 tid→pid 表（tick 线程构建；TakeThreadTable 弱引用转交）
+    std::shared_ptr<const std::unordered_map<DWORD, DWORD>> m_thread_table;
 
     // name/path caches, guarded by m_name_mutex (LookupName: any thread)
     mutable std::mutex m_name_mutex;

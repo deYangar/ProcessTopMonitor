@@ -3,6 +3,7 @@
 #include "PluginInterface.h"
 #include "metrics_collector.h"
 #include "etw_file_collector.h"
+#include "core_class_mapper.h"
 #include "top_aggregator.h"
 #include "top_list_window.h"
 #include "window_manager.h"
@@ -122,6 +123,8 @@ public:
     PtSettings m_settings;
     std::wstring m_config_dir;           // <plugins>\ProcessTopMonitor
     bool m_settings_dirty = false;
+    // 核型分类只读视图（窗口/选项层：菜单项/默认指标/标签风格的条件依据）
+    const CoreClassMap& CoreClass() const { return m_core_class; }
 
 private:
     CTopItem m_item;
@@ -131,6 +134,7 @@ private:
     EtwFileCollector m_etw;
     GpuCollector m_gpu;
     GpuTickData m_gpu_last;              // GPU 上一次采集结果（tick 线程私有）
+    CoreClassMap m_core_class;           // 核型分类（InitOnce 一次；tick/UI 读）
     TopAggregator m_aggregator;
     MetricsSnapshot m_snapshot;          // guarded by m_data_lock
     bool m_snapshot_valid = false;

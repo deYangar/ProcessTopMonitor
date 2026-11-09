@@ -1,5 +1,6 @@
 // metrics_collector.cpp — snapshot collection via NtQuerySystemInformation
 #include "metrics_collector.h"
+#include "core_class_mapper.h"
 #include <cstdio>
 #include <pdh.h>
 #include <powerbase.h>
@@ -8,6 +9,7 @@
 
 typedef LONG(NTAPI* PFN_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
 constexpr ULONG SystemProcessInformation = 5;
+constexpr ULONG SystemProcessorPerformanceInformation = 8;   // §4.5 每核 Idle
 
 // PROCESSOR_POWER_INFORMATION：SDK 的 powrprof.h 不导出该结构（TM 同款手抄）
 typedef struct _PTM_PROCESSOR_POWER_INFORMATION {
@@ -194,12 +196,18 @@ void MetricsCollector::Tick(CpuMemIoMetrics& out) {
     };
     std::vector<Raw> raws;
     uint64_t idle_time = 0;
+    // tid→pid 表（核型样本归因数据源，§4.2：SPI 尾部线程数组就地解析，
+    // 零额外系统调用；tick 线程构建，TakeThreadTable 转交 ETW collector）
+    auto tid_tbl = std::make_shared<std::unordered_map<DWORD, DWORD>>();
 
     auto* base = (SPI*)m_buf.data();
     for (ULONG off = 0;;) {
         SPI* e = (SPI*)(m_buf.data() + off);
         DWORD pid = (DWORD)(ULONG_PTR)e->UniqueProcessId;
         uint64_t cpu = (uint64_t)e->KernelTime.QuadPart + (uint64_t)e->UserTime.QuadPart;
+        auto* th = (SysThreadInfo*)(e + 1);   // 紧随 SPI 的线程数组
+        for (ULONG t = 0; t < e->NumberOfThreads; t++)
+            (*tid_tbl)[(DWORD)(ULONG_PTR)th[t].UniqueThread] = pid;
         if (pid == 0) {
             // Idle / "System Idle Process": excluded from ranking, counted
             // for the system-wide CPU summary
@@ -280,4 +288,69 @@ void MetricsCollector::Tick(CpuMemIoMetrics& out) {
     m_prev_idle_time = idle_time;
     m_prev_wall = now;
     m_have_prev = true;
+
+    // tid→pid 表交付（§4.2：本拍构建完毕）
+    m_thread_table = std::move(tid_tbl);
+
+    // 系统级核群占用率（§4.5，一期拍板不延后）：异构时才跑（每拍 ~0.1ms）
+    TickCoreClassTotals(out, dt);
+}
+
+void MetricsCollector::TickCoreClassTotals(CpuMemIoMetrics& out, double dt) {
+    out.cpu_split_total_pct[0] = -1;
+    out.cpu_split_total_pct[1] = -1;
+    if (!m_ccm || !m_ccm->heterogeneous || !m_ccm->total_lp) return;
+
+    auto fn = (PFN_NtQuerySystemInformation)m_ntqsi;
+    if (!m_ntqsi_tried) {
+        // Snapshot() 尚未被调过（首拍顺序）：此处自行解析一次
+        m_ntqsi_tried = true;
+        m_ntqsi = (void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                        "NtQuerySystemInformation");
+        fn = (PFN_NtQuerySystemInformation)m_ntqsi;
+    }
+    if (!fn) return;
+
+    size_t need_records = (size_t)m_ccm->total_lp;
+    size_t want = need_records * sizeof(SPPI) + 64;
+    if (m_sppi_buf.size() < want) m_sppi_buf.resize(want);
+    ULONG got = 0;
+    LONG st = fn(SystemProcessorPerformanceInformation, m_sppi_buf.data(),
+                 (ULONG)m_sppi_buf.size(), &got);
+    if (st != 0) return;
+    size_t n_records = got / sizeof(SPPI);
+    if (n_records < need_records) return;   // 记录数不足：如实无效，不造假
+
+    // 首拍只建基线（无 delta），下拍出值
+    if (!m_have_prev_idle_core || m_prev_idle_core.size() != n_records) {
+        m_prev_idle_core.assign(n_records, 0);
+        for (size_t i = 0; i < n_records; i++)
+            m_prev_idle_core[i] = ((SPPI*)(m_sppi_buf.data() + i * sizeof(SPPI)))
+                                      ->IdleTime.QuadPart;
+        m_have_prev_idle_core = true;
+        return;
+    }
+
+    // 每核 Idle 差分 → 核群和（100ns 单位）。绝对 LP 号 = 数组下标（§3.2）
+    uint64_t idle_sum[2] = { 0, 0 };
+    for (size_t i = 0; i < n_records; i++) {
+        uint64_t idle = ((SPPI*)(m_sppi_buf.data() + i * sizeof(SPPI)))
+                            ->IdleTime.QuadPart;
+        uint64_t d = idle >= m_prev_idle_core[i] ? idle - m_prev_idle_core[i] : 0;
+        m_prev_idle_core[i] = idle;
+        // P/VCache 群 = [1]，E/StdCcd 群 = [0]；Homog（防御性未知核）不进任何群
+        if (m_ccm->lp[i] == CoreClass::P || m_ccm->lp[i] == CoreClass::VCache)
+            idle_sum[1] += d;
+        else if (m_ccm->lp[i] == CoreClass::E || m_ccm->lp[i] == CoreClass::StdCcd)
+            idle_sum[0] += d;
+    }
+    // 核群容量占用率：100 − ΣIdle增量 / (dt × 核群核数)（§4.5 口径）
+    for (int g = 0; g < 2; g++) {
+        int n = m_ccm->class_lp_count[g];
+        if (n <= 0 || dt <= 0) continue;
+        double idle_pct = ((double)idle_sum[g] / 1e7) / (dt * (double)n) * 100.0;
+        if (idle_pct < 0) idle_pct = 0;
+        if (idle_pct > 100) idle_pct = 100;
+        out.cpu_split_total_pct[g] = 100.0 - idle_pct;
+    }
 }

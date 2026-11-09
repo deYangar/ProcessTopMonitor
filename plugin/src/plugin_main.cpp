@@ -626,6 +626,13 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     EtwFileCollector::SetDebugLogs(m_settings.debug_logs);
     m_gpu.ProbeGrade();   // OS-version gate: menu gray-state on G3 systems
 
+    // 核型分类（核型拆分方案 §3）：启动时一次；拓扑运行期视为不变。
+    // 同构机器 heterogeneous=false → 功能整体隐藏（界面零变化），ETW 侧
+    // 样本通道静默（会话 flags 已带 PROFILE|DISPATCHER，消费端判表跳过）
+    m_core_class = BuildCoreClassMap();
+    m_metrics.SetCoreClassMap(&m_core_class);
+    m_etw.SetCoreClassMap(&m_core_class);
+
     // ---- i18n (PNM-inherited): scan <config>\lang\, auto-follow TM ----
     {
         wchar_t dll_path[MAX_PATH] = {};
@@ -998,12 +1005,19 @@ void CProcessTopPlugin::RefreshTick() {
     // 2c) ETW 迟停（问题①A，同款语义）：无磁盘 IO 窗口 → 3 分钟后才停
     // 会话；真停走 StopAsync（问题①B——tick 线程零阻塞）。切回时
     // IsRunning 检查幂等启动，C 档会话重试由 ConsumerLoop 自带 10s 循环
-    // 承担，不重复 Start
+    // 承担，不重复 Start。
+    // 核型拆分（§4.1）：启动条件从 io_bound 扩为 io_bound || cpu_split_
+    // bound（异构机器上任何窗口绑 CpuP/CpuE/DiskIo 任一）；不做运行期
+    // flag 热切换（内核 flag 不可热改，热切 = 会话重启 = IO 数据窗口损失）
     constexpr ULONGLONG kEtwIdleStopMs = 180000;   // 3 分钟
     bool io_bound = (mask & PtKindMask(MetricKind::DiskIo)) != 0;
-    if (io_bound) {
+    bool cpu_split_bound = m_core_class.heterogeneous
+        && (mask & (PtKindMask(MetricKind::CpuP) | PtKindMask(MetricKind::CpuE))) != 0;
+    if (io_bound || cpu_split_bound) {
         if (!m_etw.IsRunning()) m_etw.Start();
         m_etw_idle_since = 0;
+        // tid→pid 表转交（§4.2 归因数据源；每拍一次，便宜）
+        m_etw.UpdateThreadTable(m_metrics.TakeThreadTable());
     } else if (m_etw.IsRunning()) {
         if (m_etw_idle_since == 0) m_etw_idle_since = now;
         if (now - m_etw_idle_since >= kEtwIdleStopMs) {

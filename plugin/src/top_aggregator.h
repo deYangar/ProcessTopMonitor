@@ -10,7 +10,7 @@
 #include "etw_file_collector.h"
 #include "gpu_collector.h"
 
-enum class MetricKind { Cpu, Mem, DiskIo, DiskRead, DiskWrite, Gpu, Vram };
+enum class MetricKind { Cpu, Mem, DiskIo, DiskRead, DiskWrite, Gpu, Vram, CpuP, CpuE };
 
 // 指标绑定位集（bit per MetricKind，M3-1 方案 §2.2）：多窗模式下 GPU 按
 // 需启停的判定基础——mask 含 Gpu/Vram 任一位才保采集。
@@ -27,6 +27,10 @@ struct TopRow {
     // 其他维度恒 0；io 合计视图 value = max(read,write)（排序键））
     double io_read_bps = 0;
     double io_write_bps = 0;
+    // 核型拆分（§4.3）：进程核型占比 passthrough（CPU 视图行 tooltip 用，
+    // io_read_bps 先例同款）——全部样本口径百分比，其他维度恒 0
+    double cpu_p_pct = 0;
+    double cpu_e_pct = 0;
 };
 
 struct MetricView {
@@ -36,10 +40,19 @@ struct MetricView {
 
 struct MetricsSnapshot {
     MetricView cpu, mem, io, io_read, io_write, gpu, vram;
+    // 核型拆分两视图（§5 top_aggregator.h 行）：异构机器上随快照构建，
+    // 同构机器恒 has_value=false（窗口列表不含 = 不可选）
+    MetricView cpu_p, cpu_e;
     // 标题栏摘要
     double cpu_total_pct = -1;
     uint64_t mem_total = 0, mem_used = 0;
     double io_read_total_bps = 0, io_write_total_bps = 0;
+    // 系统级核群占用率（§4.5，核群自身容量口径；-1 = 无效/同构）
+    double cpu_p_total_pct = -1, cpu_e_total_pct = -1;
+    // 核型列可用性（§6：会话 C 档/窗口不完整 = false → 列不可用态）与
+    // 标签风格（true: X3D/标准；false: P核/E核）
+    bool cpu_split_valid = false;
+    bool cpu_split_x3d = false;
     // GPU/显存摘要
     double gpu_total_pct = 0;            // selected scope, clamped (G1/G2)
     bool gpu_total_valid = false;

@@ -1,13 +1,13 @@
 #pragma once
 // ============================================================
-// etw_file_collector — exact file read/write bytes per process
-// (技术方案 §2.3 主线，M1 已拍板首版即 ETW 精确口径)
+// etw_file_collector — 内核会话采集器：FileIo 字节 + CPU 核型样本
+// （FileIo 见下；核型样本通道 = 核型拆分方案 §4，2026-11-09）
 //
 // Grade state machine:
 //   A (Win8+):  own EVENT_TRACE_SYSTEM_LOGGER_MODE session
 //               "PTMFileIoSession" with EVENT_TRACE_FLAG_FILE_IO only —
-//               coexists with PNM's NT Kernel Logger (multiple system
-//               logger sessions are a Win8+ feature).
+//               coexists with PNM's NT Kernel Logger (multiple system-logger
+//               sessions are a Win8+ feature).
 //   B (Win7):   the single NT Kernel Logger, used only when idle.
 //               When occupied (e.g. PNM's ETW) -> C, NO stop-and-takeover
 //               (a session tug-of-war between sibling plugins is worse).
@@ -22,6 +22,18 @@
 // wow64-translated), so an x86 plugin on x64 parses with 8-byte pointers.
 // Read = event type 67, Write = 68 (MSDN FileIo class table).
 //
+// ---- 核型样本通道（方案 §4.2，探针实证后的定案形态）----
+// Win11 26300 实测（tools/cpuprofile_probe v1-v6，2026-11-09）：
+//   · SampledProfile = PerfInfo 新 GUID ce1dbfb4… + Opcode 46（文档 GUID
+//     3d6fa8d1 一条未出现；连 WPR 官方 ETL 亦然）
+//   · 事件头 ProcessId/ThreadId 对 SampledProfile 恒为 0xFFFFFFFF（无归因）
+//     ——方案 §4.2 主路线（Header.ProcessId）与预埋回退（header ThreadId
+//     → pid 表）双双实证死亡；唯一可行 = CSwitch 流重建线程上下文
+//     （WPA 同机制）：DISPATCHER flag 的 CSwitch（旧 GUID 3d6fa8d1 op36，
+//     payload 头 8B = NewTid/OldTid）维护每核 current_tid，sample 到达
+//     查表 → tid→pid 表（metrics_collector 每 tick 解析 SPI 线程数组供给）
+//   · 归因失败样本（unknown tid / Idle / System）保留在 sample_total 分母
+//
 // Handoff: the ProcessTrace callback thread owns a private accumulator map
 // (lock-free in the callback). The tick thread requests a handoff via an
 // atomic flag; the consumer thread (event callback or the periodic buffer
@@ -30,7 +42,8 @@
 // 2026-11-08 方案三改造：handoff 带窗口记账（QPC），交付 = 字节+窗口
 // 累计进 m_out；tick 侧「完整窗口才接管」——窗口 < 半个 tick 间隔的交付
 // 不置 valid（caller 继续全口径 fallback），字节留在 m_out 与后续窗口
-// 合并，速率永远除真实窗口而不是 tick 假 dt。
+// 合并，速率永远除真实窗口而不是 tick 假 dt。核型样本同一班车（§4.4：
+// 两通道窗口状态天然共享，占比分子分母同窗自洽）。
 // ============================================================
 #include <windows.h>
 #include <evntrace.h>
@@ -42,16 +55,22 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <memory>
+
+struct CoreClassMap;   // core_class_mapper.h（弱引用，Start 前注入）
 
 enum class FileIoGrade { A, B, C, Off };
 
 class EtwFileCollector {
 public:
-    // IoDelta: per-pid exact file read/write BYTES accumulated since the
-    // previous successful TakeDelta, plus the session's cumulative
-    // EventsLost (queried at a low rate).
+    // IoDelta: 内核会话增量（FileIo 字节 + 核型样本），自上次被接管的
+    // TakeDelta 起累计，外加会话累计 EventsLost（低频查询）。
     struct IoDelta {
         std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> per_pid; // pid -> (read,write)
+        // ---- 核型样本通道（方案 §4.4，与 IO 同一窗口、同一 handoff 序列）----
+        std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> sample_pid; // pid -> (P样本,E样本)
+        uint64_t sample_total = 0;      // 全部样本（校准分母，含 Idle/System/unknown）
+        bool sample_valid = false;      // 异构且交付窗口完整才置 true
         uint64_t events_lost = 0;
         // 本次交付覆盖的真实窗口长度（上次被消费的 handoff → 本次 handoff，
         // µs；方案三窗口记账）——Build 的速率分母，不再除 tick 假 dt
@@ -99,10 +118,22 @@ public:
     static bool DebugLogs() { return s_debug_logs.load(); }
     static std::atomic<bool> s_debug_logs;
 
+    // ---- 核型样本通道（方案 §4）----
+    // 分类表注入（Start 前一次；nullptr/同构 = 通道静默，仅 FileIo）
+    void SetCoreClassMap(const CoreClassMap* ccm) { m_ccm = ccm; }
+    // tid→pid 表供给（tick 线程每拍，metrics_collector 解析 SPI 线程数组）。
+    // 消费者线程在 dirty 标记下低频换表（~500ms 一次，mutex 瞬持）
+    using ThreadTable = std::unordered_map<DWORD, DWORD>;
+    void UpdateThreadTable(std::shared_ptr<const ThreadTable> tbl);
+
 private:
     struct Acc {
         uint64_t read = 0;
         uint64_t write = 0;
+    };
+    struct SampleAcc {
+        uint64_t p = 0;    // P/VCache 群样本
+        uint64_t e = 0;    // E/StdCcd 群样本
     };
 
     void ConsumerLoop();
@@ -114,6 +145,7 @@ private:
     void SetStatus(FileIoGrade g, const wchar_t* why);
     void LogLine(const wchar_t* fmt, ...);
     void QueryEventsLost();
+    void OnSampleOrSwitch(PEVENT_RECORD rec);   // 核型样本/CSwitch 通道（§4.2）
 
     static EtwFileCollector* s_self;
 
@@ -127,6 +159,11 @@ private:
     std::atomic<uint64_t> m_take_seq{0};
     std::unordered_map<DWORD, Acc> m_acc;      // consumer thread private
     std::unordered_map<DWORD, Acc> m_out;      // handed off; tick reads after seq bump
+    // ---- 核型样本通道（§4.4：与 IO 同一班车，同一窗口记账）----
+    std::unordered_map<DWORD, SampleAcc> m_acc_sample;   // consumer private
+    std::unordered_map<DWORD, SampleAcc> m_out_sample;   // 累计式 handed-off
+    uint64_t m_sample_total_acc = 0;    // 消费者私有：窗口内全部样本（含 Idle）
+    uint64_t m_sample_total_out = 0;    // 累计式（窗口不完整时跨窗合并）
     // 窗口记账（方案三）：m_out 改累计式——tick 不消费（超时/窗口不完整）
     // 时字节与窗口都留在 m_out 继续累计，跨短窗口合并成完整窗口交付，
     // 字节永不断账。m_out_window_us 由 consumer +=、tick 消费时清零
@@ -152,6 +189,16 @@ private:
 
     // payload pointer width: kernel bitness, resolved once at Start()
     int m_ptr_size = 8;
+
+    // ---- 核型样本通道（§4.2/§4.4）----
+    const CoreClassMap* m_ccm = nullptr;   // Start 前注入（弱引用）
+    std::vector<uint32_t> m_cur_tid;       // 每核 current_tid（消费者私有，
+                                           // CSwitch 重建态；会话重建时清零）
+    // tid→pid 表：tick 写 / 消费者低频换入（dirty + mutex 瞬持，热路径零锁）
+    std::mutex m_table_mutex;
+    std::shared_ptr<const ThreadTable> m_table_new;    // tick 最新供给
+    std::shared_ptr<const ThreadTable> m_table_local;  // 消费者局部持有
+    std::atomic<bool> m_table_dirty{false};
 
     // diagnostics
     uint64_t m_ev_seen = 0, m_ev_kept = 0, m_ev_short = 0;

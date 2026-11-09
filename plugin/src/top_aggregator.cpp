@@ -15,6 +15,8 @@ struct Acc {
     double io_r = 0, io_w = 0;
     double gpu = 0;              // %, scope+clamp applied by gpu_collector
     uint64_t vram_ded = 0, vram_shared = 0;
+    // 核型样本占比（§4.3：窗口样本数/全部样本 ×100，全机容量口径）
+    double cpu_p = 0, cpu_e = 0;
 };
 
 } // namespace
@@ -28,10 +30,22 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     out.cpu.rows.clear(); out.mem.rows.clear();
     out.io.rows.clear(); out.io_read.rows.clear(); out.io_write.rows.clear();
     out.gpu.rows.clear(); out.vram.rows.clear();
+    out.cpu_p.rows.clear(); out.cpu_e.rows.clear();
     out.cpu_total_pct = m.cpu_total_pct;
     out.mem_total = m.mem_total;
     out.mem_used = m.mem_used;
     out.stamp = GetTickCount64();
+
+    // 系统级核群占用率透传（§4.5；同构时恒 -1 → 摘要不显示）
+    out.cpu_p_total_pct = m.cpu_split_total_pct[1];
+    out.cpu_e_total_pct = m.cpu_split_total_pct[0];
+
+    // 核型样本占比（§4.3）：sample_valid = 异构且交付窗口完整。占比 =
+    // 该 pid 该类样本 / 全部样本（分母含 Idle/System/unknown = 全机容量
+    // 的采样投影；免疫采样间隔差异与均匀丢包）
+    bool split_valid = io_delta && io_delta->sample_valid && io_delta->sample_total > 0;
+    double pfac = split_valid ? 100.0 / (double)io_delta->sample_total : 0.0;
+    out.cpu_split_valid = split_valid;
 
     // 精确口径速率分母（方案三窗口对齐）：handoff 真实窗口，tick 假 dt
     // 不再参与——首窗几十 ms 的高估/低估、稳态 handoff 时机错位一并根治
@@ -56,6 +70,14 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             if (it != io_delta->per_pid.end()) {
                 io_r = (double)it->second.first / io_dt;
                 io_w = (double)it->second.second / io_dt;
+            }
+        }
+        double sp_p = 0, sp_e = 0;
+        if (split_valid) {
+            auto sit = io_delta->sample_pid.find(p.pid);
+            if (sit != io_delta->sample_pid.end()) {
+                sp_p = (double)sit->second.first * pfac;
+                sp_e = (double)sit->second.second * pfac;
             }
         }
         double gpu_pct = 0;
@@ -85,6 +107,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             a.gpu = gpu_pct;
             a.vram_ded = vram_d;
             a.vram_shared = vram_s;
+            a.cpu_p = sp_p;
+            a.cpu_e = sp_e;
             merged.push_back(std::move(a));
         } else {
             Acc& a = merged[it->second];
@@ -99,6 +123,9 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             if (gpu_pct > a.gpu) a.gpu = gpu_pct;
             a.vram_ded += vram_d;
             a.vram_shared += vram_s;
+            // 核型占比按同名进程累加（分母统一全机样本，可加）
+            a.cpu_p += sp_p;
+            a.cpu_e += sp_e;
             // representative = biggest live contributor by CPU (stable pick)
             if (p.cpu_pct > 0.01 && a.main_pid == 0) a.main_pid = p.pid;
         }
@@ -107,6 +134,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     // ---- short-lived processes seen by ETW but already gone from the
     // snapshot: name-cache fallback so they still rank (方案 §5.2 第 3 步) —
     // only in the exact view; C-grade counters only see live snapshots.
+    // 核型样本同款兜底（§9 短命进程行）：sample 通道与 IO 通道同一窗口，
+    // etw_exact 成立时 split_valid 才可能成立，共用本块的 live 检查
     if (etw_exact) {
         std::unordered_set<DWORD> live_pids;
         live_pids.reserve(m.procs.size() + 8);
@@ -122,6 +151,15 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             }
             double r = (double)kv.second.first / io_dt;
             double w = (double)kv.second.second / io_dt;
+            // 该 pid 的核型占比（有则并入同名 Acc）
+            double sp_p = 0, sp_e = 0;
+            if (split_valid) {
+                auto sit = io_delta->sample_pid.find(kv.first);
+                if (sit != io_delta->sample_pid.end()) {
+                    sp_p = (double)sit->second.first * pfac;
+                    sp_e = (double)sit->second.second * pfac;
+                }
+            }
             auto it = by_name.find(nm);
             if (it == by_name.end()) {
                 by_name[nm] = merged.size();
@@ -134,11 +172,52 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
                                        //「×N」合并数含已退出进程
                 a.io_r = r;
                 a.io_w = w;
+                a.cpu_p = sp_p;
+                a.cpu_e = sp_e;
                 merged.push_back(std::move(a));
             } else {
                 Acc& a = merged[it->second];
                 a.io_r += r;
                 a.io_w += w;
+                a.cpu_p += sp_p;
+                a.cpu_e += sp_e;
+            }
+        }
+        // 只在核型样本里出现的短命进程（窗口内烧 CPU 后退出、无 IO）：
+        // 同名合并进 merged，让 cpu_p/cpu_e 视图也能排上（占比口径自带排序值）
+        if (split_valid) {
+            for (const auto& kv : io_delta->sample_pid) {
+                if (kv.second.first == 0 && kv.second.second == 0) continue;
+                if (live_pids.count(kv.first)) continue;
+                // 已被 IO 块并入的跳过（by_name 查得到合并过同名 Acc——
+                // 简化：IO 块只处理 per_pid 里的 pid，这里查 sample-only）
+                std::wstring nm = mc.LookupName(kv.first);
+                if (nm.empty()) {
+                    wchar_t tmp[32];
+                    swprintf_s(tmp, L"<PID %lu>", kv.first);
+                    nm = tmp;
+                }
+                double sp_p = (double)kv.second.first * pfac;
+                double sp_e = (double)kv.second.second * pfac;
+                auto it = by_name.find(nm);
+                if (it == by_name.end()) {
+                    by_name[nm] = merged.size();
+                    Acc a;
+                    a.name = nm;
+                    a.main_pid = 0;
+                    a.count = 0;         // C4：死 pid 不计入
+                    a.cpu_p = sp_p;
+                    a.cpu_e = sp_e;
+                    merged.push_back(std::move(a));
+                } else {
+                    Acc& a = merged[it->second];
+                    // 同 pid 已在 IO 块加过（per_pid 有它时）——重复加会
+                    // 翻倍。防御：只加 IO 块没碰过的 pid（per_pid 查无）
+                    if (io_delta->per_pid.find(kv.first) == io_delta->per_pid.end()) {
+                        a.cpu_p += sp_p;
+                        a.cpu_e += sp_e;
+                    }
+                }
             }
         }
     }
@@ -173,8 +252,17 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     };
     auto no_aux = [](const Acc*, TopRow&) {};
 
+    // 核型占比 passthrough（§5 TopRow 先例同款）：cpu/cpu_p/cpu_e 三个视图
+    // 的行都带 P/E 明细——CPU 视图 tooltip 取用，核型视图自身亦可显示
+    auto split_aux = [](const Acc* a, TopRow& r) {
+        r.cpu_p_pct = a->cpu_p;
+        r.cpu_e_pct = a->cpu_e;
+    };
+
     bool has_delta = !m.first;
-    fill(out.cpu, [](const Acc* a) { return a->cpu; }, has_delta, no_aux);
+    fill(out.cpu, [](const Acc* a) { return a->cpu; }, has_delta, split_aux);
+    fill(out.cpu_p, [](const Acc* a) { return a->cpu_p; }, split_valid, split_aux);
+    fill(out.cpu_e, [](const Acc* a) { return a->cpu_e; }, split_valid, split_aux);
     fill(out.mem, [](const Acc* a) { return (double)a->mem; }, true, no_aux);
     // 合计视图（问题③）：排序键 = max(read, write)——纯读/纯写大户不被
     // 双边合计淹没，与「读写分开显示」的意图自洽；r/w 拆分随行带出供
