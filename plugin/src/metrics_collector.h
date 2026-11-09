@@ -54,7 +54,12 @@ struct CpuMemIoMetrics {
     //（「P 38」读作 P 核群忙 38%）。-1 = 同构/首拍/NtQSI 失败。
     // [1] = P/VCache 群，[0] = E/StdCcd 群
     double cpu_split_total_pct[2] = { -1, -1 };
-    std::vector<ProcMetric> procs;     // idle/system excluded, all others
+    // 核群 LP 数与全机 LP 数（2026-11-10 方案②其余合计行用：群总 ×
+    // LP_g/total_lp 换算到全核口径，才能与行值（分母=全部核）同量纲对
+    // 账）。异构时随 split 计算填写；同构恒 0（下游 share=0 → rest 不显示）
+    int cpu_split_lp[2] = { 0, 0 };   // [1]=P/VCache 群 [0]=E/StdCcd 群
+    int cpu_lp_total = 0;             // 全机 LP 数（含防御性 Homog 核）
+    std::vector<ProcMetric> procs;     // idle excluded; System(pid4) in ranking
 };
 
 class MetricsCollector {

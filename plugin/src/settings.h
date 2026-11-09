@@ -56,6 +56,12 @@ struct PtSettings {
     // P/E 或 X3D/标准 双列，默认）/0=仅总量（ETW 采样通道不启，tooltip
     // P/E 明细随之消失）。仅异构机器有意义；同构机忽略（形态恒纯 CPU）
     int cpu_view = 1;
+    // System(pid 4) 计入核型归因（2026-11-10 方案①）：true（默认）=
+    // System 内核线程时间进 P/E 账本，群总与下方加总对得上账；false =
+    // 拆分时代行为（System 时间留分母不归因）。仅管 ETW 核型通道——
+    // cpu 视图总量口径（NtQSI）System 恒在 ranking，不受此键影响。
+    // 缺键 = true（旧配置升级天然兼容）
+    bool show_system_procs = true;
     std::vector<WindowCfg> windows;   // 单窗模式≤1；多窗 1..6；空=悬浮窗模式退出
 
     // clamp everything to its legal domain (hand-edited settings.json must
@@ -209,6 +215,7 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"default_metric\": %d,\n", st.default_metric);
     fprintf(f, "  \"multi_window\": %s,\n", st.multi_window ? "true" : "false");
     fprintf(f, "  \"cpu_view\": %d,\n", st.cpu_view);
+    fprintf(f, "  \"show_system_procs\": %s,\n", st.show_system_procs ? "true" : "false");
     fprintf(f, "  \"windows\": [\n");
     for (size_t i = 0; i < st.windows.size(); i++) {
         const WindowCfg& c = st.windows[i];
@@ -292,6 +299,7 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     geti("\"default_metric\"", st.default_metric);
     getb("\"multi_window\"", st.multi_window);
     geti("\"cpu_view\"", st.cpu_view);   // 缺键 = 默认 1（Clamp 兜底非法值）
+    getb("\"show_system_procs\"", st.show_system_procs);   // 缺键 = 默认 true
     int schema_read = 0;   // 无 schema 键 = v1/v2 旧文件，走迁移
     geti("\"schema\"", schema_read);
 

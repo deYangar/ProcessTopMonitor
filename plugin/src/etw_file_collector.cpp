@@ -619,7 +619,14 @@ void EtwFileCollector::OnSampleOrSwitch(PEVENT_RECORD rec) {
                 auto it = m_table_local->find(tid);
                 if (it != m_table_local->end()) {
                     DWORD pid = it->second;
-                    if (pid != 0 && pid != 4) {  // Idle/System：留分母不进 per-pid
+                    // Idle 恒排除（非负载）。System(pid 4) 2026-11-10 起默认
+                    // 归因进 per-pid（方案①：P/E 账闭合——System 内核线程
+                    // 时间是「群总 vs 下方加总」缺口的真实大头），开关
+                    // m_show_system 可关（运行时原子翻转，下一窗全生效；
+                    // 已累计账目不回溯）。关掉即回到拆分时代行为
+                    if (pid != 0
+                        && (pid != 4
+                            || m_show_system.load(std::memory_order_relaxed))) {
                         switch (m_ccm->lp[core]) {
                         case CoreClass::P:
                         case CoreClass::VCache: m_acc_sample[pid].p += dt; break;

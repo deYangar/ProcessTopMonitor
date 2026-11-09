@@ -41,6 +41,7 @@ enum {
     IDC_POPUPMODE_CBO = 1070, // 出现方式（M6 §4.5）
     IDC_DEFMETRIC_CBO,        // 默认指标
     IDC_MULTIWINDOW_CHK,      // 多窗口并排
+    IDC_SHOWSYS_CHK,          // System 归因（方案①：仅异构机器创建）
     IDC_CPUVIEW_CBO,          // CPU 视图形态（合并方案 D1：仅异构机器创建）
 };
 
@@ -432,7 +433,10 @@ void PtCreateControls(HWND hwnd) {
     y += Sc(100) + Sc(12);
 
     // ---- 显示（M6 §4.5：出现方式/默认指标/多窗口并排三行）----
-    PtGroup(hwnd, TR(L"显示"), M, y, GW, Sc(88));
+    // System 归因开关（2026-11-10 方案①）仅异构机器追加一行（同构机核型
+    // 通道不启，开关无意义——CPU 视图 combo 同款零变化原则）
+    bool hetero = plugin.CoreClass().heterogeneous;
+    PtGroup(hwnd, TR(L"显示"), M, y, GW, Sc(88) + (hetero ? Sc(24) : 0));
     {
         int iy = y + Sc(26);
         PtFont(PtLabel(hwnd, TR(L"出现方式"), M + Sc(12), iy + Sc(4), Sc(60), Sc(20)));
@@ -476,8 +480,20 @@ void PtCreateControls(HWND hwnd) {
             (HMENU)(INT_PTR)IDC_MULTIWINDOW_CHK, nullptr, nullptr);
         SendMessageW(mw, BM_SETCHECK, st.multi_window ? BST_CHECKED : BST_UNCHECKED, 0);
         PtFont(mw);
+        // System 归因（方案①）：仅异构机器创建（核型通道存在才有意义）；
+        // 保存路径按控件存在性判定，同构机缺席不覆写
+        if (hetero) {
+            HWND ss = CreateWindowW(L"BUTTON",
+                TR(L"核型视图归因 System 进程（P/E 账含内核线程时间）"),
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+                M + Sc(12), iy + Sc(58), Sc(420), Sc(20), hwnd,
+                (HMENU)(INT_PTR)IDC_SHOWSYS_CHK, nullptr, nullptr);
+            SendMessageW(ss, BM_SETCHECK,
+                         st.show_system_procs ? BST_CHECKED : BST_UNCHECKED, 0);
+            PtFont(ss);
+        }
     }
-    y += Sc(88) + Sc(12);
+    y += Sc(88) + (hetero ? Sc(24) : 0) + Sc(12);
 
     // ---- 窗口与外观 ----
     PtGroup(hwnd, TR(L"窗口与外观"), M, y, GW, Sc(88));
@@ -622,6 +638,13 @@ void PtOnOk(HWND hwnd) {
     }
     st.multi_window = SendMessageW(GetDlgItem(hwnd, IDC_MULTIWINDOW_CHK),
                                    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    // System 归因（方案①）：同构机控件缺席不覆写（IsWindow 判定，
+    // cpu_view combo 同款）
+    if (IsWindow(GetDlgItem(hwnd, IDC_SHOWSYS_CHK))) {
+        st.show_system_procs =
+            SendMessageW(GetDlgItem(hwnd, IDC_SHOWSYS_CHK),
+                         BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     st.sensor_summary = SendMessageW(GetDlgItem(hwnd, IDC_SENSOR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.debug_logs = SendMessageW(GetDlgItem(hwnd, IDC_DEBUG_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     // 崩溃转储开关：读回 + 即时生效（旗标/WER 注册当场翻转，不等重启）

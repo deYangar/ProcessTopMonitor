@@ -1673,6 +1673,39 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     // D2 回退态的落点：数据无效回落总量百分比）
     default: m_summary_value = snap.cpu_total_pct; break;
     }
+
+    // 其余合计行（2026-11-10 方案②）：相对本窗实际显示的行集算（截断
+    // 口径）。核型分列形态：群总 × LP占比换算到全核口径 − Σ行 P/E
+    //（行值分母 = 全部核的 CSwitch 总时间，群总分母 = 本群 LP，量纲先
+    // 换齐再对账）；瞬时负值钳 0——群总走 idle 差分窗、行值走 ETW
+    // handoff 窗，两窗滑动错位时的噪声（量级一两个点），且残差行天然
+    // 吸收未归因时间（unknown tid/丢缓冲），只会偏小不会负。纯总量/
+    // 预热/D2 回退形态：总量 − Σ行值（同源同窗 NtQSI，账最齐，残差 =
+    // 截断 + 中断/DPC 等不属于任何进程的时间）。粘滞拍行集沿用、群总
+    // 照刷，同样成立
+    m_rest_value = m_rest_p = m_rest_e = -1;
+    if (m_kind == MetricKind::Cpu && m_rows_has_value && !m_rows.empty()) {
+        if (SplitDisplayActive()) {
+            double sp = snap.cpu_split_lp_share[1];
+            double se = snap.cpu_split_lp_share[0];
+            if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0 && sp > 0 && se > 0) {
+                double sum_p = 0, sum_e = 0;
+                for (const auto& r : m_rows) {
+                    sum_p += r.cpu_p_pct;
+                    sum_e += r.cpu_e_pct;
+                }
+                double rp = m_cpu_p_total * sp - sum_p;
+                double re = m_cpu_e_total * se - sum_e;
+                m_rest_p = rp > 0 ? rp : 0;
+                m_rest_e = re > 0 ? re : 0;
+            }
+        } else if (m_summary_value >= 0) {
+            double sum = 0;
+            for (const auto& r : m_rows) sum += r.value;
+            double rv = m_summary_value - sum;
+            m_rest_value = rv > 0 ? rv : 0;
+        }
+    }
 }
 
 void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind kind,
@@ -1694,6 +1727,11 @@ void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind 
                           + (long long)m_tm_cpu_freq });
     for (auto& r : m_rows)
         sig.push_back({ r.pid, (long long)(r.value * 10.0) + r.count * 1000003 });
+    // rest 行指纹（方案②）：群总变而行集不变时 summary 指纹可能不动
+    //（P↑E↓ 抵消），残差变化必须独立触发重绘/重排（行高随 rest 出现）
+    sig.push_back({ 0xBEEF, (long long)(m_rest_value * 10.0)
+                              + (long long)(m_rest_p * 10.0) * 1000003LL
+                              + (long long)(m_rest_e * 10.0) * 100000037LL });
     bool changed = first_tick || !m_rows_has_value || sig != m_dirty_sig;
     m_dirty_sig = std::move(sig);
 
@@ -1959,6 +1997,8 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
             + status_lines * STATUS_H
             + rows * ROW_HEIGHT
             + PADDING;
+    // 其余合计行（方案②）：本拍有值多占一行（消失即缩回）
+    if (m_rest_value >= 0 || m_rest_p >= 0) out_h += ROW_HEIGHT;
     if (out_h < HEADER_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING)
         out_h = HEADER_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING;
 }
@@ -2263,6 +2303,58 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
     SelectObject(hdc, hOld);
 }
 
+void CTopListWindow::DrawRestRow(HDC hdc, int y) {
+    // 其余合计行（2026-11-10 方案②）：未进显示行的其余进程 + 未归因
+    // 时间的合计，账面闭合行。灰字（hint 文案同款次要色）；无序号无
+    // 图标（不是进程，也不参与命中/tooltip——UpdateRowTooltip 的
+    // row >= m_rows.size() 边界天然排除）；分隔线同款收底
+    RECT client;
+    GetClientRect(m_hwnd, &client);
+    int w = client.right;
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, UseTextTheme() ? RGB(120, 120, 120) : RGB(160, 160, 160));
+    HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
+
+    // 标签对齐进程名列起点（序号+图标占位之后）
+    int name_x = PADDING + IDX_W + ICON_SIZE + (int)(6 * m_dpi_scale);
+    RECT rc_name = { name_x, y, w - PADDING - ValueAreaWidth(),
+                     y + ROW_HEIGHT };
+    DrawTextW(hdc, TR(L"其余合计"), -1, &rc_name,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // 值：核型分列形态 P/E 双列（DrawRow 同款布局/前缀，灰字），
+    // 其余（纯总量/预热/D2 回退）单值右对齐
+    if (SplitDisplayActive()) {
+        const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
+        const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
+        wchar_t pv[48], ev[48];
+        swprintf_s(pv, 48, L"%s%.1f%%", pl, m_rest_p);
+        swprintf_s(ev, 48, L"%s%.1f%%", el, m_rest_e);
+        int col_gap = (int)(8 * m_dpi_scale);
+        RECT rc_e = { w - PADDING - VALUE_AREA_W, y, w - PADDING,
+                      y + ROW_HEIGHT };
+        DrawTextW(hdc, ev, -1, &rc_e, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        RECT rc_p = { rc_e.left - col_gap - VALUE_AREA_W, y,
+                      rc_e.left - col_gap, y + ROW_HEIGHT };
+        DrawTextW(hdc, pv, -1, &rc_p, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    } else {
+        wchar_t val[32];
+        swprintf_s(val, 32, L"%.1f%%", m_rest_value);
+        RECT rc_val = { w - PADDING - ValueAreaWidth(), y, w - PADDING,
+                        y + ROW_HEIGHT };
+        DrawTextW(hdc, val, -1, &rc_val, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    }
+
+    // 分隔线（DrawRow 同款）
+    HPEN hOldPen = (HPEN)SelectObject(hdc, m_pen_separator);
+    MoveToEx(hdc, PADDING + IDX_W, y + ROW_HEIGHT - 1, nullptr);
+    LineTo(hdc, w - PADDING, y + ROW_HEIGHT - 1);
+    SelectObject(hdc, hOldPen);
+
+    SelectObject(hdc, hOld);
+}
+
 void CTopListWindow::DrawContent(HDC dc, int w, int h, bool content_only) {
     // 边框参与 coverage 双底解算（背景由 ULW 合成提供）
     if (m_acrylic_active) {
@@ -2317,6 +2409,12 @@ void CTopListWindow::DrawContent(HDC dc, int w, int h, bool content_only) {
     }
     for (size_t i = 0; i < m_rows.size(); i++) {
         DrawRow(dc, y, (int)i, m_rows[i]);
+        y += ROW_HEIGHT;
+    }
+    // 其余合计行（方案②）：收尾灰字行（ApplySnapshotForCurrentView
+    // 算值，-1 = 本拍不显示）
+    if (m_rest_value >= 0 || m_rest_p >= 0) {
+        DrawRestRow(dc, y);
         y += ROW_HEIGHT;
     }
 }

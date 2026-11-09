@@ -39,6 +39,12 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     // 系统级核群占用率透传（§4.5；同构时恒 -1 → 摘要不显示）
     out.cpu_p_total_pct = m.cpu_split_total_pct[1];
     out.cpu_e_total_pct = m.cpu_split_total_pct[0];
+    // LP 换算系数（方案②其余合计行）：群总（群内容量口径）× share →
+    // 全核口径贡献，与行值（分母=全部核）同量纲；同构恒 0 → rest 不显示
+    if (m.cpu_lp_total > 0) {
+        out.cpu_split_lp_share[1] = (double)m.cpu_split_lp[1] / m.cpu_lp_total;
+        out.cpu_split_lp_share[0] = (double)m.cpu_split_lp[0] / m.cpu_lp_total;
+    }
 
     // 核型样本占比（§4.3）：sample_valid = 异构且交付窗口完整。占比 =
     // 该 pid 该类样本 / 全部样本（分母含 Idle/System/unknown = 全机容量

@@ -117,6 +117,8 @@ private:
     void CalcLayout(HDC hdc, int& out_w, int& out_h);
     void DrawContent(HDC dc, int w, int h, bool content_only);
     void DrawRow(HDC hdc, int y, int idx, const TopRow& row);
+    // 其余合计行（方案②）：灰字收尾行，不参与排序/命中/tooltip
+    void DrawRestRow(HDC hdc, int y);
     void DrawHeader(HDC hdc, int w, int y);   // M6 头部条：‹指标名› + 传感器摘要
     void DrawSummary(HDC hdc, int w, int y);
     // 指标循环切换（滚轮/头部点击共用；单窗模式，M6 §4.1.2/§4.1.3）
@@ -226,6 +228,12 @@ private:
     // 粘滞计数（刀2）：连续无效拍数——<kSplitHoldBeats 沿用上一拍形态
     // 与行集（不重灌），超时如实回落 ⚠；有效拍清零
     int m_split_invalid_streak = 0;
+    // 其余合计行（2026-11-10 方案②）：未进显示行的其余进程 + 未归因
+    // 时间，让「上方总量 vs 下方加总」账面闭合。全核口径（与行值同
+    // 量纲）；-1 = 本拍不显示（首拍/数据无效/非 CPU 视图）。_p/_e 仅
+    // 核型分列形态（SplitDisplayActive）有意义，此时 _value=-1
+    double m_rest_value = -1;
+    double m_rest_p = -1, m_rest_e = -1;
     int m_topn = 10;
     int m_io_view = 0;
     int m_color_mode = 0;

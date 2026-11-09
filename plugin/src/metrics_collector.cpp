@@ -300,6 +300,10 @@ void MetricsCollector::TickCoreClassTotals(CpuMemIoMetrics& out, double dt) {
     out.cpu_split_total_pct[0] = -1;
     out.cpu_split_total_pct[1] = -1;
     if (!m_ccm || !m_ccm->heterogeneous || !m_ccm->total_lp) return;
+    // LP 数拓扑（方案②其余合计行换算原料）：与 split 值无关，恒填
+    out.cpu_split_lp[0] = m_ccm->class_lp_count[0];
+    out.cpu_split_lp[1] = m_ccm->class_lp_count[1];
+    out.cpu_lp_total = m_ccm->total_lp;
 
     auto fn = (PFN_NtQuerySystemInformation)m_ntqsi;
     if (!m_ntqsi_tried) {

@@ -689,6 +689,9 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
 void CProcessTopPlugin::ApplySettingsToCollectors() {
     m_metrics.SetMemBasisWorkingSet(m_settings.memory_basis == 1);
     m_gpu.Configure(m_settings.GpuScope());
+    // System 归因开关（2026-11-10 方案①）：核型通道原子翻转即时生效
+    //（consumer 每事件读取，设置页保存后下一窗全量生效，无需重启会话）
+    m_etw.SetShowSystemProcs(m_settings.show_system_procs);
     // 外观三件套是全局设置：应用到全部窗口（M3-1 方案 §3.4）
     WindowManager::Instance().ForEach([](CTopListWindow& w, int) {
         w.SetAppearance(CProcessTopPlugin::Instance().m_settings.color_mode,
