@@ -1673,11 +1673,17 @@ void CTopListWindow::ShowAt(int x, int y) {
         m_cov_dirty = true;   // 首显判定结果（翻转/面板观感）影响双底内容
     }
 
-    if (m_blur_hwnd)
-        SetWindowPos(m_blur_hwnd, HWND_TOPMOST, x, y, pw, ph,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // Z 序一次到位（2026-11-09 闪现治本）：旧序 blur 先 HWND_TOPMOST——已
+    // topmost 的窗再设 TOPMOST 会在带内提顶（真实窗实测），blur 那一瞬压在
+    // 内容之上，两步间若插入 DWM vsync 即合成一帧「纯模糊无字」（悬浮窗
+    // 不定时闪一下的根因）。改为内容先提顶、blur 以内容为 insert-after 落
+    // 在其正下方（ApplyBackdrop 可见热切换同款手法）——每步完成后 Z 序
+    // 形态都正确，压顶窗口期不存在
     SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, pw, ph,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (m_blur_hwnd)
+        SetWindowPos(m_blur_hwnd, m_hwnd, x, y, pw, ph,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
     m_visible = true;
     if (m_acrylic_active) UpdateWindow(m_hwnd);
 }
