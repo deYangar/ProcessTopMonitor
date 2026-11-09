@@ -312,11 +312,14 @@ void MetricsCollector::TickCoreClassTotals(CpuMemIoMetrics& out, double dt) {
     if (!fn) return;
 
     size_t need_records = (size_t)m_ccm->total_lp;
-    size_t want = need_records * sizeof(SPPI) + 64;
+    // info-8 要求缓冲区精确 = 核数 × sizeof(SPPI)：多一个字节都报
+    // STATUS_INFO_LENGTH_MISMATCH（2026-11-09 实测：+64 超长 → 0xC0000004
+    // → 摘要恒 "--" 的根因；精确 24×48=1152 → 成功）
+    size_t want = need_records * sizeof(SPPI);
     if (m_sppi_buf.size() < want) m_sppi_buf.resize(want);
     ULONG got = 0;
     LONG st = fn(SystemProcessorPerformanceInformation, m_sppi_buf.data(),
-                 (ULONG)m_sppi_buf.size(), &got);
+                 (ULONG)want, &got);
     if (st != 0) return;
     size_t n_records = got / sizeof(SPPI);
     if (n_records < need_records) return;   // 记录数不足：如实无效，不造假
