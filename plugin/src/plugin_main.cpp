@@ -627,19 +627,13 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     m_gpu.ProbeGrade();   // OS-version gate: menu gray-state on G3 systems
 
     // 核型分类（核型拆分方案 §3）：启动时一次；拓扑运行期视为不变。
-    // 同构机器 heterogeneous=false → 功能整体隐藏（界面零变化），ETW 侧
-    // 样本通道静默（会话 flags 已带 PROFILE|DISPATCHER，消费端判表跳过）
+    // 同构机器 heterogeneous=false → CPU 视图形态恒纯总量（合并方案 §3），
+    // 设置项不创建、ETW 侧样本通道静默（会话 flags 已带 PROFILE|
+    // DISPATCHER，消费端判表跳过）。配置里残留的 kind 7/8 由 Clamp 全机
+    // 归 0（2026-11-09 合并前是同构机 InitOnce 矫正，合并后 7/8 全面退役）
     m_core_class = BuildCoreClassMap();
     m_metrics.SetCoreClassMap(&m_core_class);
     m_etw.SetCoreClassMap(&m_core_class);
-    // 同构矫正：配置里的 7/8（CpuP/CpuE——异构机上写下的，或手改）在同构
-    // 机器不可用，归位 CPU（窗口恢复前完成，不出现死视图）
-    if (!m_core_class.heterogeneous) {
-        if (m_settings.default_metric == 7 || m_settings.default_metric == 8)
-            m_settings.default_metric = 0;
-        for (auto& c : m_settings.windows)
-            if (c.kind == 7 || c.kind == 8) c.kind = 0;
-    }
 
     // ---- i18n (PNM-inherited): scan <config>\lang\, auto-follow TM ----
     {
@@ -1027,13 +1021,17 @@ void CProcessTopPlugin::RefreshTick() {
     // 会话；真停走 StopAsync（问题①B——tick 线程零阻塞）。切回时
     // IsRunning 检查幂等启动，C 档会话重试由 ConsumerLoop 自带 10s 循环
     // 承担，不重复 Start。
-    // 核型拆分（§4.1）：启动条件从 io_bound 扩为 io_bound || cpu_split_
-    // bound（异构机器上任何窗口绑 CpuP/CpuE/DiskIo 任一）；不做运行期
-    // flag 热切换（内核 flag 不可热改，热切 = 会话重启 = IO 数据窗口损失）
+    // 核型拆分（§4.1 → 合并方案 D4）：启动条件 = io_bound || cpu_split_
+    // bound（异构 + 设置「核型分列」+ 绑 CPU 窗——核型数据需要采样会话；
+    // 强制「仅总量」不启：画面与 tooltip 明细都不要，省整个会话。IO 窗口
+    // 在跑时会话顺路供数，tooltip 白拿）。不做运行期 flag 热切换（内核
+    // flag 不可热改，热切 = 会话重启 = IO 数据窗口损失；设置切换 cpu_view
+    // 只影响启停判定，下一拍自然生效）
     constexpr ULONGLONG kEtwIdleStopMs = 180000;   // 3 分钟
     bool io_bound = (mask & PtKindMask(MetricKind::DiskIo)) != 0;
     bool cpu_split_bound = m_core_class.heterogeneous
-        && (mask & (PtKindMask(MetricKind::CpuP) | PtKindMask(MetricKind::CpuE))) != 0;
+        && m_settings.cpu_view == 1
+        && (mask & PtKindMask(MetricKind::Cpu)) != 0;
     if (io_bound || cpu_split_bound) {
         if (!m_etw.IsRunning()) m_etw.Start();
         m_etw_idle_since = 0;

@@ -135,6 +135,12 @@ private:
     // 8×DPI 列间距；其余视图单列。DrawRow 名字列缩减与 CalcLayout 窗宽联动
     // 都以此为单一事实源
     int ValueAreaWidth() const;
+    // CPU 视图形态解析（合并方案 §3，每拍求值）：
+    // SplitWanted = 异构 && 设置「核型分列」（用户意图，随设置翻转）；
+    // SplitDisplayActive = SplitWanted && 本拍核型数据有效（false 落纯
+    // CPU 形态：行/摘要/窗宽全走单列，ToneSplitNA 出警示行）
+    bool SplitWanted() const;
+    bool SplitDisplayActive() const;
     void Reposition();                       // clamp to work area, show
     void OnPaint();
 
@@ -156,7 +162,7 @@ private:
     void BuildContextMenu(POINT pt);
     void RecalcAndRepaint(bool reposition);
 
-    // ---- 行级 tooltip（核型拆分 §5：CPU/CpuP/CpuE 视图行 P/E 明细）----
+    // ---- 行级 tooltip（核型拆分 §5 → 合并方案：CPU 视图行 P/E 明细）----
     // 手动 TRACK 模式（TTF_TRACK|TTF_ABSOLUTE）：WM_MOUSEMOVE 算命中行并
     // 更新文本/位置，WM_MOUSELEAVE 收起——不用 TTF_SUBCLASS（layered 窗口
     // 自管消息，气泡独立顶层窗正常显示）

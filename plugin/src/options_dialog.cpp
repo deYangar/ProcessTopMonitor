@@ -41,6 +41,7 @@ enum {
     IDC_POPUPMODE_CBO = 1070, // 出现方式（M6 §4.5）
     IDC_DEFMETRIC_CBO,        // 默认指标
     IDC_MULTIWINDOW_CHK,      // 多窗口并排
+    IDC_CPUVIEW_CBO,          // CPU 视图形态（合并方案 D1：仅异构机器创建）
 };
 
 // ---- 对话框会话状态（单开，模态期内独占）----
@@ -444,17 +445,30 @@ void PtCreateControls(HWND hwnd) {
         PtFont(c8);
         PtFont(PtLabel(hwnd, TR(L"默认指标"), M + Sc(220), iy + Sc(4), Sc(60), Sc(20)));
         HWND c9 = PtCombo(hwnd, IDC_DEFMETRIC_CBO, M + Sc(290), iy, Sc(110));
-        const int dmk[] = { 0, 1, 2, 5, 6, 7 };   // MetricKind 原值（itemdata）
-        const wchar_t* dmt[] = { L"CPU", L"内存", L"磁盘 IO", L"GPU", L"显存",
-                                 L"核型" };
-        // 核型一枚（§5，单面板双列）：异构机器条件追加
-        const auto& cc = plugin.CoreClass();
-        int n_dm = cc.heterogeneous ? 6 : 5;
-        for (int i = 0; i < n_dm; i++) {
+        const int dmk[] = { 0, 1, 2, 5, 6 };   // MetricKind 原值（itemdata）
+        const wchar_t* dmt[] = { L"CPU", L"内存", L"磁盘 IO", L"GPU", L"显存" };
+        // 核型分列并入 CPU 视图形态自适应（2026-11-09 合并方案）：
+        // 「核型」项退役，形态走下方 CPU 视图 combo
+        for (int i = 0; i < 5; i++) {
             PtCboAdd(hwnd, IDC_DEFMETRIC_CBO, TR(dmt[i]), dmk[i]);
             if (st.default_metric == dmk[i]) SendMessageW(c9, CB_SETCURSEL, i, 0);
         }
         PtFont(c9);
+        // CPU 视图形态（合并方案 D1）：核型分列（默认）/仅总量，仅异构
+        // 机器创建——同构机形态恒纯总量且无数据，选项整行缺席（零变化
+        // 原则）；保存路径按控件存在性判定，缺席不覆写
+        if (plugin.CoreClass().heterogeneous) {
+            PtFont(PtLabel(hwnd, TR(L"CPU 视图"), M + Sc(430), iy + Sc(4),
+                           Sc(60), Sc(20)));
+            HWND cv = PtCombo(hwnd, IDC_CPUVIEW_CBO, M + Sc(500), iy, Sc(110));
+            const int cvv[] = { 1, 0 };   // itemdata = PtSettings.cpu_view 值
+            const wchar_t* cvt[] = { L"核型分列", L"仅总量" };
+            for (int i = 0; i < 2; i++) {
+                PtCboAdd(hwnd, IDC_CPUVIEW_CBO, TR(cvt[i]), cvv[i]);
+                if (st.cpu_view == cvv[i]) SendMessageW(cv, CB_SETCURSEL, i, 0);
+            }
+            PtFont(cv);
+        }
         HWND mw = CreateWindowW(L"BUTTON",
             TR(L"多窗口并排（每窗固定指标，增删走右键菜单）"),
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
@@ -595,6 +609,16 @@ void PtOnOk(HWND hwnd) {
         LPARAM dm = SendMessageW(GetDlgItem(hwnd, IDC_DEFMETRIC_CBO),
                                  CB_GETITEMDATA, dmi, 0);
         if (dm) st.default_metric = (int)dm;
+    }
+    // CPU 视图形态（合并方案 D1）：同构机不创建控件（GetDlgItem=NULL 时
+    // CB_GETCURSEL 也返 0，必须先判存在再读——缺席不覆写存量值）
+    if (IsWindow(GetDlgItem(hwnd, IDC_CPUVIEW_CBO))) {
+        int cvi = PtCboSel(hwnd, IDC_CPUVIEW_CBO);
+        if (cvi >= 0) {
+            LPARAM cvv = SendMessageW(GetDlgItem(hwnd, IDC_CPUVIEW_CBO),
+                                      CB_GETITEMDATA, cvi, 0);
+            st.cpu_view = (int)cvv;   // itemdata 即 0/1，无选中返 CB_ERR=-1 不进
+        }
     }
     st.multi_window = SendMessageW(GetDlgItem(hwnd, IDC_MULTIWINDOW_CHK),
                                    BM_GETCHECK, 0, 0) == BST_CHECKED;

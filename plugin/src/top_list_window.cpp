@@ -258,11 +258,13 @@ void CTopListWindow::EnsureRowTooltip() {
 }
 
 void CTopListWindow::UpdateRowTooltip(const POINT& client_pt) {
-    // 异构机器且通道有效才显示（§5：同构/不可用零侵入）
-    bool split_on = m_cpu_split_valid;
-    bool kind_wants = (m_kind == MetricKind::Cpu && split_on)
-                   || m_kind == MetricKind::CpuP || m_kind == MetricKind::CpuE;
-    if (!kind_wants) { HideRowTooltip(); return; }
+    // 异构机器且通道有效才显示（§5：同构/不可用零侵入；合并方案 D4：
+    // 强制「仅总量」→ 采样通道不启 → split_valid=false 自动隐藏；
+    // IO 窗口在跑时会话顺路供数 = 白拿场景照样显示明细）
+    if (m_kind != MetricKind::Cpu || !m_cpu_split_valid) {
+        HideRowTooltip();
+        return;
+    }
     // 命中行（与 DrawContent 布局一致：PADDING+HEADER+SUMMARY+状态行+行区）
     StatusTone lines[4];
     int nlines = 0;
@@ -275,7 +277,10 @@ void CTopListWindow::UpdateRowTooltip(const POINT& client_pt) {
     EnsureRowTooltip();
     if (!m_tip_hwnd) return;
 
-    // 文本：进程名 + 全机占比（CPU 列口径）+ P/E 明细（行 passthrough）
+    // 文本：进程名 + P/E 明细（行 passthrough）。纯总量形态的行
+    // r.value = 全机 CPU%（一并展示）；核型分列形态 r.value = max(P,E)
+    // 排序键，再标 CPU 会误导（核型面板时代的误标随合并修正）——只列
+    // 两核群明细
     const TopRow& r = m_rows[(size_t)row];
     std::wstring name = r.name;
     if (name.size() > 4) {
@@ -283,14 +288,22 @@ void CTopListWindow::UpdateRowTooltip(const POINT& client_pt) {
         if (ext == L".exe" || ext == L".EXE") name = name.substr(0, name.size() - 4);
     }
     wchar_t text[512];
-    if (m_cpu_split_x3d)
+    if (SplitDisplayActive()) {
+        if (m_cpu_split_x3d)
+            swprintf_s(text, 512, L"%s\nX3D %.1f%% · %s %.1f%%",
+                       name.c_str(), r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
+        else
+            swprintf_s(text, 512, L"%s\n%s %.1f%% · %s %.1f%%",
+                       name.c_str(), TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
+    } else if (m_cpu_split_x3d) {
         swprintf_s(text, 512, L"%s\n%s %.1f%%\nX3D %.1f%% · %s %.1f%%",
                    name.c_str(), TR(L"CPU"), r.value,
                    r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
-    else
+    } else {
         swprintf_s(text, 512, L"%s\n%s %.1f%%\n%s %.1f%% · %s %.1f%%",
                    name.c_str(), TR(L"CPU"), r.value,
                    TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
+    }
 
     TOOLINFOW ti = {};
     ti.cbSize = sizeof(ti);
@@ -421,9 +434,8 @@ const wchar_t* CTopListWindow::MetricTitle() const {
     case MetricKind::DiskIo: return TR(L"磁盘 IO");
     case MetricKind::Gpu: return TR(L"GPU");
     case MetricKind::Vram: return TR(L"显存");
-    case MetricKind::CpuP:   // 核型面板（单面板双列，IO 合计同款形态）；
-                             // P/E 还是 X3D/标准由列前缀区分（§0 拍板）
-        return TR(L"核型");
+    // CPU 视图形态自适应（合并方案 §3）：核型分列时列前缀 P核/E核 或
+    // X3D/标准已区分（§0 拍板不统一叫法），标题恒 CPU
     default: return TR(L"CPU");
     }
 }
@@ -602,10 +614,8 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             m_tracking = true;
         }
         m_hovering = true;   // HoverTick over_group 信号（M6 §4.3.2）
-        // 行级 tooltip（核型拆分 §5）：CPU/核型视图的行 P/E 明细
-        if (!m_preview && (m_kind == MetricKind::Cpu
-                           || m_kind == MetricKind::CpuP
-                           || m_kind == MetricKind::CpuE)) {
+        // 行级 tooltip（合并方案）：CPU 视图的行 P/E 明细
+        if (!m_preview && m_kind == MetricKind::Cpu) {
             POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
             UpdateRowTooltip(pt);
         }
@@ -721,17 +731,14 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         int id = LOWORD(wp);
         if (id >= 100 && id <= 199) {
-            // 指标切换菜单（异构机器追加核型一枚，§5：id 105=CpuP 核型面板；
-            // CpuE 已并入 CpuP 双列呈现，不再单独成视图）
+            // 指标切换菜单（CPU 视图合并后 5 枚：核型分列并入 CPU 视图
+            // 形态自适应，2026-11-09 合并方案；id 105 退役）
             static const MetricKind kinds[] = {
                 MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
-                MetricKind::Gpu, MetricKind::Vram, MetricKind::CpuP
+                MetricKind::Gpu, MetricKind::Vram
             };
             int sel = id - 100;
-            // 同构机器核型不在菜单（BuildContextMenu 不放出），此防御
-            // 挡手改配置/消息注入
-            int max_sel = CProcessTopPlugin::Instance().CoreClass().heterogeneous ? 6 : 5;
-            if (sel >= 0 && sel < max_sel) SetKind(kinds[sel]);
+            if (sel >= 0 && sel < 5) SetKind(kinds[sel]);
         } else if (id >= 200 && id <= 202) {
             m_io_view = id - 200;
             m_cfg.io_view = m_io_view;
@@ -759,17 +766,16 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             }
             RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
-        } else if (id >= 320 && id <= 325) {
+        } else if (id >= 320 && id <= 324) {
             // 添加窗口（M6 §4.6）：kind 映射 320..324 → Cpu/Mem/DiskIo/
-            // Gpu/Vram，异构追加 325 → CpuP 核型面板（§5 同款条件）；
-            // 当前单窗且窗数将 >1 → 自动进入多窗；组可见时
-            // 重排全组让新窗上屏
-            static const int kinds[] = { 0, 1, 2, 5, 6, (int)MetricKind::CpuP };
+            // Gpu/Vram（CPU 视图合并后 325 核型退役，异构机 CPU 窗形态
+            // 走 cpu_view 设置）；当前单窗且窗数将 >1 → 自动进入多窗；
+            // 组可见时重排全组让新窗上屏
+            static const int kinds[] = { 0, 1, 2, 5, 6 };
             auto& plugin = CProcessTopPlugin::Instance();
             auto& mgr = WindowManager::Instance();
             int sel = id - 320;
-            int max_sel = plugin.CoreClass().heterogeneous ? 6 : 5;
-            if (sel < 0 || sel >= max_sel) return 0;   // 越界防御（同构机不出 325）
+            if (sel < 0 || sel >= 5) return 0;   // 越界防御
             WindowCfg c;
             c.kind = kinds[sel];
             c.topn = plugin.m_settings.topn;       // 新窗默认行数/视图
@@ -839,12 +845,12 @@ void CTopListWindow::SetKind(MetricKind k) {
 
 void CTopListWindow::CycleKind(int step) {
     // 循环切换（滚轮/头部指标区点击共用，M6 §4.1.2/§4.1.3）；
-    // 异构机器追加核型一枚（§5：循环序同菜单序，同构不含 = 不可达）
+    // 核型分列并入 CPU 视图形态自适应后恒 5 枚（2026-11-09 合并方案）
     static const MetricKind order[] = {
         MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
-        MetricKind::Gpu, MetricKind::Vram, MetricKind::CpuP
+        MetricKind::Gpu, MetricKind::Vram
     };
-    int n = CProcessTopPlugin::Instance().CoreClass().heterogeneous ? 6 : 5;
+    int n = 5;
     int idx = 0;
     for (int i = 0; i < n; i++) if (order[i] == m_kind) idx = i;
     idx = ((idx + step) % n + n) % n;
@@ -866,20 +872,16 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
         bool multi = CProcessTopPlugin::Instance().m_settings.multi_window;
         if (!multi) {
             bool gpu_hidden = (m_gpu_grade == GpuGrade::G3);
-            const auto& cc = CProcessTopPlugin::Instance().CoreClass();
             struct { UINT id; MetricKind kind; const wchar_t* label; bool gray; } kinds[] = {
                 { 100, MetricKind::Cpu, L"CPU", false },
                 { 101, MetricKind::Mem, L"内存", false },
                 { 102, MetricKind::DiskIo, L"磁盘 IO", false },
                 { 103, MetricKind::Gpu, L"GPU", gpu_hidden },
                 { 104, MetricKind::Vram, L"显存", gpu_hidden },
-                // 核型一枚（§5，单面板双列）：异构机器才有；列前缀
-                // P核/E核 还是 X3D/标准 由分类表定（§0 拍板不统一叫法）
-                { 105, MetricKind::CpuP, L"核型", false },
+                // 核型分列已并入 CPU 视图形态自适应（2026-11-09 合并
+                // 方案）：105「核型」退役，异构机 CPU 窗由设置切换形态
             };
-            int n_kinds = cc.heterogeneous ? 6 : 5;
-            for (int i = 0; i < n_kinds; i++) {
-                auto& k = kinds[i];
+            for (auto& k : kinds) {
                 UINT flags = MF_STRING;
                 if (k.kind == m_kind) flags |= MF_CHECKED;
                 if (k.gray) flags |= MF_GRAYED;
@@ -942,7 +944,6 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
         {
             auto& mgr = WindowManager::Instance();
             bool full = mgr.Count() >= CTopListWindow::MAX_WINDOWS;
-            const auto& cc = CProcessTopPlugin::Instance().CoreClass();
             HMENU sub_add = CreatePopupMenu();
             struct { UINT id; const wchar_t* label; } adds[] = {
                 { 320, L"CPU" },
@@ -950,13 +951,11 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
                 { 322, L"磁盘 IO" },
                 { 323, L"GPU" },
                 { 324, L"显存" },
-                // 核型一枚（§5 同款条件，单面板双列）：异构机器才有
-                { 325, L"核型" },
+                // 核型分列已并入 CPU 视图（2026-11-09 合并方案）：325 退役
             };
-            int n_adds = cc.heterogeneous ? 6 : 5;
-            for (int i = 0; i < n_adds; i++)
+            for (auto& a : adds)
                 AppendMenuW(sub_add, MF_STRING | (full ? MF_GRAYED : 0),
-                            adds[i].id, TR(adds[i].label));
+                            a.id, TR(a.label));
             AppendMenuW(menu, MF_POPUP | (full ? MF_GRAYED : 0),
                         (UINT_PTR)sub_add, TR(L"添加窗口"));
         }
@@ -1619,11 +1618,13 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     }
     case MetricKind::Gpu: view = &snap.gpu; break;
     case MetricKind::Vram: view = &snap.vram; break;
-    // 核型面板：行集走 cpu_pe（max(P,E) 合计排序），双列值由行内
-    // passthrough（cpu_p_pct/cpu_e_pct）带出
-    case MetricKind::CpuP: view = &snap.cpu_pe; break;
-    case MetricKind::CpuE: view = &snap.cpu_e; break;   // 已撤出 UI，防御保留
-    default: view = &snap.cpu; break;
+    // CPU 视图形态自适应（合并方案 §3）：核型分列时行集走 cpu_pe
+    // （max(P,E) 排序，双列值由行内 passthrough 带出）；否则纯总量行
+    // （NtQSI 口径恒可用——含 D2 回退：想要核型但数据无效落这里）
+    // 残留 kind=7/8（Clamp 已归 0，防御）同落纯总量
+    default:
+        view = SplitDisplayActive() ? &snap.cpu_pe : &snap.cpu;
+        break;
     }
     m_rows = view->rows;
     // 每窗行数：视图按最大 15 行供数（多窗共享快照），本窗按 cfg.topn 截断
@@ -1642,9 +1643,9 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
                                    ? m_vram_sys_ded + m_vram_sys_shared
                                    : m_vram_sys_ded);
         break;
-    // 摘要 = 该核群自身容量占用率（§4.5；窗口看哪个核型就摘哪个核群）
-    case MetricKind::CpuP: m_summary_value = m_cpu_p_total; break;
-    case MetricKind::CpuE: m_summary_value = m_cpu_e_total; break;
+    // CPU 视图：核型分列时摘要恒走总量值（DrawSummary 的双列并排分支
+    // 直接读 m_cpu_p_total/m_cpu_e_total，不取 m_summary_value——值仅作
+    // D2 回退态的落点：数据无效回落总量百分比）
     default: m_summary_value = snap.cpu_total_pct; break;
     }
 }
@@ -1770,7 +1771,9 @@ void CTopListWindow::LoadDemoSnapshot(int kind) {
         m_rows[i].cpu_e_pct = m_rows[i].value * 0.2;
     }
     m_rows_has_value = true;
-    // summary 值与 ApplySnapshotForCurrentView 同源逻辑（示例值）
+    // summary 值与 ApplySnapshotForCurrentView 同源逻辑（示例值）；
+    // CPU 视图核型分列的并排摘要由 DrawSummary 直接读 m_cpu_p_total/
+    // m_cpu_e_total，m_summary_value 仅作纯总量落点
     switch (m_kind) {
     case MetricKind::Mem: m_summary_value = (double)m_mem_used; break;
     case MetricKind::DiskIo:
@@ -1781,8 +1784,6 @@ void CTopListWindow::LoadDemoSnapshot(int kind) {
                                    ? m_vram_sys_ded + m_vram_sys_shared
                                    : m_vram_sys_ded);
         break;
-    case MetricKind::CpuP: m_summary_value = m_cpu_p_total; break;
-    case MetricKind::CpuE: m_summary_value = m_cpu_e_total; break;
     default: m_summary_value = m_cpu_total; break;
     }
     m_dirty_sig.clear();   // 预览不走 UpdateFromSnapshot；清指纹防误比对
@@ -1861,6 +1862,19 @@ void CTopListWindow::Reposition() {
 // layout & draw
 // ============================================================
 
+bool CTopListWindow::SplitWanted() const {
+    // 用户意图（合并方案 D1/D4）：异构机器 + 设置「核型分列」。
+    // 同构机恒 false（形态恒纯 CPU，设置项也不创建）；强制「仅总量」
+    // 时 ETW 采样通道不启（plugin_main 按同款条件判定绑定位集），
+    // split_valid 随之恒 false，形态自然回落——两处条件保持一致
+    return CProcessTopPlugin::Instance().CoreClass().heterogeneous
+        && CProcessTopPlugin::Instance().m_settings.cpu_view == 1;
+}
+
+bool CTopListWindow::SplitDisplayActive() const {
+    return SplitWanted() && m_cpu_split_valid;
+}
+
 void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
     count = 0;
     if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C)
@@ -1873,18 +1887,17 @@ void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
     if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G3 &&
         !m_gpu_reason.empty())
         out[count++] = ToneGpuHidden;
-    // 核型列不可用（§6）：异构机器上会话 C 档/窗口不完整——与 IO 警示
-    // 同视觉语言，不显示假 0（sample_valid=false → 视图 has_value=false，
-    // 行区 hint「等待首次采样」之外再给原因行）
-    if ((m_kind == MetricKind::CpuP || m_kind == MetricKind::CpuE)
-        && !m_cpu_split_valid)
+    // 核型明细不可用（合并方案 D2）：异构机要核型形态但本拍数据无效
+    // （会话 C 档/窗口不完整）——行区已回退纯 CPU 总量（NtQSI 恒可用），
+    // 警示行如实说明缺的是核型明细，不显示假 0
+    if (m_kind == MetricKind::Cpu && SplitWanted() && !m_cpu_split_valid)
         out[count++] = ToneSplitNA;
 }
 
 int CTopListWindow::ValueAreaWidth() const {
-    // 双列值区（IO 合计读+写 / 核型面板 P+E，单面板双列同款加宽）
+    // 双列值区（IO 合计读+写 / CPU 视图核型分列 P+E，单面板双列同款加宽）
     if ((m_kind == MetricKind::DiskIo && m_io_view == 0)
-        || m_kind == MetricKind::CpuP)
+        || (m_kind == MetricKind::Cpu && SplitDisplayActive()))
         return VALUE_AREA_W * 2 + (int)(8 * m_dpi_scale);
     return VALUE_AREA_W;
 }
@@ -1899,10 +1912,10 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     SelectObject(hdc, hOld);
 
     out_w = (int)(BASE_WIDTH * m_dpi_scale);
-    // 窗宽自适应（问题③）：双列视图（IO 合计/核型面板）值区加宽，名字列
-    // 宽度不缩——若值区吃名字列（300px 窗只剩 ~40px）进程名不可读
+    // 窗宽自适应（问题③）：双列视图（IO 合计/CPU 核型分列）值区加宽，
+    // 名字列宽度不缩——若值区吃名字列（300px 窗只剩 ~40px）进程名不可读
     if ((m_kind == MetricKind::DiskIo && m_io_view == 0)
-        || m_kind == MetricKind::CpuP)
+        || (m_kind == MetricKind::Cpu && SplitDisplayActive()))
         out_w += VALUE_AREA_W + (int)(8 * m_dpi_scale);
     out_h = PADDING + HEADER_H + SUMMARY_H
             + status_lines * STATUS_H
@@ -2012,17 +2025,24 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             swprintf_s(text, 160, L"%s", v);
         }
         break;
-    case MetricKind::CpuP: {
-        // 核型面板摘要 = 两核群各自容量占用率并排（§4.5：P 38 读作
-        // P 核群忙 38%；-1 = 无效/采样未就绪 → --）
-        const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
-        const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
-        if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0)
-            swprintf_s(text, 160, L"%s %.1f%% · %s %.1f%%", pl, m_cpu_p_total, el, m_cpu_e_total);
-        else
-            wcscpy_s(text, 160, L"--");
+    case MetricKind::Cpu:
+        if (SplitDisplayActive()) {
+            // 核型分列摘要 = 两核群各自容量占用率并排（§4.5：P 38 读作
+            // P 核群忙 38%；-1 = 无效/采样未就绪 → --）
+            const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
+            const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
+            if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0)
+                swprintf_s(text, 160, L"%s %.1f%% · %s %.1f%%", pl, m_cpu_p_total, el, m_cpu_e_total);
+            else
+                wcscpy_s(text, 160, L"--");
+        } else {
+            // 纯总量形态（含 D2 回退：想要核型但数据无效，警示行已说明）
+            if (m_summary_value < 0)
+                swprintf_s(text, 160, L"--");
+            else
+                swprintf_s(text, 160, L"%.1f%%", m_summary_value);
+        }
         break;
-    }
     case MetricKind::Gpu:
         // G3（Win7/无 GPU）：维度隐藏，摘要回落宿主整机值（方案 §2.4 G3 行）
         if (m_gpu_grade == GpuGrade::G3 && m_tm_gpu_usage >= 0)
@@ -2134,11 +2154,11 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
     DrawTextW(hdc, name.c_str(), -1, &rc_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     // 4) 数值（右对齐 accent；双列视图 文字前缀——问题③，2026-11-06
-    //    反馈箭头 ↓↑ 分不清方向后改文字前缀；核型面板 P/E 双列同款
-    //    （2026-11-09 反馈：单面板双列，IO 合计同形态），列标签随
-    //    分类表（§0 拍板：Intel P核/E核、AMD X3D/标准））
+    //    反馈箭头 ↓↑ 分不清方向后改文字前缀；CPU 视图核型分列 P/E
+    //    双列同款（IO 合计同形态），列标签随分类表（§0 拍板：Intel
+    //    P核/E核、AMD X3D/标准））
     SetTextColor(hdc, GetAccentColor());
-    if (m_rows_has_value && m_kind == MetricKind::CpuP) {
+    if (m_rows_has_value && m_kind == MetricKind::Cpu && SplitDisplayActive()) {
         const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
         const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
         wchar_t pv[48], ev[48];

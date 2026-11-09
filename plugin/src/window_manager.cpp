@@ -676,10 +676,10 @@ void WindowManager::RefreshAll(const MetricsSnapshot& snap, bool snap_valid,
             break;
         case MetricKind::Gpu: view = &snap.gpu; break;
         case MetricKind::Vram: view = &snap.vram; break;
-        // 核型面板（单面板双列，IO 合计同款）：排序走 cpu_pe（max(P,E)
-        // 合计键），行内双列值由 TopRow passthrough 带出
-        case MetricKind::CpuP: view = &snap.cpu_pe; break;
-        case MetricKind::CpuE: view = &snap.cpu_e; break;   // 已撤出 UI（加载钳 8→7），数据层防御保留
+        // CPU 视图形态自适应（合并方案 §3）：first_tick 首拍强制重绘只看
+        // 纯总量视图；核型分列形态的实际有效性（cpu_pe.has_value）由窗口
+        // 自身的 m_rows_has_value 兜底（changed 含 !m_rows_has_value）。
+        // kind 7/8 已退役（Clamp 归 0，防御落 default 纯总量）
         default: view = &snap.cpu; break;
         }
         bool first_tick = !view || !view->has_value;
