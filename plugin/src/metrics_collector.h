@@ -143,6 +143,12 @@ private:
         SIZE_T ReadTransferCount;
         SIZE_T WriteTransferCount;
         SIZE_T OtherTransferCount;
+        // 尾部对齐（2026-11-09 实测）：官方 sizeof(SYSTEM_PROCESS_INFORMATION)
+        // x64 = 256，上面字段到 248；线程数组紧跟结构（起点 = 结构+256）。
+        // 没有这 8 字节时尾部线程数组的 tid 解析整体错位（归因全 unknown，
+        // tools/cpuprofile_probe/diag_ioffset.cpp 实测定案）。字段偏移本身
+        // 与旧手写完全一致——生产 CPU/内存/IO 读数不受影响
+        uint64_t TailPadding = 0;
     };
 #pragma pack(pop)
 
