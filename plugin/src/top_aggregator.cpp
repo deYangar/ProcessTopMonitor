@@ -30,7 +30,7 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     out.cpu.rows.clear(); out.mem.rows.clear();
     out.io.rows.clear(); out.io_read.rows.clear(); out.io_write.rows.clear();
     out.gpu.rows.clear(); out.vram.rows.clear();
-    out.cpu_p.rows.clear(); out.cpu_e.rows.clear();
+    out.cpu_p.rows.clear(); out.cpu_e.rows.clear(); out.cpu_pe.rows.clear();
     out.cpu_total_pct = m.cpu_total_pct;
     out.mem_total = m.mem_total;
     out.mem_used = m.mem_used;
@@ -263,6 +263,11 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     fill(out.cpu, [](const Acc* a) { return a->cpu; }, has_delta, split_aux);
     fill(out.cpu_p, [](const Acc* a) { return a->cpu_p; }, split_valid, split_aux);
     fill(out.cpu_e, [](const Acc* a) { return a->cpu_e; }, split_valid, split_aux);
+    // 核型面板视图（单面板双列）：排序键 max(P,E)——IO 合计 max(r,w)
+    // 同款语义（纯 E 群大户不被 P+E 合计里的 P 大户淹没），行内 P/E
+    // 双列值由 split_aux passthrough 带出
+    fill(out.cpu_pe, [](const Acc* a) { return std::max(a->cpu_p, a->cpu_e); },
+         split_valid, split_aux);
     fill(out.mem, [](const Acc* a) { return (double)a->mem; }, true, no_aux);
     // 合计视图（问题③）：排序键 = max(read, write)——纯读/纯写大户不被
     // 双边合计淹没，与「读写分开显示」的意图自洽；r/w 拆分随行带出供

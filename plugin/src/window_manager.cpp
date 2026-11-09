@@ -676,8 +676,10 @@ void WindowManager::RefreshAll(const MetricsSnapshot& snap, bool snap_valid,
             break;
         case MetricKind::Gpu: view = &snap.gpu; break;
         case MetricKind::Vram: view = &snap.vram; break;
-        case MetricKind::CpuP: view = &snap.cpu_p; break;
-        case MetricKind::CpuE: view = &snap.cpu_e; break;
+        // 核型面板（单面板双列，IO 合计同款）：排序走 cpu_pe（max(P,E)
+        // 合计键），行内双列值由 TopRow passthrough 带出
+        case MetricKind::CpuP: view = &snap.cpu_pe; break;
+        case MetricKind::CpuE: view = &snap.cpu_e; break;   // 已撤出 UI（加载钳 8→7），数据层防御保留
         default: view = &snap.cpu; break;
         }
         bool first_tick = !view || !view->has_value;

@@ -19,11 +19,12 @@
 // 注意：kind 存 MetricKind 原始 int 值（枚举含 DiskRead=3/DiskWrite=4
 // 占位，Gpu=5、Vram=6，核型拆分新增 CpuP=7/CpuE=8（2026-11-09，仅异构
 // 机器实际可用；同构机器上由 InitOnce 矫正回 0，无迁移——旧配置不含
-// 新值，新值仅在用户选择后写入）。
+// 新值，新值仅在用户选择后写入。同日拍板改单面板双列：CpuE=8
+// 撤出 UI，P/E 两列并入 CpuP=7 一枚呈现；老配置存过 8 的加载时归 7）。
 // x/y 语义（M6 §3.1）：仅常驻/pin 态使用的「拖过的位置记忆」；
 // INT_MIN=未拖过（常驻态用组布局，hover 态忽略）
 struct WindowCfg {
-    int kind = 0;          // MetricKind as int（0=Cpu 1=Mem 2=DiskIo 5=Gpu 6=Vram 7=CpuP 8=CpuE）
+    int kind = 0;          // MetricKind as int（0=Cpu 1=Mem 2=DiskIo 5=Gpu 6=Vram 7=CpuP 核型面板；8=CpuE 已并入 7）
     int io_view = 0;       // 0=combined 1=read 2=write（仅 kind==2 有意义）
     int topn = 10;         // 5/10/15
     int x = INT_MIN;       // INT_MIN = 未拖过
@@ -71,9 +72,11 @@ struct PtSettings {
         if (lang.empty()) lang = L"auto";
         // v3 三新键（M6 §3.2）
         if (popup_mode != 0 && popup_mode != 1) popup_mode = 0;
+        // CpuE(8) 已并入 CpuP(7) 单面板双列（2026-11-09）：老配置若存过
+        // 8，加载时归一到 7——双列面板两列都有，无信息损失
+        if (default_metric == 8) default_metric = 7;
         if (default_metric != 0 && default_metric != 1 && default_metric != 2 &&
-            default_metric != 5 && default_metric != 6 &&
-            default_metric != 7 && default_metric != 8)
+            default_metric != 5 && default_metric != 6 && default_metric != 7)
             default_metric = 0;   // 非法（含 3/4 占位）→ CPU
         // windows[]：数量钳到上限，每行字段钳域（手改 settings.json 防砖）。
         // 单窗模式窗数收敛到 ≤1（多窗切回单窗保留第一窗）；空列表合法
@@ -81,8 +84,9 @@ struct PtSettings {
         if (windows.size() > 6) windows.resize(6);
         if (!multi_window && windows.size() > 1) windows.resize(1);
         for (auto& c : windows) {
+            if (c.kind == 8) c.kind = 7;   // CpuE 并入 CpuP 双列，同上归一
             if (c.kind != 0 && c.kind != 1 && c.kind != 2 && c.kind != 5 &&
-                c.kind != 6 && c.kind != 7 && c.kind != 8)
+                c.kind != 6 && c.kind != 7)
                 c.kind = 0;   // 3/4 是 DiskRead/DiskWrite 占位，不进配置
             if (c.io_view < 0 || c.io_view > 2) c.io_view = 0;
             if (c.topn != 5 && c.topn != 10 && c.topn != 15) c.topn = 10;

@@ -40,9 +40,12 @@ struct MetricView {
 
 struct MetricsSnapshot {
     MetricView cpu, mem, io, io_read, io_write, gpu, vram;
-    // 核型拆分两视图（§5 top_aggregator.h 行）：异构机器上随快照构建，
-    // 同构机器恒 has_value=false（窗口列表不含 = 不可选）
-    MetricView cpu_p, cpu_e;
+    // 核型拆分视图（§5）：异构机器上随快照构建，同构机器恒
+    // has_value=false（窗口列表不含 = 不可选）。cpu_pe = 核型面板
+    // （单面板双列，IO 合计视图同款形态，2026-11-09 反馈定稿）：
+    // 排序键 max(P,E)（IO 合计 max(r,w) 同款语义——纯单核群大户不被
+    // 合计淹没），行内双列值走 TopRow passthrough（cpu_p_pct/cpu_e_pct）
+    MetricView cpu_p, cpu_e, cpu_pe;
     // 标题栏摘要
     double cpu_total_pct = -1;
     uint64_t mem_total = 0, mem_used = 0;

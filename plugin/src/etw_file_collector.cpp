@@ -492,10 +492,13 @@ void EtwFileCollector::ConsumerLoop() {
         m_acc.clear();
         m_acc_sample.clear();
         m_sample_total_acc = 0;
-        if (m_ccm && m_ccm->heterogeneous && m_ccm->total_lp > 0)
+        if (m_ccm && m_ccm->heterogeneous && m_ccm->total_lp > 0) {
             m_cur_tid.assign((size_t)m_ccm->total_lp, 0);
-        else
+            m_last_sw_t.assign((size_t)m_ccm->total_lp, 0);   // 0 = 无区间起点
+        } else {
             m_cur_tid.clear();
+            m_last_sw_t.clear();
+        }
         {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
@@ -572,52 +575,68 @@ void EtwFileCollector::DoHandoffLocked() {
 }
 
 void EtwFileCollector::OnSampleOrSwitch(PEVENT_RECORD rec) {
-    // consumer thread only（核型样本通道，§4.2 探针定案口径）。
-    // SampledProfile 事件头无归因（pid/tid 恒 0xFFFFFFFF，v3-v5 实证）：
-    // 归因 = CSwitch 重建每核 current_tid → tid→pid 表。
+    // consumer thread only（核型时间账通道，§4.2 探针定案 + 2026-11-09
+    // 实测口径修正）。归因状态机沿 §4.2 定案：CSwitch 流重建每核
+    // current_tid → tid→pid 表；计量从「SampledProfile 计数」改为
+    // 「CSwitch 区间时间账」：switch(t, core, new_tid) 结算
+    // [上次switch, t) 时长给旧 current_tid 对应 pid——调度器时间账
+    // （NtQSI 同源），忙闲核无采样密度失真（实测样本计数口径下
+    // pin_load 占比 95% vs 时钟口径 25%，闲核深 C-state timer 压缩）。
     const auto& h = rec->EventHeader;
+    // SampledProfile（新 GUID op46）：不再计量（时间账由 CSwitch 全权），
+    // 识别保留——flags 里的 PROFILE 事件到此静默丢弃（摘 flag 列为后续
+    // 优化，避免本窗口动会话参数）
+    if (h.EventDescriptor.Opcode == kOpSampleProfile) return;
+    if (h.EventDescriptor.Opcode != kOpCSwitch
+        || h.ProviderId.Data1 != kPerfInfoOldGuid.Data1)
+        return;
+
     uint32_t core = rec->BufferContext.ProcessorIndex;
     // >255 LP：EVENT_HEADER_EXT_TYPE_PROCESSOR_INDEX 扩展项防御分支
     //（消费级远不及；UCHAR 越界即丢弃，§9 风险表）
     if (core >= m_cur_tid.size()) { m_ev_short++; return; }
+    // CSwitch payload: NewThreadId[4] OldThreadId[4] …（TDH schema 固定头）
+    if (rec->UserDataLength < 8) { m_ev_short++; return; }
 
-    if (h.EventDescriptor.Opcode == kOpCSwitch
-        && h.ProviderId.Data1 == kPerfInfoOldGuid.Data1) {
-        // CSwitch payload: NewThreadId[4] OldThreadId[4] …（TDH schema 固定头）
-        if (rec->UserDataLength >= 8) {
-            uint32_t nt, ot;
-            memcpy(&nt, (BYTE*)rec->UserData, 4);
-            memcpy(&ot, (BYTE*)rec->UserData + 4, 4);
-            // 状态机自愈：old != current（丢包/会话起点中途）时直接覆盖
-            m_cur_tid[core] = nt;
-            (void)ot;
+    // 结算旧区间 [m_last_sw_t[core], t) → 旧 current_tid 的核群时间账
+    uint64_t t = (uint64_t)h.TimeStamp.QuadPart;   // 100ns ticks，单调
+    uint64_t last = m_last_sw_t[core];
+    if (last && t > last) {
+        uint64_t dt = t - last;
+        m_sample_total_acc += dt;               // 全部核时间进分母（含 Idle/System/unknown）
+        uint32_t tid = m_cur_tid[core];
+        if (tid && tid != 0xFFFFFFFF) {
+            // 低频换表（tick 每 ~500ms 供新表；dirty 检查 ~1ns/事件）
+            if (m_table_dirty.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(m_table_mutex);
+                m_table_local = m_table_new;
+                m_table_dirty.store(false, std::memory_order_release);
+            }
+            if (m_table_local && core < m_ccm->lp.size()) {
+                auto it = m_table_local->find(tid);
+                if (it != m_table_local->end()) {
+                    DWORD pid = it->second;
+                    if (pid != 0 && pid != 4) {  // Idle/System：留分母不进 per-pid
+                        switch (m_ccm->lp[core]) {
+                        case CoreClass::P:
+                        case CoreClass::VCache: m_acc_sample[pid].p += dt; break;
+                        case CoreClass::E:
+                        case CoreClass::StdCcd: m_acc_sample[pid].e += dt; break;
+                        default: break;          // Homog/未知核：留分母
+                        }
+                    }
+                }
+                // unknown tid（新建线程）：时间留分母（≤1 tick 归因延迟的
+                // 时间版——首个 switch 前的区间记不到新线程头上，量级同）
+            }
         }
-        return;
     }
-    if (h.EventDescriptor.Opcode != kOpSampleProfile) return;   // 其它 PerfInfo 事件忽略
 
-    m_sample_total_acc++;                       // 全部样本进分母（含 Idle/System）
-    uint32_t tid = m_cur_tid[core];
-    if (!tid || tid == 0xFFFFFFFF) return;      // 无上下文：留分母不归因
-    // 低频换表（tick 每 ~500ms 供新表；dirty 检查 ~1ns/事件）
-    if (m_table_dirty.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lk(m_table_mutex);
-        m_table_local = m_table_new;
-        m_table_dirty.store(false, std::memory_order_release);
-    }
-    if (!m_table_local) return;
-    auto it = m_table_local->find(tid);
-    if (it == m_table_local->end()) return;     // unknown tid（新建线程）：留分母
-    DWORD pid = it->second;
-    if (pid == 0 || pid == 4) return;           // Idle/System：留分母不进 per-pid
-    if (core >= m_ccm->lp.size()) return;       // 防御（同 m_cur_tid 已查）
-    switch (m_ccm->lp[core]) {
-    case CoreClass::P:
-    case CoreClass::VCache: m_acc_sample[pid].p++; break;
-    case CoreClass::E:
-    case CoreClass::StdCcd: m_acc_sample[pid].e++; break;
-    default: break;                             // Homog/未知核：留分母
-    }
+    // 推进状态机：新区间从本事件起算，归属 new_tid
+    uint32_t nt;
+    memcpy(&nt, (BYTE*)rec->UserData, 4);
+    m_cur_tid[core] = nt;   // 状态机自愈：old != current（丢包/中途起会话）时直接覆盖
+    m_last_sw_t[core] = t;
 }
 
 void WINAPI EtwFileCollector::EventCallback(PEVENT_RECORD rec) {
@@ -773,6 +792,32 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
                         (unsigned)out.per_pid.size(),
                         (unsigned long long)min_window_us);
                 m_log_was_valid = out.valid;
+            }
+            // 核型时间账通道节流日志（§4.4 验证证据，debug_logs 开时每 5s
+            // 一条）：全量核时间 + 占比 ≥0.5% 的 pid 明细（≤5 条）——实机
+            // 对账/远期排查用，锁屏等无屏场景也能数据层核账（us = ticks/10）
+            if (s_debug_logs.load() && out.sample_total > 0) {
+                ULONGLONG now = GetTickCount64();
+                if (now - m_log_sample_tick >= 5000) {
+                    m_log_sample_tick = now;
+                    LogLine(L"coretime window: total=%lluticks(%.2f core-seconds) pids=%u valid=%d",
+                            (unsigned long long)out.sample_total,
+                            (double)out.sample_total / 10000000.0,
+                            (unsigned)out.sample_pid.size(),
+                            (int)out.sample_valid);
+                    int n = 0;
+                    for (auto& kv : out.sample_pid) {
+                        if (kv.second.first + kv.second.second < out.sample_total / 200)
+                            continue;   // <0.5% 的杂项不打
+                        LogLine(L"  coretime pid=%u p=%llu e=%llu (%.1f%% of total)",
+                                kv.first,
+                                (unsigned long long)kv.second.first,
+                                (unsigned long long)kv.second.second,
+                                100.0 * (double)(kv.second.first + kv.second.second)
+                                    / (double)out.sample_total);
+                        if (++n >= 5) break;
+                    }
+                }
             }
             QueryEventsLost();
             out.events_lost = m_events_lost;

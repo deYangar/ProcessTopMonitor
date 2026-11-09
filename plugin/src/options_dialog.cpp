@@ -444,17 +444,14 @@ void PtCreateControls(HWND hwnd) {
         PtFont(c8);
         PtFont(PtLabel(hwnd, TR(L"默认指标"), M + Sc(220), iy + Sc(4), Sc(60), Sc(20)));
         HWND c9 = PtCombo(hwnd, IDC_DEFMETRIC_CBO, M + Sc(290), iy, Sc(110));
-        const int dmk[] = { 0, 1, 2, 5, 6, 7, 8 };   // MetricKind 原值（itemdata）
+        const int dmk[] = { 0, 1, 2, 5, 6, 7 };   // MetricKind 原值（itemdata）
         const wchar_t* dmt[] = { L"CPU", L"内存", L"磁盘 IO", L"GPU", L"显存",
-                                 L"P核", L"E核" };
-        // 核型两枚（§5）：异构机器条件追加；标签风格随分类表（x3d）
+                                 L"核型" };
+        // 核型一枚（§5，单面板双列）：异构机器条件追加
         const auto& cc = plugin.CoreClass();
-        int n_dm = cc.heterogeneous ? 7 : 5;
-        const wchar_t* dm7 = cc.x3d_style ? L"X3D" : L"P核";
-        const wchar_t* dm8 = cc.x3d_style ? L"标准" : L"E核";
+        int n_dm = cc.heterogeneous ? 6 : 5;
         for (int i = 0; i < n_dm; i++) {
-            PtCboAdd(hwnd, IDC_DEFMETRIC_CBO, TR(i >= 5 ? (i == 5 ? dm7 : dm8) : dmt[i]),
-                     dmk[i]);
+            PtCboAdd(hwnd, IDC_DEFMETRIC_CBO, TR(dmt[i]), dmk[i]);
             if (st.default_metric == dmk[i]) SendMessageW(c9, CB_SETCURSEL, i, 0);
         }
         PtFont(c9);

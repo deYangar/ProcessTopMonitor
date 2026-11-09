@@ -67,9 +67,14 @@ public:
     // TakeDelta 起累计，外加会话累计 EventsLost（低频查询）。
     struct IoDelta {
         std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> per_pid; // pid -> (read,write)
-        // ---- 核型样本通道（方案 §4.4，与 IO 同一窗口、同一 handoff 序列）----
-        std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> sample_pid; // pid -> (P样本,E样本)
-        uint64_t sample_total = 0;      // 全部样本（校准分母，含 Idle/System/unknown）
+        // ---- 核型时间账通道（§4.2 定案 + 2026-11-09 实测口径修正，与 IO
+        // 同一窗口、同一 handoff 序列）----
+        // sample_pid: pid -> (P核群时间, E核群时间)，单位 100ns ticks
+        // （CSwitch 区间账单，非样本计数——实测闲核深 C-state 下
+        // SampledProfile 密度暴跌，样本占比≠容量占比，95% vs 25% 背离；
+        // CSwitch 时间戳结算的调度器时间账 = NtQSI 同源口径，无此失真）
+        std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> sample_pid;
+        uint64_t sample_total = 0;      // 全部核时间 ticks（校准分母，含 Idle/System/unknown）
         bool sample_valid = false;      // 异构且交付窗口完整才置 true
         uint64_t events_lost = 0;
         // 本次交付覆盖的真实窗口长度（上次被消费的 handoff → 本次 handoff，
@@ -190,10 +195,15 @@ private:
     // payload pointer width: kernel bitness, resolved once at Start()
     int m_ptr_size = 8;
 
-    // ---- 核型样本通道（§4.2/§4.4）----
+    // ---- 核型时间账通道（§4.2/§4.4；2026-11-09 口径修正：CSwitch 区间
+    // 时间账取代 SampledProfile 计数——闲核深 C-state 下 timer 压缩使
+    // 样本密度暴跌，样本占比≠容量占比（实测 95% vs 25%）；switch 区间
+    // [t_in, t_out) 结算给对应 pid = 调度器时间账，NtQSI 同源无失真）----
     const CoreClassMap* m_ccm = nullptr;   // Start 前注入（弱引用）
     std::vector<uint32_t> m_cur_tid;       // 每核 current_tid（消费者私有，
                                            // CSwitch 重建态；会话重建时清零）
+    std::vector<uint64_t> m_last_sw_t;     // 每核上次 switch 时间戳（100ns，
+                                           // 0 = 尚无（会话起点前的区间不结算））
     // tid→pid 表：tick 写 / 消费者低频换入（dirty + mutex 瞬持，热路径零锁）
     std::mutex m_table_mutex;
     std::shared_ptr<const ThreadTable> m_table_new;    // tick 最新供给
@@ -204,4 +214,5 @@ private:
     uint64_t m_ev_seen = 0, m_ev_kept = 0, m_ev_short = 0;
     bool m_log_was_valid = false;   // 上次 TakeDelta 的接管态（转换点日志用，
                                     // tick 线程私有）；会话重启时重置
+    ULONGLONG m_log_sample_tick = 0; // 核型样本节流日志的上次时间戳（5s 一条）
 };
