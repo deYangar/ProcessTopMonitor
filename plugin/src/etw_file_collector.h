@@ -150,6 +150,14 @@ private:
     void SetStatus(FileIoGrade g, const wchar_t* why);
     void LogLine(const wchar_t* fmt, ...);
     void QueryEventsLost();
+    // 闲机 handoff 治本（2026-11-09 发现）：深 C-state 闲机上 timer 类
+    // 内核事件（SampledProfile/CSwitch）近乎停摆，缓冲填不满也不按
+    // FlushTimer 空转 → BufferCallback 停摆 → TakeDelta 百 ms 等待超时
+    //（10-25 实测的「BufferCallback 每 1s 必火、零事件也火」在 26300
+    // 构建的闲机上不再成立，忙机一直掩盖）。tick 线程在等待过半时主动
+    // FLUSH 会话逼出半满缓冲，交付模型不再依赖事件自发洪峰。与
+    // QueryEventsLost 同款跨线程 ControlTrace（已有先例）
+    void FlushForHandoff();
     void OnSampleOrSwitch(PEVENT_RECORD rec);   // 核型样本/CSwitch 通道（§4.2）
 
     static EtwFileCollector* s_self;

@@ -728,8 +728,27 @@ void EtwFileCollector::QueryEventsLost() {
     if (rc == ERROR_SUCCESS) m_events_lost = p->EventsLost;
 }
 
-void EtwFileCollector::UpdateThreadTable(std::shared_ptr<const ThreadTable> tbl) {
-    // tick 线程（每拍）：换新表 + 置 dirty。消费者在下一事件回调的低频
+void EtwFileCollector::FlushForHandoff() {
+    // 闲机 handoff 治本（2026-11-09）：take_req 等待过半仍无 handoff =
+    // 消费侧零回调（缓冲填不满 + FlushTimer 不空转）。主动 FLUSH 把
+    // 半满缓冲交给消费线程，BufferCallback 随之触发并服务 pending 的
+    // take_req。失败无需处理（会话将死/权限变化时下一轮重试自然兜住，
+    // 与 QueryEventsLost 同语义）。B 档走会话名 FLUSH（NT Kernel
+    // Logger 无自有句柄）
+    if (m_own_session_handle) {
+        BYTE fbuf[sizeof(EVENT_TRACE_PROPERTIES) + 64] = {};
+        auto* p = (EVENT_TRACE_PROPERTIES*)fbuf;
+        p->Wnode.BufferSize = sizeof(fbuf);
+        ControlTraceW(m_own_session_handle, nullptr, p, EVENT_TRACE_CONTROL_FLUSH);
+    } else if (m_using_kernel_logger) {
+        BYTE fbuf[sizeof(EVENT_TRACE_PROPERTIES) + 64] = {};
+        auto* p = (EVENT_TRACE_PROPERTIES*)fbuf;
+        p->Wnode.BufferSize = sizeof(fbuf);
+        ControlTraceW(0, KERNEL_LOGGER_NAMEW, p, EVENT_TRACE_CONTROL_FLUSH);
+    }
+}
+
+void EtwFileCollector::UpdateThreadTable(std::shared_ptr<const ThreadTable> tbl) {    // tick 线程（每拍）：换新表 + 置 dirty。消费者在下一事件回调的低频
     // 分支里换入（mutex 瞬持，~500ms 一次，热路径零锁）
     {
         std::lock_guard<std::mutex> lk(m_table_mutex);
@@ -753,6 +772,10 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
     // bounded wait for the consumer's handoff (event or buffer callback).
     // ~100ms worst case; the tick cadence is >=250ms so this never overlaps.
     for (int i = 0; i < 100; i++) {
+        // 闲机治本（2026-11-09）：等待 40ms 仍无 handoff = 消费侧零回调
+        //（事件稀疏、缓冲不flush）——主动 FLUSH 逼出半满缓冲，剩余 60ms
+        // 等 BufferCallback 服务请求。忙机事件洪峰下天然早退，不进此分支
+        if (i == 40) FlushForHandoff();
         if (m_take_seq.load(std::memory_order_acquire) != seq0) {
             out.window_us = m_out_window_us;
             out.per_pid.reserve(m_out.size());
