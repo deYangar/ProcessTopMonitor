@@ -676,6 +676,8 @@ void WindowManager::RefreshAll(const MetricsSnapshot& snap, bool snap_valid,
             break;
         case MetricKind::Gpu: view = &snap.gpu; break;
         case MetricKind::Vram: view = &snap.vram; break;
+        case MetricKind::CpuP: view = &snap.cpu_p; break;
+        case MetricKind::CpuE: view = &snap.cpu_e; break;
         default: view = &snap.cpu; break;
         }
         bool first_tick = !view || !view->has_value;

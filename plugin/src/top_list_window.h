@@ -18,6 +18,7 @@
 //     first so no acrylic ghost survives the content window.
 // ============================================================
 #include <windows.h>
+#include <commctrl.h>   // TOOLTIPS_CLASSW（行级 tooltip，核型拆分 §5）
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -125,6 +126,7 @@ private:
         ToneEventsLost,   // 黄：ETW 丢事件
         ToneGpuG2,        // 灰：G2 档无引擎命名说明
         ToneGpuHidden,    // 黄：GPU 维度不可用原因
+        ToneSplitNA,      // 黄：核型列不可用（会话 C 档/窗口不完整，§6）
     };
     void DrawStatusLine(HDC hdc, int w, int y, StatusTone tone);
     // 当前实际显示的状态行清单（布局/绘制/菜单判定共用，保持一致）
@@ -153,6 +155,16 @@ private:
     const wchar_t* MetricTitle() const;
     void BuildContextMenu(POINT pt);
     void RecalcAndRepaint(bool reposition);
+
+    // ---- 行级 tooltip（核型拆分 §5：CPU/CpuP/CpuE 视图行 P/E 明细）----
+    // 手动 TRACK 模式（TTF_TRACK|TTF_ABSOLUTE）：WM_MOUSEMOVE 算命中行并
+    // 更新文本/位置，WM_MOUSELEAVE 收起——不用 TTF_SUBCLASS（layered 窗口
+    // 自管消息，气泡独立顶层窗正常显示）
+    void EnsureRowTooltip();
+    void UpdateRowTooltip(const POINT& client_pt);
+    void HideRowTooltip();
+    HWND m_tip_hwnd = nullptr;
+    int m_tip_row = -1;                 // 当前 tooltip 挂着的行号（-1 = 无）
 
     // ---- message handling ----
     LRESULT HandleMessage(UINT msg, WPARAM wp, LPARAM lp);
@@ -192,6 +204,11 @@ private:
     int m_tm_gpu_usage = -1;                    // 宿主整机 GPU（G3 摘要兜底）
     // 宿主传感器（M3-3 L0）：0 = TM 未采集 → 摘要行传感器段整体隐藏
     int m_tm_cpu_temp = 0, m_tm_gpu_temp = 0, m_tm_cpu_freq = 0;
+    // 核型拆分（§4.5/§5）：系统级核群占用率（摘要行）+ 通道可用性/标签
+    // 风格（快照同步；同构机器三元组恒初始值 = 相关 UI 不出现）
+    double m_cpu_p_total = -1, m_cpu_e_total = -1;
+    bool m_cpu_split_valid = false;
+    bool m_cpu_split_x3d = false;
     int m_topn = 10;
     int m_io_view = 0;
     int m_color_mode = 0;

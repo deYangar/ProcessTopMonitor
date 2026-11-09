@@ -215,6 +215,11 @@ void CTopListWindow::Destroy() {
     // 穿透的 blur 靠下一拍 ReclaimDead 收尸——最后一窗关闭会先停定时器，
     // blur 滞留桌面成亚克力残影
     DestroyBlurLayer();
+    if (m_tip_hwnd) {
+        DestroyWindow(m_tip_hwnd);
+        m_tip_hwnd = nullptr;
+        m_tip_row = -1;
+    }
     if (m_hwnd && !g_shutting_down) {
         PtSafeDestroyWindow(m_hwnd);
         // m_hwnd 故意保留死句柄不置空：ReclaimDead 用 GetHwnd() &&
@@ -226,6 +231,90 @@ void CTopListWindow::Destroy() {
     // × 语义 = windows[] 删行（配置不保留，方案 §3.2）：标脏等节流落盘
     CProcessTopPlugin::Instance().m_settings_dirty = true;
     WindowManager::Instance().RecomputeBoundMask();
+}
+
+// ============================================================
+// 行级 tooltip（核型拆分 §5：CPU/P核/E核 视图行的 P/E 明细）
+// 手动 TRACK 模式：mousemove 算命中行并重灌文本，离开收起。文本每拍
+// 随 mousemove 刷新（数据更新时 tooltip 跟着新）；位置 = 光标右下。
+// ============================================================
+
+void CTopListWindow::EnsureRowTooltip() {
+    if (m_tip_hwnd || !m_hwnd) return;
+    m_tip_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+                                 TOOLTIPS_CLASSW, nullptr,
+                                 WS_POPUP | TTS_ALWAYSTIP,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, 10, 10,
+                                 m_hwnd, nullptr, m_hinst, nullptr);
+    if (!m_tip_hwnd) return;
+    TOOLINFOW ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_TRACK | TTF_ABSOLUTE | TTF_TRANSPARENT;
+    ti.hwnd = m_hwnd;
+    ti.uId = 1;
+    ti.lpszText = (LPWSTR)L"";
+    SendMessageW(m_tip_hwnd, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    SendMessageW(m_tip_hwnd, TTM_SETMAXTIPWIDTH, 0, 360);
+}
+
+void CTopListWindow::UpdateRowTooltip(const POINT& client_pt) {
+    // 异构机器且通道有效才显示（§5：同构/不可用零侵入）
+    bool split_on = m_cpu_split_valid;
+    bool kind_wants = (m_kind == MetricKind::Cpu && split_on)
+                   || m_kind == MetricKind::CpuP || m_kind == MetricKind::CpuE;
+    if (!kind_wants) { HideRowTooltip(); return; }
+    // 命中行（与 DrawContent 布局一致：PADDING+HEADER+SUMMARY+状态行+行区）
+    StatusTone lines[4];
+    int nlines = 0;
+    ActiveStatusLines(lines, nlines);
+    int rows_top = PADDING + HEADER_H + SUMMARY_H + nlines * STATUS_H;
+    if (client_pt.y < rows_top || m_rows.empty()) { HideRowTooltip(); return; }
+    int row = (client_pt.y - rows_top) / ROW_HEIGHT;
+    if (row < 0 || row >= (int)m_rows.size()) { HideRowTooltip(); return; }
+
+    EnsureRowTooltip();
+    if (!m_tip_hwnd) return;
+
+    // 文本：进程名 + 全机占比（CPU 列口径）+ P/E 明细（行 passthrough）
+    const TopRow& r = m_rows[(size_t)row];
+    std::wstring name = r.name;
+    if (name.size() > 4) {
+        std::wstring ext = name.substr(name.size() - 4);
+        if (ext == L".exe" || ext == L".EXE") name = name.substr(0, name.size() - 4);
+    }
+    wchar_t text[512];
+    if (m_cpu_split_x3d)
+        swprintf_s(text, 512, L"%s\n%s %.1f%%\nX3D %.1f%% · %s %.1f%%",
+                   name.c_str(), TR(L"CPU"), r.value,
+                   r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
+    else
+        swprintf_s(text, 512, L"%s\n%s %.1f%%\n%s %.1f%% · %s %.1f%%",
+                   name.c_str(), TR(L"CPU"), r.value,
+                   TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
+
+    TOOLINFOW ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = m_hwnd;
+    ti.uId = 1;
+    ti.lpszText = text;
+    SendMessageW(m_tip_hwnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+
+    POINT cursor;
+    GetCursorPos(&cursor);
+    SendMessageW(m_tip_hwnd, TTM_TRACKPOSITION, 0,
+                 MAKELPARAM(cursor.x + 16, cursor.y + 18));
+    SendMessageW(m_tip_hwnd, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+    m_tip_row = row;
+}
+
+void CTopListWindow::HideRowTooltip() {
+    if (!m_tip_hwnd || m_tip_row < 0) return;
+    TOOLINFOW ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = m_hwnd;
+    ti.uId = 1;
+    SendMessageW(m_tip_hwnd, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+    m_tip_row = -1;
 }
 
 void CTopListWindow::ApplyCfg(const WindowCfg& c) {
@@ -332,6 +421,11 @@ const wchar_t* CTopListWindow::MetricTitle() const {
     case MetricKind::DiskIo: return TR(L"磁盘 IO");
     case MetricKind::Gpu: return TR(L"GPU");
     case MetricKind::Vram: return TR(L"显存");
+    case MetricKind::CpuP:   // 标签风格按分类表（§0 拍板：Intel P核/E核、
+                             // AMD X3D/标准，不统一叫法）
+        return m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
+    case MetricKind::CpuE:
+        return m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
     default: return TR(L"CPU");
     }
 }
@@ -510,12 +604,20 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             m_tracking = true;
         }
         m_hovering = true;   // HoverTick over_group 信号（M6 §4.3.2）
+        // 行级 tooltip（核型拆分 §5）：CPU/核型视图的行 P/E 明细
+        if (!m_preview && (m_kind == MetricKind::Cpu
+                           || m_kind == MetricKind::CpuP
+                           || m_kind == MetricKind::CpuE)) {
+            POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+            UpdateRowTooltip(pt);
+        }
         return 0;
     }
 
     case WM_MOUSELEAVE:
         m_tracking = false;
         m_hovering = false;
+        HideRowTooltip();
         return 0;
 
     case WM_WINDOWPOSCHANGED: {
@@ -621,13 +723,16 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         int id = LOWORD(wp);
         if (id >= 100 && id <= 199) {
-            // 指标切换菜单
+            // 指标切换菜单（异构机器追加核型两枚，§5：id 105=CpuP 106=CpuE）
             static const MetricKind kinds[] = {
                 MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
-                MetricKind::Gpu, MetricKind::Vram
+                MetricKind::Gpu, MetricKind::Vram, MetricKind::CpuP, MetricKind::CpuE
             };
             int sel = id - 100;
-            if (sel >= 0 && sel < 5) SetKind(kinds[sel]);
+            // 同构机器后两位不在菜单（BuildContextMenu 不放出），此防御
+            // 挡手改配置/消息注入
+            int max_sel = CProcessTopPlugin::Instance().CoreClass().heterogeneous ? 7 : 5;
+            if (sel >= 0 && sel < max_sel) SetKind(kinds[sel]);
         } else if (id >= 200 && id <= 202) {
             m_io_view = id - 200;
             m_cfg.io_view = m_io_view;
@@ -655,15 +760,19 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             }
             RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
-        } else if (id >= 320 && id <= 324) {
+        } else if (id >= 320 && id <= 326) {
             // 添加窗口（M6 §4.6）：kind 映射 320..324 → Cpu/Mem/DiskIo/
-            // Gpu/Vram；当前单窗且窗数将 >1 → 自动进入多窗；组可见时
+            // Gpu/Vram，异构追加 325/326 → CpuP/CpuE（§5 同款条件）；
+            // 当前单窗且窗数将 >1 → 自动进入多窗；组可见时
             // 重排全组让新窗上屏
-            static const int kinds[5] = { 0, 1, 2, 5, 6 };
+            static const int kinds[] = { 0, 1, 2, 5, 6, (int)MetricKind::CpuP, (int)MetricKind::CpuE };
             auto& plugin = CProcessTopPlugin::Instance();
             auto& mgr = WindowManager::Instance();
+            int sel = id - 320;
+            int max_sel = plugin.CoreClass().heterogeneous ? 7 : 5;
+            if (sel < 0 || sel >= max_sel) return 0;   // 越界防御（同构机不出 325/326）
             WindowCfg c;
-            c.kind = kinds[id - 320];
+            c.kind = kinds[sel];
             c.topn = plugin.m_settings.topn;       // 新窗默认行数/视图
             c.io_view = plugin.m_settings.io_view; // （x/y=INT_MIN：组布局摆位）
             if (mgr.AddWindow(c) >= 0) {
@@ -706,6 +815,7 @@ void CTopListWindow::SetKind(MetricKind k) {
     if (k == m_kind) return;
     m_kind = k;
     m_cfg.kind = (int)k;
+    HideRowTooltip();   // 口径变了，行 tooltip 文本立即失效（下次 move 重建）
     // 绑定指标变化 → 重算绑定位集（tick 线程据此按需启停 GPU 采集，
     // 方案 §3.3；cfg 即配置本体，标脏走节流落盘）
     WindowManager::Instance().RecomputeBoundMask();
@@ -729,14 +839,16 @@ void CTopListWindow::SetKind(MetricKind k) {
 }
 
 void CTopListWindow::CycleKind(int step) {
-    // 循环切换（滚轮/头部指标区点击共用，M6 §4.1.2/§4.1.3）
+    // 循环切换（滚轮/头部指标区点击共用，M6 §4.1.2/§4.1.3）；
+    // 异构机器追加核型两枚（§5：循环序同菜单序，同构不含 = 不可达）
     static const MetricKind order[] = {
         MetricKind::Cpu, MetricKind::Mem, MetricKind::DiskIo,
-        MetricKind::Gpu, MetricKind::Vram
+        MetricKind::Gpu, MetricKind::Vram, MetricKind::CpuP, MetricKind::CpuE
     };
+    int n = CProcessTopPlugin::Instance().CoreClass().heterogeneous ? 7 : 5;
     int idx = 0;
-    for (int i = 0; i < 5; i++) if (order[i] == m_kind) idx = i;
-    idx = ((idx + step) % 5 + 5) % 5;
+    for (int i = 0; i < n; i++) if (order[i] == m_kind) idx = i;
+    idx = ((idx + step) % n + n) % n;
     SetKind(order[idx]);
 }
 
@@ -755,14 +867,20 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
         bool multi = CProcessTopPlugin::Instance().m_settings.multi_window;
         if (!multi) {
             bool gpu_hidden = (m_gpu_grade == GpuGrade::G3);
+            const auto& cc = CProcessTopPlugin::Instance().CoreClass();
             struct { UINT id; MetricKind kind; const wchar_t* label; bool gray; } kinds[] = {
                 { 100, MetricKind::Cpu, L"CPU", false },
                 { 101, MetricKind::Mem, L"内存", false },
                 { 102, MetricKind::DiskIo, L"磁盘 IO", false },
                 { 103, MetricKind::Gpu, L"GPU", gpu_hidden },
                 { 104, MetricKind::Vram, L"显存", gpu_hidden },
+                // 核型两枚（§5）：异构机器才有；标签风格随分类表（x3d）
+                { 105, MetricKind::CpuP, cc.x3d_style ? L"X3D" : L"P核", false },
+                { 106, MetricKind::CpuE, cc.x3d_style ? L"标准" : L"E核", false },
             };
-            for (auto& k : kinds) {
+            int n_kinds = cc.heterogeneous ? 7 : 5;
+            for (int i = 0; i < n_kinds; i++) {
+                auto& k = kinds[i];
                 UINT flags = MF_STRING;
                 if (k.kind == m_kind) flags |= MF_CHECKED;
                 if (k.gray) flags |= MF_GRAYED;
@@ -825,6 +943,7 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
         {
             auto& mgr = WindowManager::Instance();
             bool full = mgr.Count() >= CTopListWindow::MAX_WINDOWS;
+            const auto& cc = CProcessTopPlugin::Instance().CoreClass();
             HMENU sub_add = CreatePopupMenu();
             struct { UINT id; const wchar_t* label; } adds[] = {
                 { 320, L"CPU" },
@@ -832,10 +951,14 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
                 { 322, L"磁盘 IO" },
                 { 323, L"GPU" },
                 { 324, L"显存" },
+                // 核型两枚（§5 同款条件）：异构机器才有
+                { 325, cc.x3d_style ? L"X3D" : L"P核" },
+                { 326, cc.x3d_style ? L"标准" : L"E核" },
             };
-            for (auto& a : adds)
+            int n_adds = cc.heterogeneous ? 7 : 5;
+            for (int i = 0; i < n_adds; i++)
                 AppendMenuW(sub_add, MF_STRING | (full ? MF_GRAYED : 0),
-                            a.id, TR(a.label));
+                            adds[i].id, TR(adds[i].label));
             AppendMenuW(menu, MF_POPUP | (full ? MF_GRAYED : 0),
                         (UINT_PTR)sub_add, TR(L"添加窗口"));
         }
@@ -1482,6 +1605,11 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     m_tm_cpu_temp = snap.tm_cpu_temp;
     m_tm_gpu_temp = snap.tm_gpu_temp;
     m_tm_cpu_freq = snap.tm_cpu_freq;
+    // 核型拆分同步（§5）：标签风格/可用性/系统级核群占用率
+    m_cpu_p_total = snap.cpu_p_total_pct;
+    m_cpu_e_total = snap.cpu_e_total_pct;
+    m_cpu_split_valid = snap.cpu_split_valid;
+    m_cpu_split_x3d = snap.cpu_split_x3d;
 
     const MetricView* view = nullptr;
     switch (m_kind) {
@@ -1493,6 +1621,8 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     }
     case MetricKind::Gpu: view = &snap.gpu; break;
     case MetricKind::Vram: view = &snap.vram; break;
+    case MetricKind::CpuP: view = &snap.cpu_p; break;
+    case MetricKind::CpuE: view = &snap.cpu_e; break;
     default: view = &snap.cpu; break;
     }
     m_rows = view->rows;
@@ -1512,6 +1642,9 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
                                    ? m_vram_sys_ded + m_vram_sys_shared
                                    : m_vram_sys_ded);
         break;
+    // 摘要 = 该核群自身容量占用率（§4.5；窗口看哪个核型就摘哪个核群）
+    case MetricKind::CpuP: m_summary_value = m_cpu_p_total; break;
+    case MetricKind::CpuE: m_summary_value = m_cpu_e_total; break;
     default: m_summary_value = snap.cpu_total_pct; break;
     }
 }
@@ -1626,6 +1759,16 @@ void CTopListWindow::LoadDemoSnapshot(int kind) {
         r.io_write_bps = d.wr;
         m_rows.push_back(r);
     }
+    // 核型拆分示例（§5）：预览也演示 P/E 列形态（P 群占用 42.7%、E 群
+    // 15.2%；行 passthrough 按 CPU 值近似拆分——仅视觉示意）
+    m_cpu_p_total = 42.7;
+    m_cpu_e_total = 15.2;
+    m_cpu_split_valid = true;
+    m_cpu_split_x3d = false;
+    for (size_t i = 0; i < m_rows.size() && i < 3; i++) {
+        m_rows[i].cpu_p_pct = m_rows[i].value * 0.8;
+        m_rows[i].cpu_e_pct = m_rows[i].value * 0.2;
+    }
     m_rows_has_value = true;
     // summary 值与 ApplySnapshotForCurrentView 同源逻辑（示例值）
     switch (m_kind) {
@@ -1638,6 +1781,8 @@ void CTopListWindow::LoadDemoSnapshot(int kind) {
                                    ? m_vram_sys_ded + m_vram_sys_shared
                                    : m_vram_sys_ded);
         break;
+    case MetricKind::CpuP: m_summary_value = m_cpu_p_total; break;
+    case MetricKind::CpuE: m_summary_value = m_cpu_e_total; break;
     default: m_summary_value = m_cpu_total; break;
     }
     m_dirty_sig.clear();   // 预览不走 UpdateFromSnapshot；清指纹防误比对
@@ -1728,6 +1873,12 @@ void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
     if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G3 &&
         !m_gpu_reason.empty())
         out[count++] = ToneGpuHidden;
+    // 核型列不可用（§6）：异构机器上会话 C 档/窗口不完整——与 IO 警示
+    // 同视觉语言，不显示假 0（sample_valid=false → 视图 has_value=false，
+    // 行区 hint「等待首次采样」之外再给原因行）
+    if ((m_kind == MetricKind::CpuP || m_kind == MetricKind::CpuE)
+        && !m_cpu_split_valid)
+        out[count++] = ToneSplitNA;
 }
 
 int CTopListWindow::ValueAreaWidth() const {
@@ -1905,6 +2056,8 @@ void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y, StatusTone tone) {
         swprintf_s(text, 256, TR(L"GPU 口径：全部节点求和（本系统无引擎类型细分）"));
     } else if (tone == ToneGpuHidden) {
         swprintf_s(text, 256, TR(L"\u26a0 GPU 排行不可用：%s"), m_gpu_reason.c_str());
+    } else if (tone == ToneSplitNA) {
+        swprintf_s(text, 256, TR(L"\u26a0 核型排行不可用——需要管理员权限的内核采样"));
     }
     if (!text[0]) return;
     SetBkMode(hdc, TRANSPARENT);

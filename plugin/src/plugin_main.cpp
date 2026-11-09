@@ -632,6 +632,14 @@ void CProcessTopPlugin::InitOnce(const wchar_t* cfg_base) {
     m_core_class = BuildCoreClassMap();
     m_metrics.SetCoreClassMap(&m_core_class);
     m_etw.SetCoreClassMap(&m_core_class);
+    // 同构矫正：配置里的 7/8（CpuP/CpuE——异构机上写下的，或手改）在同构
+    // 机器不可用，归位 CPU（窗口恢复前完成，不出现死视图）
+    if (!m_core_class.heterogeneous) {
+        if (m_settings.default_metric == 7 || m_settings.default_metric == 8)
+            m_settings.default_metric = 0;
+        for (auto& c : m_settings.windows)
+            if (c.kind == 7 || c.kind == 8) c.kind = 0;
+    }
 
     // ---- i18n (PNM-inherited): scan <config>\lang\, auto-follow TM ----
     {
@@ -897,6 +905,19 @@ void CProcessTopPlugin::BuildTooltip() {
     } else {
         wcscpy_s(line, 256, L"CPU: --");
     }
+    // 核型汇总（§4.5）：异构且系统级核群占用有效时追加 (P xx · E xx)。
+    // 标签风格随分类表（Intel P/E、AMD X3D/标准）
+    if (m_core_class.heterogeneous && snap.cpu_p_total_pct >= 0
+        && snap.cpu_e_total_pct >= 0) {
+        wchar_t pe[80];
+        if (m_core_class.x3d_style)
+            swprintf_s(pe, 80, TR(L" (X3D %.0f · 标准 %.0f)"),
+                       snap.cpu_p_total_pct, snap.cpu_e_total_pct);
+        else
+            swprintf_s(pe, 80, TR(L" (P %.0f · E %.0f)"),
+                       snap.cpu_p_total_pct, snap.cpu_e_total_pct);
+        wcscat_s(line, 256, pe);
+    }
     wcscat_s(tip, kTipSize, line);
     if (snap.mem_total) {
         swprintf_s(line, 256, L"  MEM: %.2f/%.2f GB",
@@ -1053,6 +1074,9 @@ void CProcessTopPlugin::RefreshTick() {
                        m_gpu.IsRunning() ? &gpu_data : nullptr,
                        agg, m_metrics, snap);
     if (m_etw.IsRunning()) snap.io_grade = m_etw.Grade();   // true grade (A/B/C)
+    // 核型标签风格透传（§5：Intel P核/E核、AMD X3D/标准——分类表在
+    // plugin 实例，快照带回窗口层）
+    snap.cpu_split_x3d = m_core_class.x3d_style;
     snap.gpu_grade = m_gpu.Grade();                          // true grade even when off
     snap.tm_gpu_usage = m_tm_gpu_usage.load();
     // 宿主传感器（M3-3）：进快照供窗口摘要行取用（0 = 未采集）
