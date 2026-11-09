@@ -126,7 +126,8 @@ private:
         ToneEventsLost,   // 黄：ETW 丢事件
         ToneGpuG2,        // 灰：G2 档无引擎命名说明
         ToneGpuHidden,    // 黄：GPU 维度不可用原因
-        ToneSplitNA,      // 黄：核型列不可用（会话 C 档/窗口不完整，§6）
+        ToneSplitWarmup,  // 灰：核型采样预热中（会话未交付首窗，闪现治本刀3）
+        ToneSplitNA,      // 黄：核型列不可用（会话 C 档/连续无效超时，§6）
     };
     void DrawStatusLine(HDC hdc, int w, int y, StatusTone tone);
     // 当前实际显示的状态行清单（布局/绘制/菜单判定共用，保持一致）
@@ -137,10 +138,15 @@ private:
     int ValueAreaWidth() const;
     // CPU 视图形态解析（合并方案 §3，每拍求值）：
     // SplitWanted = 异构 && 设置「核型分列」（用户意图，随设置翻转）；
-    // SplitDisplayActive = SplitWanted && 本拍核型数据有效（false 落纯
-    // CPU 形态：行/摘要/窗宽全走单列，ToneSplitNA 出警示行）
+    // SplitDisplayActive = SplitWanted && 核型数据有效（含粘滞保持期，
+    // 闪现治本刀2——单拍无效多为交付节律扰动，沿用上一拍数值；连续
+    // 5 拍无效才如实回落）；
+    // SplitLayoutActive = SplitWanted &&（有效 || 预热中）——布局层形态
+    // 判定（刀3）：窗宽/列数一步到位双列终态，预热期值占位 --，杜绝
+    // 窄↔宽跳变；数据真伪仍由 SplitDisplayActive 区分
     bool SplitWanted() const;
     bool SplitDisplayActive() const;
+    bool SplitLayoutActive() const;
     void Reposition();                       // clamp to work area, show
     void OnPaint();
 
@@ -215,6 +221,11 @@ private:
     double m_cpu_p_total = -1, m_cpu_e_total = -1;
     bool m_cpu_split_valid = false;
     bool m_cpu_split_x3d = false;
+    // 预热位（闪现治本刀3）：想要核型但会话未交付首窗——骨架双列+占位
+    bool m_cpu_split_warmup = false;
+    // 粘滞计数（刀2）：连续无效拍数——<kSplitHoldBeats 沿用上一拍形态
+    // 与行集（不重灌），超时如实回落 ⚠；有效拍清零
+    int m_split_invalid_streak = 0;
     int m_topn = 10;
     int m_io_view = 0;
     int m_color_mode = 0;

@@ -106,6 +106,10 @@ public:
     void StopAsync();
     bool IsRunning() const { return m_running.load(); }
     FileIoGrade Grade() const;
+    // 本会话是否交付过有效核型样本窗（Start 清零、首窗交付置位；未交付
+    // = 会话预热中——窗口层据此画双列骨架占位而非闪回退态，2026-11-10
+    // 闪现治本刀3）
+    bool SampleEverDelivered() const { return m_sample_ever.load(); }
 
     // Human-readable one-line status for the options dialog / status row.
     // Thread-safe.
@@ -177,6 +181,7 @@ private:
     std::unordered_map<DWORD, SampleAcc> m_out_sample;   // 累计式 handed-off
     uint64_t m_sample_total_acc = 0;    // 消费者私有：窗口内全部样本（含 Idle）
     uint64_t m_sample_total_out = 0;    // 累计式（窗口不完整时跨窗合并）
+    std::atomic<bool> m_sample_ever{false};   // 本会话交付过有效样本窗（预热判定）
     // 窗口记账（方案三）：m_out 改累计式——tick 不消费（超时/窗口不完整）
     // 时字节与窗口都留在 m_out 继续累计，跨短窗口合并成完整窗口交付，
     // 字节永不断账。m_out_window_us 由 consumer +=、tick 消费时清零

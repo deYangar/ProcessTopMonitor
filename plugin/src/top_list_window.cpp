@@ -1602,13 +1602,29 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     m_tm_cpu_temp = snap.tm_cpu_temp;
     m_tm_gpu_temp = snap.tm_gpu_temp;
     m_tm_cpu_freq = snap.tm_cpu_freq;
-    // 核型拆分同步（§5）：标签风格/可用性/系统级核群占用率
+    // 核型拆分同步（§5）：标签风格/可用性/系统级核群占用率。
+    // 形态粘滞（闪现治本刀2，2026-11-10）：单拍 valid=false 多为交付
+    // 节律扰动（kick 补拍窗口短/FLUSH 半满缓冲），非真故障——沿用
+    // 上一拍形态与行集，连续 kSplitHoldBeats 拍无效才如实回落 ⚠（真
+    // 故障可见性不损，只多几拍确认期）。p/e 系统级汇总（NtQSI 口径）
+    // 不依赖采样会话，粘滞期照常刷新
+    constexpr int kSplitHoldBeats = 5;
+    if (snap.cpu_split_valid) {
+        m_cpu_split_valid = true;
+        m_split_invalid_streak = 0;
+    } else if (m_split_invalid_streak < kSplitHoldBeats) {
+        m_split_invalid_streak++;   // 粘滞拍：valid 保持 true，行集沿用
+    } else {
+        m_cpu_split_valid = false;  // 超时回落（真无效）
+    }
     m_cpu_p_total = snap.cpu_p_total_pct;
     m_cpu_e_total = snap.cpu_e_total_pct;
-    m_cpu_split_valid = snap.cpu_split_valid;
     m_cpu_split_x3d = snap.cpu_split_x3d;
+    // 预热位组合（刀3）：快照侧「会话未交付首窗」且本窗不在有效/粘滞态
+    m_cpu_split_warmup = snap.cpu_split_warmup && !m_cpu_split_valid;
 
     const MetricView* view = nullptr;
+    bool hold_rows = false;   // 粘滞拍：行集沿用 m_rows（snap.cpu_pe 是空的）
     switch (m_kind) {
     case MetricKind::Mem: view = &snap.mem; break;
     case MetricKind::DiskIo: {
@@ -1620,16 +1636,25 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     case MetricKind::Vram: view = &snap.vram; break;
     // CPU 视图形态自适应（合并方案 §3）：核型分列时行集走 cpu_pe
     // （max(P,E) 排序，双列值由行内 passthrough 带出）；否则纯总量行
-    // （NtQSI 口径恒可用——含 D2 回退：想要核型但数据无效落这里）
-    // 残留 kind=7/8（Clamp 已归 0，防御）同落纯总量
+    // （NtQSI 口径恒可用——含 D2 回退/预热骨架：想要核型但数据未就绪
+    // 落这里，双列布局下 P/E 值画 -- 占位）残留 kind=7/8（Clamp 已归
+    // 0，防御）同落纯总量
     default:
-        view = SplitDisplayActive() ? &snap.cpu_pe : &snap.cpu;
+        if (m_cpu_split_valid && !snap.cpu_split_valid) {
+            hold_rows = true;   // 粘滞拍：不重灌（沿用上一拍 cpu_pe 行集）
+        } else {
+            view = SplitDisplayActive() ? &snap.cpu_pe : &snap.cpu;
+        }
         break;
     }
-    m_rows = view->rows;
-    // 每窗行数：视图按最大 15 行供数（多窗共享快照），本窗按 cfg.topn 截断
-    if ((int)m_rows.size() > m_topn) m_rows.resize(m_topn);
-    m_rows_has_value = view->has_value;
+    if (hold_rows) {
+        // 行集/has_value 原样保留；summary 总量照刷（下方 switch）
+    } else {
+        m_rows = view->rows;
+        // 每窗行数：视图按最大 15 行供数（多窗共享快照），本窗按 cfg.topn 截断
+        if ((int)m_rows.size() > m_topn) m_rows.resize(m_topn);
+        m_rows_has_value = view->has_value;
+    }
     switch (m_kind) {
     case MetricKind::Mem: m_summary_value = (double)m_mem_used; break;
     case MetricKind::DiskIo:
@@ -1875,6 +1900,13 @@ bool CTopListWindow::SplitDisplayActive() const {
     return SplitWanted() && m_cpu_split_valid;
 }
 
+bool CTopListWindow::SplitLayoutActive() const {
+    // 布局层形态判定（闪现治本刀3）：有效（含粘滞）或预热中——窗宽/
+    // 列数一步到位双列终态，预热期 P/E 值画 -- 占位；数据真伪由
+    // SplitDisplayActive 区分（DrawRow/DrawSummary 占位分支用）
+    return SplitWanted() && (m_cpu_split_valid || m_cpu_split_warmup);
+}
+
 void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
     count = 0;
     if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C)
@@ -1887,17 +1919,21 @@ void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
     if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G3 &&
         !m_gpu_reason.empty())
         out[count++] = ToneGpuHidden;
-    // 核型明细不可用（合并方案 D2）：异构机要核型形态但本拍数据无效
-    // （会话 C 档/窗口不完整）——行区已回退纯 CPU 总量（NtQSI 恒可用），
-    // 警示行如实说明缺的是核型明细，不显示假 0
+    // 核型明细状态行三分（闪现治本刀2/刀3）：有效/粘滞期 = 无行（粘滞
+    // 吸收节律扰动）；预热中（会话未交付首窗）= 中性灰说明（行区骨架
+    // 双列 + P/E 值 -- 占位）；连续 5 拍无效 = 真回落 ⚠（合并方案 D2
+    // 语义：行区回退纯 CPU 总量——NtQSI 恒可用，警示行如实说明缺的是
+    // 核型明细，不显示假 0）
     if (m_kind == MetricKind::Cpu && SplitWanted() && !m_cpu_split_valid)
-        out[count++] = ToneSplitNA;
+        out[count++] = m_cpu_split_warmup ? ToneSplitWarmup : ToneSplitNA;
 }
 
 int CTopListWindow::ValueAreaWidth() const {
-    // 双列值区（IO 合计读+写 / CPU 视图核型分列 P+E，单面板双列同款加宽）
+    // 双列值区（IO 合计读+写 / CPU 视图核型分列 P+E，单面板双列同款加宽）。
+    // CPU 视图用布局判定 SplitLayoutActive（闪现治本刀3）：预热期同样
+    // 双列宽——窗宽一步到位终态，杜绝窄↔宽跳变
     if ((m_kind == MetricKind::DiskIo && m_io_view == 0)
-        || (m_kind == MetricKind::Cpu && SplitDisplayActive()))
+        || (m_kind == MetricKind::Cpu && SplitLayoutActive()))
         return VALUE_AREA_W * 2 + (int)(8 * m_dpi_scale);
     return VALUE_AREA_W;
 }
@@ -1913,9 +1949,11 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
 
     out_w = (int)(BASE_WIDTH * m_dpi_scale);
     // 窗宽自适应（问题③）：双列视图（IO 合计/CPU 核型分列）值区加宽，
-    // 名字列宽度不缩——若值区吃名字列（300px 窗只剩 ~40px）进程名不可读
+    // 名字列宽度不缩——若值区吃名字列（300px 窗只剩 ~40px）进程名不可读。
+    // CPU 视图用布局判定 SplitLayoutActive（闪现治本刀3，与
+    // ValueAreaWidth 同源）：预热期即双列宽，形态零跳变
     if ((m_kind == MetricKind::DiskIo && m_io_view == 0)
-        || (m_kind == MetricKind::Cpu && SplitDisplayActive()))
+        || (m_kind == MetricKind::Cpu && SplitLayoutActive()))
         out_w += VALUE_AREA_W + (int)(8 * m_dpi_scale);
     out_h = PADDING + HEADER_H + SUMMARY_H
             + status_lines * STATUS_H
@@ -2026,9 +2064,11 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
         }
         break;
     case MetricKind::Cpu:
-        if (SplitDisplayActive()) {
+        if (SplitLayoutActive()) {
             // 核型分列摘要 = 两核群各自容量占用率并排（§4.5：P 38 读作
-            // P 核群忙 38%；-1 = 无效/采样未就绪 → --）
+            // P 核群忙 38%；-1 = 无效/采样未就绪 → --）。布局判定含预热
+            // 骨架（刀3）：p/e 汇总走 NtQSI（不依赖采样会话），预热期
+            // 通常已有真值；真无效才 -- 占位
             const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
             const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
             if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0)
@@ -2090,12 +2130,14 @@ void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y, StatusTone tone) {
         swprintf_s(text, 256, TR(L"GPU 口径：全部节点求和（本系统无引擎类型细分）"));
     } else if (tone == ToneGpuHidden) {
         swprintf_s(text, 256, TR(L"\u26a0 GPU 排行不可用：%s"), m_gpu_reason.c_str());
+    } else if (tone == ToneSplitWarmup) {
+        swprintf_s(text, 256, TR(L"核型采样预热中…"));
     } else if (tone == ToneSplitNA) {
         swprintf_s(text, 256, TR(L"\u26a0 核型排行不可用——需要管理员权限的内核采样"));
     }
     if (!text[0]) return;
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, tone == ToneGpuG2
+    SetTextColor(hdc, (tone == ToneGpuG2 || tone == ToneSplitWarmup)
                           ? (UseTextTheme() ? RGB(150, 150, 150) : RGB(110, 110, 110))
                           : (UseTextTheme() ? RGB(255, 200, 80) : RGB(190, 120, 0)));
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_small);
@@ -2158,12 +2200,19 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
     //    双列同款（IO 合计同形态），列标签随分类表（§0 拍板：Intel
     //    P核/E核、AMD X3D/标准））
     SetTextColor(hdc, GetAccentColor());
-    if (m_rows_has_value && m_kind == MetricKind::Cpu && SplitDisplayActive()) {
+    if (m_rows_has_value && m_kind == MetricKind::Cpu && SplitLayoutActive()) {
         const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
         const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
         wchar_t pv[48], ev[48];
-        swprintf_s(pv, 48, L"%s%.1f%%", pl, row.cpu_p_pct);
-        swprintf_s(ev, 48, L"%s%.1f%%", el, row.cpu_e_pct);
+        if (SplitDisplayActive()) {
+            swprintf_s(pv, 48, L"%s%.1f%%", pl, row.cpu_p_pct);
+            swprintf_s(ev, 48, L"%s%.1f%%", el, row.cpu_e_pct);
+        } else {
+            // 预热骨架（刀3）：列头在、值占位——会话首窗未交付，行集是
+            // NtQSI 总量行（passthrough 为 0），画 0.0% 即假值
+            swprintf_s(pv, 48, L"%s--", pl);
+            swprintf_s(ev, 48, L"%s--", el);
+        }
         int col_gap = (int)(8 * m_dpi_scale);
         RECT rc_e = { w - PADDING - VALUE_AREA_W, y, w - PADDING, y + ROW_HEIGHT };
         DrawTextW(hdc, ev, -1, &rc_e, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);

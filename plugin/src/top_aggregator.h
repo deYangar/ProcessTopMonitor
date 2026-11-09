@@ -56,6 +56,10 @@ struct MetricsSnapshot {
     // 标签风格（true: X3D/标准；false: P核/E核）
     bool cpu_split_valid = false;
     bool cpu_split_x3d = false;
+    // 核型预热中（2026-11-10 闪现治本刀3）：想要核型但本会话尚未交付
+    // 首个样本窗（会话 3 分钟迟停后重开/进程刚启动）——窗口层画双列
+    // 骨架 + 值占位 -- + 中性灰预热行，而非闪回退态 ⚠
+    bool cpu_split_warmup = false;
     // GPU/显存摘要
     double gpu_total_pct = 0;            // selected scope, clamped (G1/G2)
     bool gpu_total_valid = false;

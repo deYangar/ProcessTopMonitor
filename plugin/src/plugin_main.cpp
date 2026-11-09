@@ -968,7 +968,11 @@ void CProcessTopPlugin::RefreshTick() {
             if (rms < 250) rms = 250;
             if (rms > 2000) rms = 2000;
             m_etw.TakeDelta(io_delta, (uint64_t)rms * 500);   // µs = ms*1000/2
-            have_etw = io_delta.valid;
+            // 双通道独立交付（2026-11-10 闪现治本刀1b）：此前 delta 整包
+            // 跟 IO valid 走——拒收拍不进 Build，核型 sample 连坐（切回
+            // CPU 必闪根因之二）。Build 内 etw_exact 自带 valid 判定，
+            // 拒收拍 IO 行自动回落全口径计数器，IO 语义不变
+            have_etw = io_delta.valid || io_delta.sample_valid;
         }
     }
 
@@ -1075,6 +1079,16 @@ void CProcessTopPlugin::RefreshTick() {
     // 核型标签风格透传（§5：Intel P核/E核、AMD X3D/标准——分类表在
     // plugin 实例，快照带回窗口层）
     snap.cpu_split_x3d = m_core_class.x3d_style;
+    // 核型预热位（闪现治本刀3）：想要核型 + 当前周期无有效交付（会话
+    // 停着待重启，或刚启动未交首窗）+ 档位非 C（C=权限不可用，留给 ⚠
+    // 真因文案）。!IsRunning 分支让「迟停已落地」的缓存快照也带预热位
+    //——切回 CPU 的首帧（SetKind 用缓存快照就地重灌）直接骨架化，
+    // 不闪回退态；Off=未探测（首拍 Start 前）同按预热处理
+    snap.cpu_split_warmup = m_core_class.heterogeneous
+        && m_settings.cpu_view == 1
+        && !snap.cpu_split_valid
+        && m_etw.Grade() != FileIoGrade::C
+        && (!m_etw.IsRunning() || !m_etw.SampleEverDelivered());
     snap.gpu_grade = m_gpu.Grade();                          // true grade even when off
     snap.tm_gpu_usage = m_tm_gpu_usage.load();
     // 宿主传感器（M3-3）：进快照供窗口摘要行取用（0 = 未采集）

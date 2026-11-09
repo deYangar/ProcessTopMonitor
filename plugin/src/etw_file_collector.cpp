@@ -201,6 +201,9 @@ FileIoGrade EtwFileCollector::Start() {
     if (m_running.load()) return Grade();
     s_self = this;
     m_stop = false;
+    // 预热位按会话周期重置：新会话从「未交付」起算（闪现治本刀3，
+    // SampleEverDelivered 消费方见 plugin_main 快照 warmup 判定）
+    m_sample_ever.store(false, std::memory_order_relaxed);
     // 窗口记账（方案三）：QPC 频率取一次；窗口起点由首个会话的
     // 「首拍就绪 handoff」推齐（见 ConsumerLoop）
     if (!m_qpc_freq) {
@@ -795,16 +798,30 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
             // 不接管时字节/窗口**不清零**，留在 m_out 累计到下个窗口合并
             // 交付，速率按合并后的真实窗口计算，永不断账
             out.valid = (out.window_us >= min_window_us);
+            // 核型采样通道解耦（2026-11-10 闪现治本刀1）：此前 sample_
+            // valid 连坐 IO 完整窗口防线——kick 补拍窗口=距上次交付≤一拍，
+            // 无论切换时刻落在拍的哪一半，必有一拍窗口<min_window 被拒收
+            //（实测 10 次切回 CPU 闪 8 次，且数学必闪），拒收拍 sample_
+            // valid 连带 false → 双列↔回退态↔双列闪 0.55~1s。占比分子
+            // 分母同窗自洽，短窗只是统计功效低而非错值——采样通道独立
+            // 判定（下限 100ms：40ms FLUSH 逼出的半满缓冲占比噪声大，防
+            // 抖）；IO 速率防线（假零防护）原样保留。两通道各自清账：
+            // 拒收拍 IO 字节继续累计（下窗合并交付），样本账本独立清零
+            //（占比以本窗样本为分母，不清会滚成多窗累计口径）
+            constexpr uint64_t kSampleMinWinUs = 100000;   // 100ms
+            out.sample_valid = (out.window_us >= kSampleMinWinUs) && m_ccm
+                               && m_ccm->heterogeneous
+                               && out.sample_total > 0;
             if (out.valid) {
                 m_out.clear();
                 m_out_window_us = 0;
+            }
+            if (out.valid || out.sample_valid) {
                 m_out_sample.clear();
                 m_sample_total_out = 0;
             }
-            // 采样通道的可用性：异构分类注入且本窗口完整（与 IO 同一
-            // 窗口判定；占比口径无速率分母，窗口完整性即数据覆盖性）
-            out.sample_valid = out.valid && m_ccm && m_ccm->heterogeneous
-                               && out.sample_total > 0;
+            if (out.sample_valid)
+                m_sample_ever.store(true, std::memory_order_relaxed);
             // 接管转换点日志（方案三验证证据，仅 debug_logs 开时落盘）：
             // 让位（窗口不完整→fallback）与接管（首个完整窗口）的切换
             // 各打一条，稳态静默
