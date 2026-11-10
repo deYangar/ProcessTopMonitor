@@ -93,17 +93,40 @@ GpuScopeConfig GpuCollector::Scope() const {
     return m_cfg;
 }
 
+void GpuCollector::SetGradeLocked(GpuGrade g, const wchar_t* why) {
+    // C-7：档位状态唯一写入通道（m_grade_mutex 内）
+    std::lock_guard<std::mutex> lk(m_grade_mutex);
+    m_grade = g;
+    m_grade_reason = why ? why : L"";
+}
+
+GpuGrade GpuCollector::Grade() const {
+    // C-7：UI 线程（设置页/菜单）与 tick 线程并发读——锁内取
+    std::lock_guard<std::mutex> lk(m_grade_mutex);
+    return m_grade;
+}
+
+void GpuCollector::Reason(wchar_t* out, size_t cap) const {
+    // C-7：锁内拷入调用方缓冲（tick 侧重探测并发时读者拿到完整串）
+    if (!out || cap == 0) return;
+    std::lock_guard<std::mutex> lk(m_grade_mutex);
+    wcsncpy_s(out, cap, m_grade_reason.c_str(), _TRUNCATE);
+}
+
 void GpuCollector::DetectGrade(std::wstring& reason) {
+    // 局部变量结算，结尾一次锁内提交（C-7）——函数体不再直写成员，
+    // 调用方（EnsureStarted/ProbeGrade）拿返回的 reason 做后续分支
+    GpuGrade g = GpuGrade::G3;
     DWORD build = 0;
     if (!PTM_GetOSBuild(build)) {
-        m_grade = GpuGrade::G3;
         reason = L"OS version unavailable";
+        SetGradeLocked(g, reason.c_str());
         return;
     }
     if (build < 9200) {
         // G3: Win7 has no reliable per-process GPU path (方案 §2.4 G3)
-        m_grade = GpuGrade::G3;
         reason = L"Windows 7";
+        SetGradeLocked(g, reason.c_str());
         return;
     }
     // 测试开关：PTM_GPU_FORCE_G2=1 在现代 build 上强制走 G2 路径——
@@ -113,23 +136,27 @@ void GpuCollector::DetectGrade(std::wstring& reason) {
     bool forced = GetEnvironmentVariableW(L"PTM_GPU_FORCE_G2", force, 4) > 0;
     if (build < 16299 || forced) {
         // G2 range (Win8 ~ Win10 1607): D3DKMTQueryStatistics path.
-        m_grade = GpuGrade::G2;
+        g = GpuGrade::G2;
         reason.clear();
+        SetGradeLocked(g, reason.c_str());
         return;
     }
     // G1: PDH GPU Engine exists since 1709; counter add failure below is
     // the RDP / no-GPU detector.
-    m_grade = GpuGrade::G1;
+    g = GpuGrade::G1;
     reason.clear();
+    SetGradeLocked(g, reason.c_str());
 }
 
 bool GpuCollector::EnsureStarted() {
     if (m_running.load()) return true;
-    DetectGrade(m_grade_reason);
-    if (m_grade == GpuGrade::G1) {
+    std::wstring why;
+    DetectGrade(why);
+    GpuGrade g = Grade();
+    if (g == GpuGrade::G1) {
         if (!OpenQuery()) {
-            m_grade = GpuGrade::G3;
-            m_grade_reason = L"GPU counters unavailable (RDP / no GPU?)";
+            // C-7：失败分支经锁内写入通道
+            SetGradeLocked(GpuGrade::G3, L"GPU counters unavailable (RDP / no GPU?)");
             m_running.store(false);
             return false;
         }
@@ -143,10 +170,10 @@ bool GpuCollector::EnsureStarted() {
         m_running.store(true);
         return true;
     }
-    if (m_grade == GpuGrade::G2) {
+    if (g == GpuGrade::G2) {
         if (!InitG2()) {
-            m_grade = GpuGrade::G3;
-            m_grade_reason = L"D3DKMT adapters unavailable";
+            // C-7：失败分支经锁内写入通道
+            SetGradeLocked(GpuGrade::G3, L"D3DKMT adapters unavailable");
             m_running.store(false);
             return false;
         }
@@ -468,7 +495,7 @@ void GpuCollector::Tick(GpuTickData& out,
     out.sys_dedicated = 0;
     out.sys_shared = 0;
     out.known_engtypes.clear();
-    out.grade = m_grade;
+    out.grade = m_grade;              // tick 线程自读（写者同线程，C-7 无竞争）
     out.unsupported_reason = m_grade_reason;
     out.util_valid = out.mem_valid = out.sys_mem_valid = false;
     if (!m_running.load()) return;
@@ -478,6 +505,11 @@ void GpuCollector::Tick(GpuTickData& out,
         return;
     }
     if (!m_query) return;
+
+    // P-1 治本（2026-11-10 审查）：实例名解析缓存只增不减（GPU 视图
+    // 常开时随进程生灭月级累积）——本拍出现的 pid 集作清理依据，Tick
+    // 末尾淘汰已消失 pid 的实例键
+    std::unordered_set<DWORD> seen_pids;
 
     if (PdhCollectQueryData((PDH_HQUERY)m_query) != ERROR_SUCCESS)
         return;
@@ -522,6 +554,7 @@ void GpuCollector::Tick(GpuTickData& out,
                 m_eng_cache[inst] = { pid, eng };
                 if (!eng.empty()) m_engtypes.insert(eng);
             }
+            if (pid) seen_pids.insert(pid);
             if (!in_scope(eng)) continue;
             double v = it.FmtValue.doubleValue;
             if (v < 0) v = 0;
@@ -555,6 +588,7 @@ void GpuCollector::Tick(GpuTickData& out,
                 }
                 m_pid_cache[inst] = pid;
             }
+            if (pid) seen_pids.insert(pid);
             double v = it.FmtValue.doubleValue;
             if (v < 0) v = 0;
             dst[pid] += (uint64_t)v;
@@ -590,6 +624,16 @@ void GpuCollector::Tick(GpuTickData& out,
         for (auto& kv : shr) out.sys_shared += kv.second;
         out.sys_mem_valid = out.mem_valid;
     }
+
+    // P-1 治本收尾：清掉本拍未出现的 pid 实例键（PDH 实例随进程退出即
+    // 消失，键继续挂着只会积灰）；负缓存项（pid=0，解析失败，如适配器
+    // 级实例名）保留——清了每拍重新解析失败再负缓存，纯抖动
+    for (auto it = m_eng_cache.begin(); it != m_eng_cache.end();)
+        it = (it->second.first && !seen_pids.count(it->second.first))
+                 ? m_eng_cache.erase(it) : ++it;
+    for (auto it = m_pid_cache.begin(); it != m_pid_cache.end();)
+        it = (it->second && !seen_pids.count(it->second))
+                 ? m_pid_cache.erase(it) : ++it;
 }
 
 // ============================================================

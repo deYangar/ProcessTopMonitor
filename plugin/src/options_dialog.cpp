@@ -62,6 +62,7 @@ struct PtDlgState {
     int snap_color_mode = 0, snap_effect = 0, snap_opacity = 100;
     bool snap_popup_topmost = true, snap_popup_click_through = false;
     int preview_color = -1;   // 预览实例当前颜色模式（变化时置双底脏）
+    ULONGLONG retry_tick = 0; // IO 重试请求发出时刻（轮询刷新计时用，C-1/P-3）
     bool changed = false;
 } g_st;
 
@@ -324,9 +325,13 @@ void PtCreateControls(HWND hwnd) {
         int iy = y + Sc(24);
         bool gpu_ok = (ggrade != GpuGrade::G3);
         if (!gpu_ok) {
-            // G3：整组灰显 + 原因一行（快照同源文本）
+            // G3：整组灰显 + 原因一行（快照同源文本）。C-7：reason 锁内
+            // 拷入缓冲（旧 c_str() 指针在 tick 侧重探测后失效）；C-4：
+            // _TRUNCATE 截断语义（超长翻译免疫 failfast）
             wchar_t reason[160];
-            swprintf_s(reason, 160, TR(L"GPU 排行不可用：%s"), plugin.GpuGradeReason());
+            wchar_t rbuf[160];
+            plugin.GpuGradeReason(rbuf, 160);
+            _snwprintf_s(reason, 160, _TRUNCATE, TR(L"GPU 排行不可用：%s"), rbuf);
             HWND rl = PtLabel(hwnd, reason, M + Sc(12), iy, GW - Sc(24), Sc(20));
             PtFont(rl);
         } else {
@@ -775,8 +780,16 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (id == IDOK) { PtOnOk(hwnd); return 0; }
         if (id == IDCANCEL) { PtOnCancel(hwnd); return 0; }
         if (id == IDC_IO_RETRY) {
+            // C-1/P-3 治本（2026-11-10 审查）：重试请求投递 tick 线程执行
+            //（RetryFileIoSession 内部置位 + Kick 立即补拍），UI 即刻返回
+            // 显示「重试中…」——Start 全程（收尸 join ≤3s + 会话接管 +
+            // 档位等待 ≤1s）不再冻结设置页。500ms 轮询刷新状态行，档位
+            // 变化自动上屏（√ 精确 / △ 降级+原因），12s 上限停轮询
+            //（重试最坏 ~5s，含余量；对话框销毁 timer 随窗自动回收）
             CProcessTopPlugin::Instance().RetryFileIoSession();
-            PtFillIoStatus(hwnd);
+            SetWindowTextW(GetDlgItem(hwnd, IDC_IO_STATUS), TR(L"重试中…"));
+            g_st.retry_tick = GetTickCount64();
+            SetTimer(hwnd, 4, 500, nullptr);
             return 0;
         }
         if (id == IDC_OPENDEBUG_BTN) {
@@ -798,6 +811,14 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    case WM_TIMER:
+        // IO 重试结果轮询（C-1/P-3）：状态行 500ms 刷新，12s 上限即停
+        if (wp == 4) {
+            PtFillIoStatus(hwnd);
+            if (GetTickCount64() - g_st.retry_tick >= 12000)
+                KillTimer(hwnd, 4);
+        }
+        return 0;
     case WM_HSCROLL: {
         if ((HWND)lp == GetDlgItem(hwnd, IDC_OPACITY_TRK)) {
             int v = (int)SendMessageW((HWND)lp, TBM_GETPOS, 0, 0);

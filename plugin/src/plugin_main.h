@@ -11,6 +11,7 @@
 #include "i18n.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 // 任务栏 item：CPU Top1 进程名 + 占用（方案 §1.1.5，PNM CProcessNetItem 缩编）
 // 自绘两段式：进程名左对齐 + 占用右对齐，点击切换排行悬浮窗显隐
@@ -28,9 +29,15 @@ public:
     int GetItemWidthEx(void* hDC) const override;
     void DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode) override;
 
-    // tick 线程写（m_data_lock 内），TM 主线程读 —— PNM 同款静态缓冲
-    static wchar_t s_top_name[48];
-    static wchar_t s_top_value[32];
+    // tick 线程写（m_data_lock 内背板 + release 翻转），TM 主线程读
+    //（acquire 取前台板）。C-6 治本（2026-11-10 审查）：旧单缓冲
+    // 「tick 锁内写 / TM 主线程无锁读」有 null 终止竞争窗口（撕裂
+    // 显示，理论越界读）——双缓冲序列号归零，手法同 CProcessTopPlugin
+    // tooltip 的 TipWriteBuf/PublishTooltip。前台指针在下一次发布
+    //（≥250ms 后）前持续有效，宿主当帧消费契约不变
+    static wchar_t s_top_name[2][48];
+    static wchar_t s_top_value[2][32];
+    static std::atomic<int> s_top_cur;   // 当前前台板下标（0/1）
     static bool s_show_item;      // master switch（M1 恒 true，留 schema 位）
     static COLORREF s_value_color;
     static bool s_has_value_color;
@@ -54,8 +61,17 @@ public:
     // DllMain DLL_PROCESS_DETACH: stop the timer + ETW consumer thread
     // before unload (private members; this wrapper is the public seam)
     void ShutdownForDllUnload() {
-        StopRefreshTimer();
-        StopKickTimer(true);
+        // C-5 治本（2026-11-10 审查）：DllMain 零等待——wait=true 的
+        // 同步等回调（INVALID_HANDLE_VALUE）在两场景有理论风险：
+        // ① ExitProcess 路径：其它线程已被杀，timer 回调若正被杀在
+        //   中途，「等回调完成」行为未定义 → TM 退出挂死；
+        // ② FreeLibrary 路径：DllMain 持 loader lock 等回调，回调内
+        //   PDH 首次 collect 惰性加载 perfgpu.dll 需要 loader lock
+        //   → 互等死锁。降级异步删除（回调最多再飞一拍），进程退出由
+        //   系统整体回收；RefreshTick 入口新加的 g_shutting_down 短路
+        //   兜底「DLL 尚未解除映射但已标记停机」窗口内进场的回调
+        StopRefreshTimer(false);
+        StopKickTimer(false);
         // A4：DllMain 路径走「尽力而为停」——ExitProcess 已杀其它线程，
         // 完整 Stop 的 SetStatus/join 可能等一把被弃的锁（TM 退出挂死）
         m_etw.StopForUnload();
@@ -94,10 +110,23 @@ public:
 
     // ---- M4 选项对话框接缝（对话框只经这些通道访问插件内部）----
     GpuGrade GpuCollectorGrade() const { return m_gpu.Grade(); }
-    const wchar_t* GpuGradeReason() const { return m_gpu.Reason(); }
+    // C-7 治本（2026-11-10 审查）：reason 是 wstring，tick 重探测写 /
+    // UI 读无同步（撕裂读可堆损坏）——锁内拷入调用方缓冲，不再返回
+    // 生命周期不受控的 c_str() 指针
+    void GpuGradeReason(wchar_t* out, size_t cap) const { m_gpu.Reason(out, cap); }
     void CopySnapshot(MetricsSnapshot& out, bool& valid);          // 锁内拷贝
     std::vector<std::wstring> EnumerateGpuEnginesForDialog();      // 运行中取快照，否则临时查询
-    FileIoGrade RetryFileIoSession() { return m_etw.Start(); }     // 幂等重试
+    // 幂等重试。C-1/P-3 治本（2026-11-10 审查）：不再 UI 线程直调
+    // Start——join 收尸（≤3s）+ 残留会话接管（~300ms）+ 档位等待
+    //（≤1s）最坏 ~4.5s 同步冻结设置页与全部 PTM 窗口，且与 tick 侧
+    // StopAsync 无互斥（C-1）。请求转交 tick 线程执行：置位 + Kick
+    // 立即补拍（RefreshTick 2c 段消费，Start 全程在 tick 语义线程），
+    // UI 即刻返回；设置页 500ms 轮询刷新状态行（重试中… → 档位文案）
+    FileIoGrade RetryFileIoSession() {
+        m_io_retry_requested.store(true);
+        KickRefreshTick();
+        return m_etw.Grade();
+    }
     void GetIoStatusForDialog(wchar_t* out, size_t cap);           // 档位文案 + 丢事件
     // 崩溃诊断开关（设置页）：旗标 + WER LocalDumps 注册/撤销即时生效
     void SetCrashDumps(bool on);
@@ -162,7 +191,13 @@ private:
     CRITICAL_SECTION m_data_lock;
     bool m_lock_inited = false;
     std::atomic<bool> m_refresh_busy{false};
-    bool m_inited = false;
+    // B-3 治本（2026-11-10 审查）：InitOnce 双入口（EI_CONFIG_DIR 宿主
+    // 主线程 / DataRequired 宿主 monitor 线程）无锁竞态窗口（双份窗口/
+    // 定时器泄漏）→ once_flag 归零；并发入口阻塞等待首次完成
+    std::once_flag m_init_once;
+    // 设置页「重试」请求（C-1/P-3，2026-11-10 审查）：UI 置位 + Kick，
+    // tick 线程 RefreshTick 2c 段消费执行 m_etw.Start()
+    std::atomic<bool> m_io_retry_requested{false};
     HANDLE m_refresh_timer = nullptr;
     bool m_refresh_timer_ok = false;
     HANDLE m_kick_timer = nullptr;   // 方案一：one-shot 补拍 timer（复用式，

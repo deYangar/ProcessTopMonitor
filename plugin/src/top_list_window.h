@@ -287,10 +287,16 @@ private:
     // 句柄上限）。pending 仍按 pid 挂（每 pid 一次提取动作）
     std::unordered_map<std::wstring, HICON> m_icon_cache;
     std::vector<DWORD> m_icon_pending;
-    std::unordered_map<DWORD, std::wstring> m_path_cache;   // pid -> exe path
+    // pid -> (exe path, 行集外连续拍数)。P-1 治本（2026-11-10 审查）：
+    // 只增不减缓存归零——ResolvePendingPaths 每 200ms 拍对行集外 pid
+    // 累计计数，连续 kPathGoneBeats 拍（≈2 分钟）不出现即淘汰（死进程
+    // 条目）；缓存语义可重建（miss 下拍重查）
+    std::unordered_map<DWORD, std::pair<std::wstring, int>> m_path_cache;
     // 解析失败的负缓存（C3）：键=pid——同映像名的其它 pid 不连坐，
-    // 瞬时失败（进程创建/退出窗口期）只影响该 pid 本身
-    std::unordered_set<DWORD> m_path_missed;
+    // 瞬时失败（进程创建/退出窗口期）只影响该 pid 本身。P-1：同款
+    // 拍计数淘汰（int = 行集外连续拍数）
+    std::unordered_map<DWORD, int> m_path_missed;
+    static constexpr int kPathGoneBeats = 600;   // 600 拍 × 200ms ≈ 2 分钟
 
     // cached GDI objects
     HFONT m_font_normal = nullptr;

@@ -71,27 +71,49 @@ int MetricsCollector::QueryCpuFreqMhz() {
     return m_freq_mhz;
 }
 
+void MetricsCollector::PruneNameCachesLocked(ULONGLONG now) {
+    // P-1：常挂机场景 pid 生灭数万/月，只增不减到 MB 级；超限才扫
+    //（每次几 µs、触发稀疏），淘汰 10 分钟未活跃条目
+    constexpr size_t kMaxEntries = 4096;
+    constexpr ULONGLONG kStaleMs = 600000;   // 10 分钟
+    if (m_names.size() <= kMaxEntries && m_paths.size() <= kMaxEntries) return;
+    for (auto it = m_names.begin(); it != m_names.end();)
+        it = (now - it->second.last_tick > kStaleMs) ? m_names.erase(it) : ++it;
+    for (auto it = m_paths.begin(); it != m_paths.end();)
+        it = (now - it->second.last_tick > kStaleMs) ? m_paths.erase(it) : ++it;
+    // 活跃进程本身超上限（极端服务器形态）：全清保命（语义可重建）
+    if (m_names.size() > kMaxEntries) m_names.clear();
+    if (m_paths.size() > kMaxEntries) m_paths.clear();
+}
+
 void MetricsCollector::Remember(DWORD pid, const std::wstring& name) {
     if (name.empty()) return;
+    ULONGLONG now = GetTickCount64();
     std::lock_guard<std::mutex> lk(m_name_mutex);
+    PruneNameCachesLocked(now);
     auto& slot = m_names[pid];
-    if (slot.empty() || slot != name) slot = name;
+    if (slot.text.empty() || slot.text != name) slot.text = name;
+    slot.last_tick = now;
 }
 
 std::wstring MetricsCollector::LookupName(DWORD pid) {
     {
         std::lock_guard<std::mutex> lk(m_name_mutex);
         auto it = m_names.find(pid);
-        if (it != m_names.end()) return it->second;
+        if (it != m_names.end()) return it->second.text;
     }
     return L"";
 }
 
 std::wstring MetricsCollector::LookupPath(DWORD pid) {
+    ULONGLONG now = GetTickCount64();
     {
         std::lock_guard<std::mutex> lk(m_name_mutex);
         auto it = m_paths.find(pid);
-        if (it != m_paths.end()) return it->second;
+        if (it != m_paths.end()) {
+            it->second.last_tick = now;   // P-1：活跃刷新（ETW 视图持续查的 pid 不淘汰）
+            return it->second.text;
+        }
     }
     std::wstring got;
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -102,7 +124,10 @@ std::wstring MetricsCollector::LookupPath(DWORD pid) {
         CloseHandle(h);
     }
     std::lock_guard<std::mutex> lk(m_name_mutex);
-    m_paths[pid] = got;   // negative cache too: dead pids won't retry-spam
+    PruneNameCachesLocked(now);
+    auto& slot = m_paths[pid];
+    slot.text = got;        // negative cache too: dead pids won't retry-spam
+    slot.last_tick = now;
     return got;
 }
 

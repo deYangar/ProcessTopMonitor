@@ -24,33 +24,19 @@
 // 无条件，入口以旗标短路；WER LocalDumps 注册/撤销随开关即时生效
 static std::atomic<bool> s_crash_dumps_on{true};
 
-static LONG WINAPI PtmCrashHandler(EXCEPTION_POINTERS* ep) {
-    if (!s_crash_dumps_on.load()) return EXCEPTION_CONTINUE_SEARCH;   // 设置关=未安装
-    DWORD code = ep->ExceptionRecord->ExceptionCode;
+// serious-code gate（VEH/SUF 共用）
+static bool PtIsSeriousCrash(DWORD code) {
     static const DWORD serious[] = {
         0xC0000005, 0xC000001D, 0xC000008C, 0xC0000094, 0xC00000FD,
         0xC0000374, 0xC0000409, 0xC0000139, 0xC0000135, 0xC0000142,
     };
-    bool serious_crash = false;
-    for (DWORD c : serious) if (code == c) { serious_crash = true; break; }
-    if (!serious_crash) return EXCEPTION_CONTINUE_SEARCH;
+    for (DWORD c : serious) if (code == c) return true;
+    return false;
+}
 
-    // de-dupe: same code+address within 10s (VEH sees first-chance too)
-    static DWORD s_last_code = 0;
-    static void* s_last_addr = nullptr;
-    static ULONGLONG s_last_tick = 0;
-    ULONGLONG now = GetTickCount64();
-    if (code == s_last_code && ep->ExceptionRecord->ExceptionAddress == s_last_addr &&
-        now - s_last_tick < 10000)
-        return EXCEPTION_CONTINUE_SEARCH;
-    s_last_code = code;
-    s_last_addr = ep->ExceptionRecord->ExceptionAddress;
-    s_last_tick = now;
-
-    // crash.log FIRST (pure Win32): the original exception must be captured
-    // before MiniDumpWriteDump, which can failfast again and lose everything
-    void* stack[24] = {};
-    USHORT nstack = CaptureStackBackTrace(2, 24, stack, nullptr);
+// crash.log append (pure Win32 zero-CRT path, VEH/SUF 共用)
+static void PtAppendCrashLog(EXCEPTION_POINTERS* ep, DWORD code,
+                             void* const* stack, USHORT nstack) {
     auto hexw = [](wchar_t* out, unsigned long long v, int nd) {
         for (int i = nd - 1; i >= 0; i--) { out[i] = L"0123456789abcdef"[v & 0xF]; v >>= 4; }
         out[nd] = 0;
@@ -63,41 +49,85 @@ static LONG WINAPI PtmCrashHandler(EXCEPTION_POINTERS* ep) {
         out[i] = 0;
     };
     wchar_t dir[MAX_PATH] = L"";
+    if (!PTM_GetDebugDir(dir, MAX_PATH)) return;
+    size_t dlen = wcslen(dir);
+    static const wchar_t lsuf[] = L"\\crash.log";
+    size_t llen = (sizeof(lsuf) / sizeof(wchar_t)) - 1;
+    if (dlen + llen >= MAX_PATH) return;
+    wchar_t logpath[MAX_PATH];
+    memcpy(logpath, dir, dlen * sizeof(wchar_t));
+    memcpy(logpath + dlen, lsuf, (llen + 1) * sizeof(wchar_t));
+    HANDLE hLog = CreateFileW(logpath, FILE_APPEND_DATA, FILE_SHARE_READ,
+                              nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (hLog == INVALID_HANDLE_VALUE) return;
+    auto wr = [&](const wchar_t* s) {
+        DWORD w = 0;
+        WriteFile(hLog, s, (DWORD)wcslen(s) * sizeof(wchar_t), &w, nullptr);
+    };
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t hh[4], mm[4], ss[4], cx[9], ax[17], th[12];
+    decw(hh, st.wHour); decw(mm, st.wMinute); decw(ss, st.wSecond);
+    hexw(cx, code, 8);
+    hexw(ax, (unsigned long long)ep->ExceptionRecord->ExceptionAddress, 16);
+    decw(th, GetCurrentThreadId());
+    wr(L"["); wr(hh); wr(L":"); wr(mm); wr(L":"); wr(ss);
+    wr(L"] CRASH code=0x"); wr(cx);
+    wr(L" addr=0x"); wr(ax);
+    wr(L" thread="); wr(th);
+    for (USHORT si = 0; si < nstack; si++) {
+        wr(L" st=");
+        wchar_t sx[17];
+        hexw(sx, (unsigned long long)stack[si], 16);
+        wr(sx);
+    }
+    wr(L"\n");
+    CloseHandle(hLog);
+}
+
+// C-8 治本（2026-11-10 审查）：VEH 第一机会只轻量记 crash.log，绝不写
+// crash.dmp——第一机会能看到一切异常，包括宿主/兄弟插件用 SEH __try
+// 正常消化的 0xC0000005（探活类代码、CRT 内部重试），此时 CREATE_ALWAYS
+// 覆盖 crash.dmp 会把真崩溃现场顶替掉（诊断污染）。dump 写入只留给
+// SetUnhandledExceptionFilter 路径（异常真正未被任何人处理时才到达）
+static LONG WINAPI PtmVehHandler(EXCEPTION_POINTERS* ep) {
+    if (!s_crash_dumps_on.load()) return EXCEPTION_CONTINUE_SEARCH;   // 设置关=未安装
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (!PtIsSeriousCrash(code)) return EXCEPTION_CONTINUE_SEARCH;
+
+    // de-dupe: same code+address within 10s（第一机会高频路径的记录闸）
+    static DWORD s_last_code = 0;
+    static void* s_last_addr = nullptr;
+    static ULONGLONG s_last_tick = 0;
+    ULONGLONG now = GetTickCount64();
+    if (code == s_last_code && ep->ExceptionRecord->ExceptionAddress == s_last_addr &&
+        now - s_last_tick < 10000)
+        return EXCEPTION_CONTINUE_SEARCH;
+    s_last_code = code;
+    s_last_addr = ep->ExceptionRecord->ExceptionAddress;
+    s_last_tick = now;
+
+    void* stack[24] = {};
+    USHORT nstack = CaptureStackBackTrace(2, 24, stack, nullptr);
+    PtAppendCrashLog(ep, code, stack, nstack);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// SetUnhandledExceptionFilter 路径：未被任何人处理的异常（进程将死）
+// ——log + minidump 全写
+static LONG WINAPI PtmCrashHandler(EXCEPTION_POINTERS* ep) {
+    if (!s_crash_dumps_on.load()) return EXCEPTION_CONTINUE_SEARCH;   // 设置关=未安装
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (!PtIsSeriousCrash(code)) return EXCEPTION_CONTINUE_SEARCH;
+
+    // crash.log FIRST (pure Win32): the original exception must be captured
+    // before MiniDumpWriteDump, which can failfast again and lose everything
+    void* stack[24] = {};
+    USHORT nstack = CaptureStackBackTrace(2, 24, stack, nullptr);
+    PtAppendCrashLog(ep, code, stack, nstack);
+
+    wchar_t dir[MAX_PATH] = L"";
     if (PTM_GetDebugDir(dir, MAX_PATH)) {
         size_t dlen = wcslen(dir);
-        static const wchar_t lsuf[] = L"\\crash.log";
-        size_t llen = (sizeof(lsuf) / sizeof(wchar_t)) - 1;
-        if (dlen + llen < MAX_PATH) {
-            wchar_t logpath[MAX_PATH];
-            memcpy(logpath, dir, dlen * sizeof(wchar_t));
-            memcpy(logpath + dlen, lsuf, (llen + 1) * sizeof(wchar_t));
-            HANDLE hLog = CreateFileW(logpath, FILE_APPEND_DATA, FILE_SHARE_READ,
-                                      nullptr, OPEN_ALWAYS, 0, nullptr);
-            if (hLog != INVALID_HANDLE_VALUE) {
-                auto wr = [&](const wchar_t* s) {
-                    DWORD w = 0;
-                    WriteFile(hLog, s, (DWORD)wcslen(s) * sizeof(wchar_t), &w, nullptr);
-                };
-                SYSTEMTIME st; GetLocalTime(&st);
-                wchar_t hh[4], mm[4], ss[4], cx[9], ax[17], th[12];
-                decw(hh, st.wHour); decw(mm, st.wMinute); decw(ss, st.wSecond);
-                hexw(cx, code, 8);
-                hexw(ax, (unsigned long long)ep->ExceptionRecord->ExceptionAddress, 16);
-                decw(th, GetCurrentThreadId());
-                wr(L"["); wr(hh); wr(L":"); wr(mm); wr(L":"); wr(ss);
-                wr(L"] CRASH code=0x"); wr(cx);
-                wr(L" addr=0x"); wr(ax);
-                wr(L" thread="); wr(th);
-                for (USHORT si = 0; si < nstack; si++) {
-                    wr(L" st=");
-                    wchar_t sx[17];
-                    hexw(sx, (unsigned long long)stack[si], 16);
-                    wr(sx);
-                }
-                wr(L"\n");
-                CloseHandle(hLog);
-            }
-        }
         static const wchar_t dsuf[] = L"\\crash.dmp";
         size_t dlen2 = (sizeof(dsuf) / sizeof(wchar_t)) - 1;
         if (dlen + dlen2 < MAX_PATH) {
@@ -233,8 +263,9 @@ bool CProcessTopPlugin::CrashDumpsEnabled() {
 }
 
 void CProcessTopPlugin::InitCrashHandlers() {
+    // C-8：VEH（第一机会）只记 log；dump 只在 SUF（未处理异常）路径写
     SetUnhandledExceptionFilter(PtmCrashHandler);
-    AddVectoredExceptionHandler(1, PtmCrashHandler);
+    AddVectoredExceptionHandler(1, PtmVehHandler);
     _set_invalid_parameter_handler(PtmInvalidParamHandler);
     ApplyWerLocalDumps(true);   // 旗标默认开；LoadSettings 后 SetCrashDumps 校正
 }
@@ -243,8 +274,9 @@ void CProcessTopPlugin::InitCrashHandlers() {
 // CTopItem — taskbar item (CPU Top1)
 // ============================================================
 
-wchar_t CTopItem::s_top_name[48] = L"-";
-wchar_t CTopItem::s_top_value[32] = L"--";
+wchar_t CTopItem::s_top_name[2][48] = { { L"-" }, { L"-" } };
+wchar_t CTopItem::s_top_value[2][32] = { { L"--" }, { L"--" } };
+std::atomic<int> CTopItem::s_top_cur{ 0 };
 bool CTopItem::s_show_item = true;
 COLORREF CTopItem::s_value_color = 0;
 bool CTopItem::s_has_value_color = false;
@@ -252,7 +284,10 @@ bool CTopItem::s_has_value_color = false;
 const wchar_t* CTopItem::GetItemName() const { return L"Top"; }
 const wchar_t* CTopItem::GetItemId() const { return L"ProcTop01"; }
 const wchar_t* CTopItem::GetItemLableText() const { return L""; }
-const wchar_t* CTopItem::GetItemValueText() const { return s_top_value; }
+// C-6：前台板指针——下一次发布（≥250ms）前有效，宿主当帧消费契约不变
+const wchar_t* CTopItem::GetItemValueText() const {
+    return s_top_value[s_top_cur.load(std::memory_order_acquire)];
+}
 const wchar_t* CTopItem::GetItemValueSampleText() const { return L"chrome.exe 32.4%"; }
 
 int CTopItem::GetItemWidth() const { return 120; }
@@ -274,8 +309,10 @@ void CTopItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode) {
 
     wchar_t name[48];
     wchar_t value[32];
-    wcsncpy_s(name, 48, s_top_name, _TRUNCATE);
-    wcsncpy_s(value, 32, s_top_value, _TRUNCATE);
+    // C-6：acquire 取前台板快照（单帧内两列读同一板，无撕裂）
+    int cur = s_top_cur.load(std::memory_order_acquire);
+    wcsncpy_s(name, 48, s_top_name[cur], _TRUNCATE);
+    wcsncpy_s(value, 32, s_top_value[cur], _TRUNCATE);
 
     // 右列：占用，右对齐
     SIZE sz_v{};
@@ -567,16 +604,17 @@ const wchar_t* CProcessTopPlugin::GetInfo(PluginInfoIndex i) {
 
 void CProcessTopPlugin::OnInitialize(ITrafficMonitor* p) {
     m_app = p;
-    if (!m_inited) {
-        m_inited = true;
-        InitOnce(p->GetPluginConfigDir());
-    }
+    // B-3 治本（2026-11-10 审查）：call_once——EI_CONFIG_DIR（宿主主
+    // 线程）与 DataRequired（宿主 monitor 线程）在 1.85.x 宿主上可能
+    // 几乎同时到达，旧检查-置位无锁窗口内双 InitOnce = 双份窗口/定时
+    // 器泄漏；call_once 下并发入口阻塞等待首次完成，归零
+    std::call_once(m_init_once, [this, p] { InitOnce(p->GetPluginConfigDir()); });
 }
 
 void CProcessTopPlugin::EnsureInitialized() {
-    if (m_inited) return;
-    m_inited = true;
-    InitOnce(m_tm_config_dir.empty() ? nullptr : m_tm_config_dir.c_str());
+    std::call_once(m_init_once, [this] {
+        InitOnce(m_tm_config_dir.empty() ? nullptr : m_tm_config_dir.c_str());
+    });
 }
 
 void CProcessTopPlugin::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data) {
@@ -925,12 +963,15 @@ void CProcessTopPlugin::BuildTooltip() {
     if (m_core_class.heterogeneous && snap.cpu_p_total_pct >= 0
         && snap.cpu_e_total_pct >= 0) {
         wchar_t pe[80];
+        // C-4（2026-11-10 审查）：TR() 译文进固定缓冲一律 _TRUNCATE 语义
+        //——超长翻译文件截断显示而非 invalid-param failfast 杀宿主
+        //（绘制路径每 500ms 走一次，崩不起）
         if (m_core_class.x3d_style)
-            swprintf_s(pe, 80, TR(L" (X3D %.0f · 标准 %.0f)"),
-                       snap.cpu_p_total_pct, snap.cpu_e_total_pct);
+            _snwprintf_s(pe, 80, _TRUNCATE, TR(L" (X3D %.0f · 标准 %.0f)"),
+                         snap.cpu_p_total_pct, snap.cpu_e_total_pct);
         else
-            swprintf_s(pe, 80, TR(L" (P %.0f · E %.0f)"),
-                       snap.cpu_p_total_pct, snap.cpu_e_total_pct);
+            _snwprintf_s(pe, 80, _TRUNCATE, TR(L" (P %.0f · E %.0f)"),
+                         snap.cpu_p_total_pct, snap.cpu_e_total_pct);
         wcscat_s(line, 256, pe);
     }
     wcscat_s(tip, kTipSize, line);
@@ -948,7 +989,12 @@ void CProcessTopPlugin::BuildTooltip() {
     int count = 0;
     for (auto& r : snap.cpu.rows) {
         if (count >= 3) break;
-        swprintf_s(line, 256, L"  %s %.1f%%\n", r.name.c_str(), r.value);
+        // C-3 治本（2026-11-10 审查）：进程名是唯一不受控输入（映像名
+        // 合法上限 255 字符，超长名可执行文件运行即触发），精度截断
+        // %.200s + _TRUNCATE 双保险——旧 swprintf_s 溢出直接 invalid-
+        // param failfast 崩宿主，且此路径每拍（500ms）都走
+        _snwprintf_s(line, 256, _TRUNCATE, L"  %.200s %.1f%%\n",
+                     r.name.c_str(), r.value);
         wcscat_s(tip, kTipSize, line);
         count++;
     }
@@ -967,6 +1013,10 @@ void CALLBACK CProcessTopPlugin::RefreshTimerProc(void* param, BOOLEAN) {
 }
 
 void CProcessTopPlugin::RefreshTick() {
+    // C-5 兜底（2026-11-10 审查）：DllMain 停机路径降级异步删 timer 后，
+    // 已在飞的回调仍可能被调度——立即短路，不触碰任何状态（DLL 可能
+    // 正在/已经解除映射，FreeLibrary 语境下继续跑就是踩空指针）
+    if (g_shutting_down) return;
     bool expected = false;
     if (!m_refresh_busy.compare_exchange_strong(expected, true)) return;
 
@@ -1057,6 +1107,12 @@ void CProcessTopPlugin::RefreshTick() {
     bool cpu_split_bound = m_core_class.heterogeneous
         && m_settings.cpu_view == 1
         && (mask & PtKindMask(MetricKind::Cpu)) != 0;
+    // 设置页「重试」请求（C-1/P-3 治本，2026-11-10 审查）：Start 全程
+    //（收尸 join ≤3s + 会话接管 ~300ms + 档位等待 ≤1s）在本线程执行，
+    // UI 只投递不等待（阻塞的是 tick 语义线程，m_refresh_busy 门闩天然
+    // 防重入；期间 UI 消息泵照常跑，设置页由 500ms 轮询看到结果）
+    if (m_io_retry_requested.exchange(false))
+        m_etw.Start();
     if (io_bound || cpu_split_bound) {
         if (!m_etw.IsRunning()) m_etw.Start();
         m_etw_idle_since = 0;
@@ -1125,6 +1181,8 @@ void CProcessTopPlugin::RefreshTick() {
         EnterCriticalSection(&m_data_lock);
         m_snapshot = snap;
         m_snapshot_valid = true;
+        // C-6：写背板后 release 翻转发布（TM 主线程无锁读前台板）
+        int wb = 1 - CTopItem::s_top_cur.load(std::memory_order_acquire);
         if (!snap.cpu.rows.empty()) {
             auto& top1 = snap.cpu.rows[0];
             std::wstring nm = top1.name;
@@ -1132,12 +1190,13 @@ void CProcessTopPlugin::RefreshTick() {
                 std::wstring ext = nm.substr(nm.size() - 4);
                 if (ext == L".exe" || ext == L".EXE") nm = nm.substr(0, nm.size() - 4);
             }
-            wcsncpy_s(CTopItem::s_top_name, 48, nm.c_str(), _TRUNCATE);
-            swprintf_s(CTopItem::s_top_value, 32, L"%.1f%%", top1.value);
+            wcsncpy_s(CTopItem::s_top_name[wb], 48, nm.c_str(), _TRUNCATE);
+            swprintf_s(CTopItem::s_top_value[wb], 32, L"%.1f%%", top1.value);
         } else {
-            wcsncpy_s(CTopItem::s_top_name, 48, L"-", _TRUNCATE);
-            wcsncpy_s(CTopItem::s_top_value, 32, L"--", _TRUNCATE);
+            wcsncpy_s(CTopItem::s_top_name[wb], 48, L"-", _TRUNCATE);
+            wcsncpy_s(CTopItem::s_top_value[wb], 32, L"--", _TRUNCATE);
         }
+        CTopItem::s_top_cur.store(wb, std::memory_order_release);
         LeaveCriticalSection(&m_data_lock);
     }
 
@@ -1364,13 +1423,15 @@ void CProcessTopPlugin::GetIoStatusForDialog(wchar_t* out, size_t cap) {
     }
     if (lost > 0) {
         wchar_t lbuf[48];
-        swprintf_s(lbuf, 48, TR(L"｜丢事件：%llu"), (unsigned long long)lost);
+        // C-4：TR 译文进固定缓冲 → _TRUNCATE 截断语义（failfast 免疫）
+        _snwprintf_s(lbuf, 48, _TRUNCATE, TR(L"｜丢事件：%llu"),
+                     (unsigned long long)lost);
         if (wcslen(out) + wcslen(lbuf) < cap) wcscat_s(out, cap, lbuf);
     }
 }
 
 void CProcessTopPlugin::DataRequired() {
-    if (!m_inited) EnsureInitialized();
+    EnsureInitialized();   // B-3：call_once 幂等（并发入口等待首次完成）
     if (m_refresh_timer_ok) return;   // fast path: the refresh timer owns collection
     // timer could not be created: degrade to TM's 1s tick
     RefreshTick();

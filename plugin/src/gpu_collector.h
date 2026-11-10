@@ -83,8 +83,12 @@ public:
 
     // OS-version gate only (no PDH resources): run once at init so the
     // metric menu can gray the dimension on G3 systems before any GPU view.
-    void ProbeGrade() { std::wstring why; DetectGrade(why); m_grade_reason = why; }
-    const wchar_t* Reason() const { return m_grade_reason.c_str(); }
+    void ProbeGrade() { std::wstring why; DetectGrade(why); }
+    // C-7 治本（2026-11-10 审查）：m_grade_reason 是 std::wstring，tick
+    // 写（EnsureStarted 冷启动重探测）/ UI 读（设置页）无同步——撕裂读
+    // 可堆损坏。独立小 mutex 包全部跨线程触点（低频路径零成本）；Reason
+    // 锁内拷入调用方缓冲（旧 c_str() 指针在下次重探测后失效）
+    void Reason(wchar_t* out, size_t cap) const;
 
     // Tick thread. Starts the PDH query (grade detection happens here:
     // OS build gate + counter presence). Returns false when the dimension
@@ -94,7 +98,7 @@ public:
     // (方案 §4 设计决策 2: PDH 全关).
     void EnsureStopped();
     bool IsRunning() const { return m_running.load(); }
-    GpuGrade Grade() const { return m_grade; }
+    GpuGrade Grade() const;   // C-7：锁内读（cpp 定义）
 
     // Tick thread, every 2nd tick (~1s). Fills out; safe to call when not
     // running (returns immediately with grade=G3).
@@ -112,13 +116,19 @@ private:
     void CloseQuery();                 // tick thread (G1)
     bool InitG2();                     // tick thread (G2): gdi32 + adapters
     void StopG2();
-    void DetectGrade(std::wstring& reason);   // tick thread
+    void DetectGrade(std::wstring& reason);   // tick thread / InitOnce 主线程
     bool TickG2(GpuTickData& out, const std::vector<DWORD>& pid_candidates);
+    // C-7：档位状态唯一写入通道（锁内）——DetectGrade 尾部提交与
+    // EnsureStarted 失败分支共用
+    void SetGradeLocked(GpuGrade g, const wchar_t* why);
 
     mutable std::mutex m_cfg_mutex;
     GpuScopeConfig m_cfg;
 
     std::atomic<bool> m_running{ false };
+    // C-7：跨线程触点（tick 写 / UI 读）全部经 m_grade_mutex；tick 线程
+    // 内部自读自写（Tick 出参）不经过锁（无竞争）
+    mutable std::mutex m_grade_mutex;
     GpuGrade m_grade = GpuGrade::G3;
     std::wstring m_grade_reason;
 

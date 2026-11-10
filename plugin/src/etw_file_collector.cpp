@@ -182,6 +182,12 @@ static ULONG PtStopSession(TRACEHANDLE handle, const wchar_t* name) {
 }
 
 FileIoGrade EtwFileCollector::Start() {
+    // C-1 治本（2026-11-10 审查）：生命周期互斥——与 Stop/StopAsync
+    //（tick 迟停边界）并发时，对 joinable 的 m_reaper/m_thread
+    // move-assign 是 UB（std::terminate 杀宿主）。持锁期含 join 收尸
+    //（≤3s）与档位等待（≤1s），并发调用方等待后安全重入（Start 语义
+    // 本就要先等收尸完成）；不进热路径
+    std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
     // 串行化点（问题①B）：上一次 StopAsync 的收尾未完成时，先等收尸
     // 线程 join 掉旧消费者（m_running 随之翻 false），再重启——否则旧
     // 消费者还活着，下面的幂等检查会误判「正在运行」直接返回旧档位。
@@ -244,7 +250,9 @@ FileIoGrade EtwFileCollector::Start() {
 
 void EtwFileCollector::Stop() {
     // 完整停（析构/DLL 卸载/选项对话框）：同步等待消费者退出——此处
-    // 允许阻塞。tick 线程的按需停走 StopAsync（问题①B）
+    // 允许阻塞。tick 线程的按需停走 StopAsync（问题①B）。C-1：生命
+    // 周期互斥（见 Start 注释）
+    std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
     if (!m_running.load() && !m_thread.joinable() && !m_reaper.joinable()) {
         SetStatus(FileIoGrade::Off, L"");
         return;
@@ -253,12 +261,8 @@ void EtwFileCollector::Stop() {
 
     // Stopping our own session unblocks ProcessTrace. For an attach-style
     // consumer, CloseTrace is the unblocker (same as PNM etw_capture).
-    if (m_own_session_handle) {
-        PtStopSession(m_own_session_handle, nullptr);
-    } else {
-        TRACEHANDLE h = m_cur_consumer.load();
-        if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
-    }
+    //（C-2：三发全上，见 PtUnlockConsumer）
+    PtUnlockConsumer();
     // 收尸协调（并发 join 同一 std::thread 是 UB）：reaper 在就等它完成
     // （它已把 m_thread join 掉）；没有 reaper 才由本线程直接等+join
     if (m_reaper.joinable()) {
@@ -279,22 +283,41 @@ void EtwFileCollector::StopForUnload() {
     // std::thread 对象若原样析构会 std::terminate（joinable 析构=杀宿主），
     // 对已死线程 detach 立即返回、对象进入安全态。m_own_session_handle/
     // m_cur_consumer 是尽力读（消费者线程写，无同步）——读到哪个分支都
-    // 只是「发一次停信号/关一次句柄」，进程退出语境下足够
+    // 只是「发一次停信号/关一次句柄」，进程退出语境下足够。C-2：三发
+    // 全上（幂等）；不拿生命周期锁（DllMain 零锁纪律，A4）
     m_stop = true;
-    if (m_own_session_handle) {
-        PtStopSession(m_own_session_handle, nullptr);
-    } else {
-        TRACEHANDLE h = m_cur_consumer.load();
-        if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
-    }
+    PtUnlockConsumer();
     if (m_reaper.joinable()) m_reaper.detach();
     if (m_thread.joinable()) m_thread.detach();
+}
+
+void EtwFileCollector::PtUnlockConsumer() {
+    // C-2 治本（2026-11-10 审查）：解锁 ProcessTrace 三发全上，消灭旧
+    // if/else 单选的单点依赖窗口——Stop 恰在 ConsumerLoop「StartTraceW
+    // 成功 → 写 m_own_session_handle → 写 m_cur_consumer → 进
+    // ProcessTrace」的纳秒窗口内先读两个句柄（读到 0 / INVALID）时，
+    // 旧代码一个解锁手段都发不出：消费者永阻 ProcessTrace 内（m_stop
+    // 对已进入的 ProcessTrace 无效），reaper join 永久挂起，下一拍
+    // IsRunning 恒真，ETW 数据永停只能重启 TM。三个手段各自幂等：
+    //   ① 停自有会话（A 档 handle）
+    //   ② 按名停（A 档 kSessionName——接管重试语境下句柄可能尚未公布
+    //      而会话已建立；B 档 NT Kernel Logger）
+    //   ③ CloseTrace 消费句柄（attach 式消费者的 ProcessTrace 解锁器）
+    // 残余理论窗口（B 档句柄全未公布）由 BufferCallback 的 m_stop
+    // 检查兜底逼停（≤1s，FlushTimer 周期必火）
+    if (m_own_session_handle)
+        PtStopSession(m_own_session_handle, nullptr);
+    PtStopSession(0, m_using_kernel_logger ? KERNEL_LOGGER_NAMEW : kSessionName);
+    TRACEHANDLE h = m_cur_consumer.load();
+    if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
 }
 
 void EtwFileCollector::StopAsync() {
     // tick 线程的按需停（问题①B）：绝不 join——发停信号 + 解锁
     // ProcessTrace 即返回，join/收尾交给一次性收尸线程。重复调用无害
-    // （m_stop 已置位时直接返回，不重叠收尸）
+    //（m_stop 已置位时直接返回，不重叠收尸）。C-1：生命周期互斥（见
+    // Start 注释）——持锁段只有发信号 + 三发解锁 + 创建 reaper（ms 级）
+    std::lock_guard<std::mutex> lk(m_lifecycle_mutex);
     if (m_stop.load()) return;
     if (!m_running.load() && !m_thread.joinable()) {
         SetStatus(FileIoGrade::Off, L"");
@@ -302,13 +325,8 @@ void EtwFileCollector::StopAsync() {
     }
     m_stop = true;
 
-    // 解锁路径与 Stop() 相同（停止自己的会话 / CloseTrace attach 消费者）
-    if (m_own_session_handle) {
-        PtStopSession(m_own_session_handle, nullptr);
-    } else {
-        TRACEHANDLE h = m_cur_consumer.load();
-        if (h != INVALID_PROCESSTRACE_HANDLE) CloseTrace(h);
-    }
+    // 解锁路径与 Stop() 相同（C-2：三发全上，见 PtUnlockConsumer）
+    PtUnlockConsumer();
 
     // 一次性收尸线程：等消费者退出（m_running 由 ConsumerLoop 末尾置
     // false——语义 = 消费者已退出）再 join。Stop()/Start() 里的串行化
@@ -716,6 +734,14 @@ ULONG WINAPI EtwFileCollector::BufferCallback(PEVENT_TRACE_LOGFILEW logfile) {
     // returns) — measured 2026-10-25: returning 0 killed the session at
     // every flush tick (A<->C flapping, "ProcessTrace rc=0" every ~1-2s).
     (void)logfile;
+    // C-2 兜底（2026-11-10 审查）：停机请求已置位时返回 FALSE 逼停
+    // ProcessTrace——正常语境恒走下面的 TRUE（坑9：FALSE 会杀会话，
+    // 仅在停机语境使用，会话本来就要停）。这保证即使 PtUnlockConsumer
+    // 三发全部落空（极端时序：B 档句柄均未公布），消费者也会在 ≤1s
+    //（FlushTimer 周期，BufferCallback 零事件也必火）内自行退出，
+    // 永阻形态物理不可构造
+    if (s_self && s_self->m_stop.load(std::memory_order_relaxed))
+        return 0;
     if (s_self && s_self->m_take_req.load(std::memory_order_relaxed))
         s_self->DoHandoffLocked();
     return 1;   // TRUE — keep consuming

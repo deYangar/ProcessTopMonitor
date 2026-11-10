@@ -154,6 +154,10 @@ private:
     static void WINAPI EventCallback(PEVENT_RECORD rec);
     static ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW logfile);
     void OnEvent(PEVENT_RECORD rec);
+    // C-2 治本（2026-11-10 审查）：解锁 ProcessTrace 三发全上（停自有
+    // 会话 + 按名停 + CloseTrace），消灭旧 if/else 单选的单点依赖窗口。
+    // Stop/StopAsync/StopForUnload 共用；各手段幂等，有值就发
+    void PtUnlockConsumer();
     // move accumulator -> out map; bump handoff sequence. consumer thread only.
     void DoHandoffLocked();
     void SetStatus(FileIoGrade g, const wchar_t* why);
@@ -175,6 +179,12 @@ private:
     std::atomic<bool> m_stop{false};
     std::thread m_thread;
     std::thread m_reaper;    // StopAsync 的一次性收尸线程：join 消费者
+    // C-1 治本（2026-11-10 审查）：生命周期互斥——Start/Stop/StopAsync
+    // 三个入口跨线程并发（tick 迟停启停 × UI 侧触发）时，对 joinable 的
+    // m_reaper/m_thread move-assign 是 UB（MSVC 直接 std::terminate 杀
+    // 宿主）。粗粒度锁只护生命周期不进热路径；StopForUnload 走 DllMain
+    // 零锁纪律（A4）不拿此锁
+    std::mutex m_lifecycle_mutex;
 
     // ---- handoff protocol (see header comment) ----
     std::atomic<bool> m_take_req{false};

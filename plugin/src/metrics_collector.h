@@ -168,6 +168,10 @@ private:
     void Remember(DWORD pid, const std::wstring& name);
     int QueryCpuFreqMhz();             // tick thread; PDH 当前频率（MHz）
     void TickCoreClassTotals(CpuMemIoMetrics& out, double dt);  // §4.5 系统级 P/E
+    // P-1 治本（2026-11-10 审查）：name/path 缓存近似 LRU——超上限才扫，
+    // 淘汰「kStaleMs 未活跃」pid（活跃进程每拍 Remember/LookupPath 刷新
+    // 时间戳），仍超（极端：活跃进程数 > 上限）全清。缓存语义可重建
+    void PruneNameCachesLocked(ULONGLONG now);
 
     // SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION（info class 8）手写布局：
     // 按编译位宽步进（x64 sizeof 48 / x86 sizeof 44，WOW64 thunk 返回
@@ -216,7 +220,12 @@ private:
     std::shared_ptr<const std::unordered_map<DWORD, DWORD>> m_thread_table;
 
     // name/path caches, guarded by m_name_mutex (LookupName: any thread)
+    // P-1：值带活跃时间戳（近似 LRU 淘汰依据）
+    struct NameEntry {
+        std::wstring text;
+        ULONGLONG last_tick = 0;
+    };
     mutable std::mutex m_name_mutex;
-    std::unordered_map<DWORD, std::wstring> m_names;
-    std::unordered_map<DWORD, std::wstring> m_paths;
+    std::unordered_map<DWORD, NameEntry> m_names;
+    std::unordered_map<DWORD, NameEntry> m_paths;
 };

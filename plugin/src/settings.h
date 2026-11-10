@@ -175,6 +175,25 @@ struct PtSettings {
     }
 };
 
+// B-1 治本（2026-11-10 审查）：写出侧 JSON 字符串转义——gpu_engines/lang
+// 值含 " 或 \ 时产出合法 JSON（值域本不含这些字符，纯手改注入防护）；
+// 读侧 gets 对应反解
+inline std::string PtJsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"':  out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:   out += c;
+        }
+    }
+    return out;
+}
+
 // UTF-8 <-> wide helpers (PNM style)
 inline std::string PtToUtf8(const std::wstring& w) {
     if (w.empty()) return {};
@@ -222,12 +241,12 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"color_mode\": %d,\n", st.color_mode);
     fprintf(f, "  \"popup_effect\": %d,\n", st.popup_effect);
     fprintf(f, "  \"popup_opacity\": %d,\n", st.popup_opacity);
-    fprintf(f, "  \"gpu_engines\": \"%s\",\n", PtToUtf8(st.gpu_engines).c_str());
+    fprintf(f, "  \"gpu_engines\": \"%s\",\n", PtJsonEscape(PtToUtf8(st.gpu_engines)).c_str());
     fprintf(f, "  \"gpu_cap_100\": %s,\n", st.gpu_cap_100 ? "true" : "false");
     fprintf(f, "  \"vram_basis\": %d,\n", st.vram_basis);
     fprintf(f, "  \"debug_logs\": %s,\n", st.debug_logs ? "true" : "false");
     fprintf(f, "  \"crash_dumps\": %s,\n", st.crash_dumps ? "true" : "false");
-    fprintf(f, "  \"lang\": \"%s\",\n", PtToUtf8(st.lang).c_str());
+    fprintf(f, "  \"lang\": \"%s\",\n", PtJsonEscape(PtToUtf8(st.lang)).c_str());
     fprintf(f, "  \"sensor_summary\": %s,\n", st.sensor_summary ? "true" : "false");
     fprintf(f, "  \"popup_mode\": %d,\n", st.popup_mode);
     fprintf(f, "  \"default_metric\": %d,\n", st.default_metric);
@@ -262,10 +281,19 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     if (swprintf_s(path, MAX_PATH, L"%s\\settings.json", config_dir.c_str()) <= 0) return false;
     FILE* f = _wfopen(path, L"r");
     if (!f) return false;
-    char buf[4096] = {};
-    size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+    // B-1 治本（2026-11-10 审查）：读循环到文件尾（上限 64KB）——旧固定
+    // 4096 字节缓冲静默截断，6 窗配置 + 超长引擎表/手改注释时 windows[]
+    // 尾部行丢失（解析不崩，表现为末尾窗配置回落默认）
+    std::string json;
+    {
+        char chunk[4096];
+        size_t n;
+        while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+            json.append(chunk, n);
+            if (json.size() >= 64 * 1024) break;   // 上限：更大按坏文件处理
+        }
+    }
     fclose(f);
-    std::string json(buf, len);
 
     auto geti = [&](const char* key, int& out) {
         size_t pos = json.find(key);
@@ -291,9 +319,21 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
         if (pos == std::string::npos) return;
         pos = json.find('"', pos);
         if (pos == std::string::npos) return;
-        size_t e = json.find('"', pos + 1);
-        if (e == std::string::npos) return;
-        out = PtFromUtf8(json.substr(pos + 1, e - pos - 1));
+        // B-1：转义反解（对应 PtJsonEscape）——扫描到未转义的闭引号为止
+        std::string raw;
+        for (size_t e = pos + 1; e < json.size(); e++) {
+            char c = json[e];
+            if (c == '"' && (raw.empty() || raw.back() != '\\')) break;
+            if (c == '\\' && e + 1 < json.size()) {
+                char nx = json[e + 1];
+                if (nx == '"' || nx == '\\') { raw += nx; e++; continue; }
+                if (nx == 'n') { raw += '\n'; e++; continue; }
+                if (nx == 'r') { raw += '\r'; e++; continue; }
+                if (nx == 't') { raw += '\t'; e++; continue; }
+            }
+            raw += c;
+        }
+        out = PtFromUtf8(raw);
     };
 
     // v1 迁移源（局部承接，M6 §3.2：结构里已无 v1 残留成员）

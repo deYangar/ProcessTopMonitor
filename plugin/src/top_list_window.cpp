@@ -289,21 +289,23 @@ void CTopListWindow::UpdateRowTooltip(const POINT& client_pt) {
         if (ext == L".exe" || ext == L".EXE") name = name.substr(0, name.size() - 4);
     }
     wchar_t text[512];
+    // C-3/C-4 同型（2026-11-10 审查）：进程名（不受控，%.200s）+ TR 译文
+    // 一律 _TRUNCATE 截断语义
     if (SplitDisplayActive()) {
         if (m_cpu_split_x3d)
-            swprintf_s(text, 512, L"%s\nX3D %.1f%% · %s %.1f%%",
-                       name.c_str(), r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
+            _snwprintf_s(text, 512, _TRUNCATE, L"%.200s\nX3D %.1f%% · %s %.1f%%",
+                         name.c_str(), r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
         else
-            swprintf_s(text, 512, L"%s\n%s %.1f%% · %s %.1f%%",
-                       name.c_str(), TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
+            _snwprintf_s(text, 512, _TRUNCATE, L"%.200s\n%s %.1f%% · %s %.1f%%",
+                         name.c_str(), TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
     } else if (m_cpu_split_x3d) {
-        swprintf_s(text, 512, L"%s\n%s %.1f%%\nX3D %.1f%% · %s %.1f%%",
-                   name.c_str(), TR(L"CPU"), r.value,
-                   r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
+        _snwprintf_s(text, 512, _TRUNCATE, L"%.200s\n%s %.1f%%\nX3D %.1f%% · %s %.1f%%",
+                     name.c_str(), TR(L"CPU"), r.value,
+                     r.cpu_p_pct, TR(L"标准"), r.cpu_e_pct);
     } else {
-        swprintf_s(text, 512, L"%s\n%s %.1f%%\n%s %.1f%% · %s %.1f%%",
-                   name.c_str(), TR(L"CPU"), r.value,
-                   TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
+        _snwprintf_s(text, 512, _TRUNCATE, L"%.200s\n%s %.1f%%\n%s %.1f%% · %s %.1f%%",
+                     name.c_str(), TR(L"CPU"), r.value,
+                     TR(L"P核"), r.cpu_p_pct, TR(L"E核"), r.cpu_e_pct);
     }
 
     TOOLINFOW ti = {};
@@ -1677,11 +1679,27 @@ std::wstring PtIconKey(const std::wstring& path) {
 // exe 路径懒解析：快照行只带 pid+name，路径在 UI 线程按需查（活进程
 // OpenProcess 快），miss 负缓存不重试
 void CTopListWindow::ResolvePendingPaths() {
+    // P-1 治本（2026-11-10 审查）：路径缓存/负缓存只增不减（常年挂机下
+    // pid 生灭数万/月）——每拍先建行集 pid 集，行集外条目累计连续缺席
+    // 拍数，超 kPathGoneBeats 即淘汰（死进程条目）；行集内条目计数清零
+    std::unordered_set<DWORD> live;
+    for (auto& r : m_rows)
+        if (r.pid) live.insert(r.pid);
+    for (auto it = m_path_missed.begin(); it != m_path_missed.end();) {
+        if (live.count(it->first)) { it->second = 0; ++it; }
+        else if (++it->second > kPathGoneBeats) it = m_path_missed.erase(it);
+        else ++it;
+    }
+    for (auto it = m_path_cache.begin(); it != m_path_cache.end();) {
+        if (live.count(it->first)) { it->second.second = 0; ++it; }
+        else if (++it->second.second > kPathGoneBeats) it = m_path_cache.erase(it);
+        else ++it;
+    }
     for (auto& r : m_rows) {
-        if (!r.pid || !r.exe_path.empty()) continue;   // resolved already
+        if (!r.pid || r.exe_path.empty()) continue;   // resolved already
         auto it = m_path_cache.find(r.pid);
         if (it != m_path_cache.end()) {
-            r.exe_path = it->second;
+            r.exe_path = it->second.first;
             continue;
         }
         // only known-image-name rows resolve; failed lookups go to the
@@ -1692,16 +1710,16 @@ void CTopListWindow::ResolvePendingPaths() {
         if (m_path_missed.count(r.pid)) continue;
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, r.pid);
         if (!h) {
-            m_path_missed.insert(r.pid);
+            m_path_missed[r.pid] = 0;
             continue;
         }
         wchar_t buf[1024] = L"";
         DWORD n = 1024;
         if (QueryFullProcessImageNameW(h, 0, buf, &n) && n) {
             r.exe_path = buf;
-            m_path_cache[r.pid] = r.exe_path;
+            m_path_cache[r.pid] = { r.exe_path, 0 };
         } else {
-            m_path_missed.insert(r.pid);
+            m_path_missed[r.pid] = 0;
         }
         CloseHandle(h);
     }
@@ -1714,13 +1732,13 @@ HICON CTopListWindow::LookupIcon(const std::wstring& name, DWORD pid) {
     //（Chrome/Electron 类子进程持续生灭）直接命中既有 HICON，GDI 句柄
     // 不再按 pid 无界增长。路径未解析时挂 pending 等 ResolvePendingPaths
     auto pit = m_path_cache.find(pid);
-    if (pit == m_path_cache.end() || pit->second.empty()) {
+    if (pit == m_path_cache.end() || pit->second.first.empty()) {
         for (DWORD q : m_icon_pending)
             if (q == pid) return nullptr;
         m_icon_pending.push_back(pid);
         return nullptr;
     }
-    auto it = m_icon_cache.find(PtIconKey(pit->second));
+    auto it = m_icon_cache.find(PtIconKey(pit->second.first));
     if (it != m_icon_cache.end()) return it->second;   // 含 nullptr 负缓存
     for (DWORD q : m_icon_pending)
         if (q == pid) return nullptr;
@@ -1783,10 +1801,10 @@ bool CTopListWindow::PumpIconExtraction(int count) {
         // 200ms timer，可能晚于图标 pending）则丢弃本条，LookupIcon 下
         // 轮会带着已就绪的路径重挂
         auto pit = m_path_cache.find(pid);
-        if (pit == m_path_cache.end() || pit->second.empty()) continue;
-        std::wstring key = PtIconKey(pit->second);
+        if (pit == m_path_cache.end() || pit->second.first.empty()) continue;
+        std::wstring key = PtIconKey(pit->second.first);
         if (m_icon_cache.count(key)) continue;
-        m_icon_cache[key] = ExtractIconFor(pit->second, pid);
+        m_icon_cache[key] = ExtractIconFor(pit->second.first, pid);
         produced = true;
     }
     return produced;
@@ -2387,8 +2405,11 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             wchar_t r[32], wr[32];
             FormatSpeed(m_io_read_total, r, 32);
             FormatSpeed(m_io_write_total, wr, 32);
-            // 读/写文字前缀（2026-11-06 反馈：↓↑ 分不清哪边是读）
-            swprintf_s(text, 160, L"%s%s %s%s", TR(L"读"), r, TR(L"写"), wr);
+            // 读/写文字前缀（2026-11-06 反馈：↓↑ 分不清哪边是读）。
+            // C-4（2026-11-10 审查）：TR() 译文进固定缓冲一律 _TRUNCATE
+            // 截断语义——超长翻译文件截断显示而非 failfast 崩宿主
+            _snwprintf_s(text, 160, _TRUNCATE, L"%s%s %s%s",
+                         TR(L"读"), r, TR(L"写"), wr);
         } else {
             FormatSpeed(m_summary_value, v, 48);
             swprintf_s(text, 160, L"%s", v);
@@ -2403,7 +2424,8 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
             const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
             if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0)
-                swprintf_s(text, 160, L"%s %.1f%% · %s %.1f%%", pl, m_cpu_p_total, el, m_cpu_e_total);
+                _snwprintf_s(text, 160, _TRUNCATE, L"%s %.1f%% · %s %.1f%%",
+                             pl, m_cpu_p_total, el, m_cpu_e_total);   // C-4: _TRUNCATE
             else
                 wcscpy_s(text, 160, L"--");
         } else {
@@ -2417,7 +2439,8 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
     case MetricKind::Gpu:
         // G3（Win7/无 GPU）：维度隐藏，摘要回落宿主整机值（方案 §2.4 G3 行）
         if (m_gpu_grade == GpuGrade::G3 && m_tm_gpu_usage >= 0)
-            swprintf_s(text, 160, L"%d%% %s", m_tm_gpu_usage, TR(L"(整机)"));
+            _snwprintf_s(text, 160, _TRUNCATE, L"%d%% %s",
+                         m_tm_gpu_usage, TR(L"(整机)"));   // C-4: _TRUNCATE
         else if (m_gpu_total_valid)
             swprintf_s(text, 160, L"%.1f%%", m_gpu_total);
         else
@@ -2453,18 +2476,26 @@ void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y, StatusTone tone) {
     // 黄色警示：档位/丢事件如实标注（口径不冒充，方案 §2.3）；
     // 灰色：信息性档位说明（G2 无引擎命名）
     wchar_t text[256] = L"";
+    // C-4（2026-11-10 审查）：TR() 译文进固定缓冲一律 _TRUNCATE 截断
+    // 语义——超长翻译文件（第三方/手改）截断显示而非 invalid-param
+    // failfast 崩宿主；绘制路径每拍都走，崩不起
     if (tone == ToneIoGrade) {
-        swprintf_s(text, 256, TR(L"\u26a0 IO 口径：全句柄（含网络）——需要管理员权限获取精确磁盘口径"));
+        _snwprintf_s(text, 256, _TRUNCATE,
+                     TR(L"\u26a0 IO 口径：全句柄（含网络）——需要管理员权限获取精确磁盘口径"));
     } else if (tone == ToneEventsLost) {
-        swprintf_s(text, 256, TR(L"\u26a0 ETW 缓冲不足，已丢失 %llu 个事件"), m_io_events_lost);
+        _snwprintf_s(text, 256, _TRUNCATE,
+                     TR(L"\u26a0 ETW 缓冲不足，已丢失 %llu 个事件"), m_io_events_lost);
     } else if (tone == ToneGpuG2) {
-        swprintf_s(text, 256, TR(L"GPU 口径：全部节点求和（本系统无引擎类型细分）"));
+        _snwprintf_s(text, 256, _TRUNCATE,
+                     TR(L"GPU 口径：全部节点求和（本系统无引擎类型细分）"));
     } else if (tone == ToneGpuHidden) {
-        swprintf_s(text, 256, TR(L"\u26a0 GPU 排行不可用：%s"), m_gpu_reason.c_str());
+        _snwprintf_s(text, 256, _TRUNCATE,
+                     TR(L"\u26a0 GPU 排行不可用：%s"), m_gpu_reason.c_str());
     } else if (tone == ToneSplitWarmup) {
-        swprintf_s(text, 256, TR(L"核型采样预热中…"));
+        _snwprintf_s(text, 256, _TRUNCATE, TR(L"核型采样预热中…"));
     } else if (tone == ToneSplitNA) {
-        swprintf_s(text, 256, TR(L"\u26a0 核型排行不可用——需要管理员权限的内核采样"));
+        _snwprintf_s(text, 256, _TRUNCATE,
+                     TR(L"\u26a0 核型排行不可用——需要管理员权限的内核采样"));
     }
     if (!text[0]) return;
     SetBkMode(hdc, TRANSPARENT);
@@ -2536,13 +2567,13 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
         const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
         wchar_t pv[48], ev[48];
         if (SplitDisplayActive()) {
-            swprintf_s(pv, 48, L"%s%.1f%%", pl, row.cpu_p_pct);
-            swprintf_s(ev, 48, L"%s%.1f%%", el, row.cpu_e_pct);
+            _snwprintf_s(pv, 48, _TRUNCATE, L"%s%.1f%%", pl, row.cpu_p_pct);   // C-4: _TRUNCATE
+            _snwprintf_s(ev, 48, _TRUNCATE, L"%s%.1f%%", el, row.cpu_e_pct);
         } else {
             // 预热骨架（刀3）：列头在、值占位——会话首窗未交付，行集是
             // NtQSI 总量行（passthrough 为 0），画 0.0% 即假值
-            swprintf_s(pv, 48, L"%s--", pl);
-            swprintf_s(ev, 48, L"%s--", el);
+            _snwprintf_s(pv, 48, _TRUNCATE, L"%s--", pl);   // C-4: _TRUNCATE
+            _snwprintf_s(ev, 48, _TRUNCATE, L"%s--", el);
         }
         int col_gap = (int)(8 * m_dpi_scale);
         RECT rc_e = { w - PADDING - VALUE_AREA_W, y, w - PADDING, y + ROW_HEIGHT };
@@ -2555,8 +2586,8 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
         FormatSpeed(row.io_read_bps, rv, 32);
         FormatSpeed(row.io_write_bps, wv, 32);
         wchar_t rd[48], wd[48];
-        swprintf_s(rd, 48, L"%s%s", TR(L"读"), rv);
-        swprintf_s(wd, 48, L"%s%s", TR(L"写"), wv);
+        _snwprintf_s(rd, 48, _TRUNCATE, L"%s%s", TR(L"读"), rv);   // C-4: _TRUNCATE
+        _snwprintf_s(wd, 48, _TRUNCATE, L"%s%s", TR(L"写"), wv);
         int col_gap = (int)(8 * m_dpi_scale);
         RECT rc_write = { w - PADDING - VALUE_AREA_W, y, w - PADDING, y + ROW_HEIGHT };
         DrawTextW(hdc, wd, -1, &rc_write, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
@@ -2620,8 +2651,8 @@ void CTopListWindow::DrawRestRow(HDC hdc, int y) {
         const wchar_t* pl = m_cpu_split_x3d ? TR(L"X3D") : TR(L"P核");
         const wchar_t* el = m_cpu_split_x3d ? TR(L"标准") : TR(L"E核");
         wchar_t pv[48], ev[48];
-        swprintf_s(pv, 48, L"%s%.1f%%", pl, m_rest_p);
-        swprintf_s(ev, 48, L"%s%.1f%%", el, m_rest_e);
+        _snwprintf_s(pv, 48, _TRUNCATE, L"%s%.1f%%", pl, m_rest_p);   // C-4: _TRUNCATE
+        _snwprintf_s(ev, 48, _TRUNCATE, L"%s%.1f%%", el, m_rest_e);
         int col_gap = (int)(8 * m_dpi_scale);
         RECT rc_e = { w - PADDING - VALUE_AREA_W, y, w - PADDING,
                       y + ROW_HEIGHT };
