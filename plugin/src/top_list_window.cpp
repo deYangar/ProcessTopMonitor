@@ -1551,7 +1551,17 @@ bool CTopListWindow::CaptureSnapNoFlash(const RECT& popup_rect, int w, int h) {
         m_affinity_ok = false;
         return false;
     }
-    if (m_blur_hwnd && !SetWindowDisplayAffinity(m_blur_hwnd, WDA_EXCLUDEFROMCAPTURE)) {
+    // blur 层只在可见时排除（2026-11-10 磨砂旧采样治本，报障「呼起
+    // 时背景模糊还是上一次的」）：隐藏窗本就不进 BitBlt 抓屏，对它做
+    // affinity 开关纯属多余——且实测（tools/blur_resample_probe_20261110）
+    // 该开关会把非 LAYERED SWCA 磨砂窗的 DWM 背景采样冻在旧值：呼起链
+    // ShowAt 首显判定恰在 blur 隐藏态跑本函数，冻结后重显磨砂=上次背景，
+    // 直到可见期周期判定再开关（「过一会才变」）或窗口移动（「拖动后才
+    // 变」）才踢活；重调 SWCA/Invalidate 均救不活。跳过后重显走 DWM 原生
+    // 逐帧采样（探针基线：无干扰重显即新）。可见期照旧排除——截屏纯度
+    // 是 2026-10-19 PNM「先亮后暗」修复的要求，不动
+    bool blur_vis = m_blur_hwnd && IsWindowVisible(m_blur_hwnd);
+    if (blur_vis && !SetWindowDisplayAffinity(m_blur_hwnd, WDA_EXCLUDEFROMCAPTURE)) {
         SetWindowDisplayAffinity(m_hwnd, 0);
         m_affinity_ok = false;
         return false;
@@ -1560,7 +1570,7 @@ bool CTopListWindow::CaptureSnapNoFlash(const RECT& popup_rect, int w, int h) {
     BitBlt(m_snap_dc, 0, 0, w, h, scr, popup_rect.left, popup_rect.top,
            SRCCOPY | CAPTUREBLT);
     ReleaseDC(nullptr, scr);
-    if (m_blur_hwnd) SetWindowDisplayAffinity(m_blur_hwnd, 0);
+    if (blur_vis) SetWindowDisplayAffinity(m_blur_hwnd, 0);
     SetWindowDisplayAffinity(m_hwnd, 0);
     return true;
 }
@@ -1696,7 +1706,10 @@ void CTopListWindow::ResolvePendingPaths() {
         else ++it;
     }
     for (auto& r : m_rows) {
-        if (!r.pid || r.exe_path.empty()) continue;   // resolved already
+        // e05f4af 回归修复（2026-11-10 实测全 logo 空）：此处曾丢 `!`
+        // 条件反转成「路径为空就跳过」，懒解析主体永不执行，图标链路
+        // （LookupIcon→PumpIconExtraction）全部落空
+        if (!r.pid || !r.exe_path.empty()) continue;   // resolved already
         auto it = m_path_cache.find(r.pid);
         if (it != m_path_cache.end()) {
             r.exe_path = it->second.first;
