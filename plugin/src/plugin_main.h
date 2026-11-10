@@ -112,9 +112,19 @@ public:
     ULONGLONG m_hover_start_tick = 0;    // hover 计时起点（400ms 阈值）
     ULONGLONG m_hover_leave_tick = 0;    // 离开宽限起点（300ms）
     bool m_group_pinned = false;         // pin：hover/常驻间临时切换
+    bool m_menu_open = false;            // §2.2（2026-11-10 方案）：PTM 右键
+                                        // 菜单模态循环中（RAII 置位/复位，
+                                        // BuildContextMenu）——HoverTick 早退
+                                        //（hover 态菜单开着鼠标去窗外不收
+                                        // 窗）+ Reposition 冻结共用
     void HoverTick();                    // 100ms 状态机（组长窗 timer id=2 驱动）
     void PinGroup(const RECT* anchor_for_show);   // pin 翻转（item/菜单 360 共用）
     void RebuildDefaultWindow();         // windows 空时 item 点击重建默认窗
+    // 置顶切换链（2026-11-10 方案② §3.4，右键 365 与设置面板 PtOnOk 共调）：
+    // 改键已在外 → 全组 HideGroup → ShowGroupAt(AnchorRect)——每窗重走
+    // ShowAt 首显分支按新键决定层（topmost / 桌面层），组内次序自然正确；
+    // 组不可见只改键（下次显示生效）。切换是显式操作，全组闪一下可接受
+    void ApplyTopmostChange();
     // 常驻启动/pin 恢复的布局锚：TM 主窗 rect（枚举查找），找不到用
     // 主屏工作区兜底（M6 §4.2.4）
     RECT GetStartupAnchor();

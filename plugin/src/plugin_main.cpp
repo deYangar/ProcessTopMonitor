@@ -753,11 +753,29 @@ void CProcessTopPlugin::PinGroup(const RECT* anchor_for_show) {
     }
 }
 
+void CProcessTopPlugin::ApplyTopmostChange() {
+    // §3.4 切换链（2026-11-10 方案②）：popup_topmost 改键已在外完成 →
+    // 组可见时全组 Hide → Show（复用首显链：每窗重走 ShowAt 按新键决定
+    // topmost / 桌面层，组内次序自然正确，免写专门重插逻辑；HideGroup
+    // 顺带卸锚子类化——常驻/pin 态本就不挂锚，无副作用）。组不可见只改
+    // 键，下次显示生效
+    auto& mgr = WindowManager::Instance();
+    if (!mgr.GroupVisible()) return;
+    mgr.HideGroup();
+    mgr.ShowGroupAt(mgr.AnchorRect());
+}
+
 void CProcessTopPlugin::HoverTick() {
     // 100ms WM_TIMER（id=2）挂组长窗；组隐藏时窗口 SW_HIDE 不停 timer。
     // 常驻模式（popup_mode==1）无 hover 逻辑——常驻组常显，item 点击的
     // 对称取消语义见 OnMouseEvent
     if (m_settings.popup_mode == 1) return;
+    // §2.2（2026-11-10 方案）：PTM 右键菜单开着 → 状态机整体冻结——
+    // 纯 hover 态下鼠标移向菜单（窗外）会触发「300ms 宽限后 HideGroup」
+    // 把菜单 owner 闪关（次生交互缺陷，与压顶同场景实测撞上）。菜单
+    // 关掉（BuildContextMenu RAII 复位）下一 tick 恢复正常判定；常驻态
+    // 本就在上面早退，此守卫只服务 hover/pin 态
+    if (m_menu_open) return;
     auto& mgr = WindowManager::Instance();
     if (mgr.Count() == 0) return;   // 无窗可弹（hover 无处显示直到 item 重建）
 

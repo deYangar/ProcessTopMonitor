@@ -182,3 +182,26 @@ inline bool PTM_GetWorkAreaForRect(const RECT& rc, RECT& out_work, RECT& out_mon
     out_monitor = mi.rcMonitor;
     return true;
 }
+
+// ============================================================
+// 桌面层锚点（2026-11-10 方案② D1=A：置顶关闭时常驻窗落桌面部件层，
+// Rainmeter「On desktop」同款手法）。Windows 桌面 Z 序（常态）：
+// Progman（壁纸）→ WorkerW（壁纸副本，存在时）→ SHELLDLL_DefView
+// （桌面图标宿主）→ 普通窗口带 → 置顶带。目标落点 = DefView 之下、
+// WorkerW/Progman 之上。返回应 insert-after 的句柄（即壁纸层 WorkerW，
+// SetWindowPos(hwnd, after,...) 把本窗放在 after 之下——after 是
+// WorkerW 时本窗在 WorkerW 与 Progman 之间，正好贴壁纸顶）；探测失败
+// 返回 nullptr（调用方兜底 HWND_BOTTOM）
+// ============================================================
+inline HWND PTM_DesktopLayerAnchor() {
+    // 1) 发 0x052C 让系统确保 WorkerW 链存在（无壁纸工具时 DefView 直接
+    //    挂 Progman 下；消息幂等、无感，Rainmeter 同款）
+    HWND progman = FindWindowW(L"Progman", nullptr);
+    if (progman)
+        SendMessageTimeoutW(progman, 0x052C, 0, 1, SMTO_ABORTIFHUNG, 200, nullptr);
+    // 2) 找 SHELLDLL_DefView，取其 Z 序后继（即壁纸层 WorkerW）
+    HWND defview = FindWindowExW(nullptr, nullptr, L"SHELLDLL_DefView", nullptr);
+    if (!defview) return nullptr;
+    HWND after = GetWindow(defview, GW_HWNDNEXT);   // 通常是 WorkerW
+    return after ? after : progman;   // 无后继时兜底 Progman 之上
+}

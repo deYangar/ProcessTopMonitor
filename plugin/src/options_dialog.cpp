@@ -43,6 +43,8 @@ enum {
     IDC_MULTIWINDOW_CHK,      // 多窗口并排
     IDC_SHOWSYS_CHK,          // System 归因（方案①：仅异构机器创建）
     IDC_CPUVIEW_CBO,          // CPU 视图形态（合并方案 D1：仅异构机器创建）
+    IDC_TOPMOST_CHK = 1075,   // 常驻悬浮窗置顶（2026-11-10 方案②）
+    IDC_CLICKTHRU_CHK,        // 鼠标穿透（方案④；取消穿透唯一入口在此）
 };
 
 // ---- 对话框会话状态（单开，模态期内独占）----
@@ -55,8 +57,10 @@ struct PtDlgState {
     int eng_rows = 0;                       // 引擎 checkbox 行数（动态）
     std::vector<std::wstring> engtypes;     // 打开时快照（确定时以此为准）
     std::vector<I18n::LangInfo> langs;      // 语言列表副本（CB_SETITEMDATA 存其元素指针，模态期内稳定）
-    // 外观三项打开时快照：取消还原用（方案 §6 定案）
+    // 外观三项打开时快照：取消还原用（方案 §6 定案）。置顶/穿透同款
+    //（2026-11-10 方案②④：checkbox 无即时预览，快照为防御性还原位）
     int snap_color_mode = 0, snap_effect = 0, snap_opacity = 100;
+    bool snap_popup_topmost = true, snap_popup_click_through = false;
     int preview_color = -1;   // 预览实例当前颜色模式（变化时置双底脏）
     bool changed = false;
 } g_st;
@@ -434,9 +438,11 @@ void PtCreateControls(HWND hwnd) {
 
     // ---- 显示（M6 §4.5：出现方式/默认指标/多窗口并排三行）----
     // System 归因开关（2026-11-10 方案①）仅异构机器追加一行（同构机核型
-    // 通道不启，开关无意义——CPU 视图 combo 同款零变化原则）
+    // 通道不启，开关无意义——CPU 视图 combo 同款零变化原则）。
+    // 置顶/穿透（方案②④）恒显两行 + 一行说明（hover 模式灰显提示不适用）
     bool hetero = plugin.CoreClass().heterogeneous;
-    PtGroup(hwnd, TR(L"显示"), M, y, GW, Sc(88) + (hetero ? Sc(24) : 0));
+    PtGroup(hwnd, TR(L"显示"), M, y, GW,
+            Sc(88) + (hetero ? Sc(24) : 0) + Sc(72));
     {
         int iy = y + Sc(26);
         PtFont(PtLabel(hwnd, TR(L"出现方式"), M + Sc(12), iy + Sc(4), Sc(60), Sc(20)));
@@ -492,8 +498,37 @@ void PtCreateControls(HWND hwnd) {
                          st.show_system_procs ? BST_CHECKED : BST_UNCHECKED, 0);
             PtFont(ss);
         }
+        // 常驻悬浮窗置顶 / 鼠标穿透（2026-11-10 方案②④）：仅常驻/pin 态
+        // 生效（hover 弹窗恒置顶且穿透对弹窗无意义）——hover 模式下两项
+        // 灰显提示当前形态不适用，键值保留（切回常驻即生效）。穿透自锁
+        // 特性如实入文案：开启后悬浮窗收不到任何鼠标输入，取消唯一入口
+        // = 本设置面板（D4=A）
+        int ct_y = iy + Sc(58) + (hetero ? Sc(24) : 0);
+        HWND tchk = CreateWindowW(L"BUTTON", TR(L"常驻悬浮窗置顶"),
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            M + Sc(12), ct_y, Sc(300), Sc(20), hwnd,
+            (HMENU)(INT_PTR)IDC_TOPMOST_CHK, nullptr, nullptr);
+        SendMessageW(tchk, BM_SETCHECK,
+                     st.popup_topmost ? BST_CHECKED : BST_UNCHECKED, 0);
+        PtFont(tchk);
+        HWND cchk = CreateWindowW(L"BUTTON",
+            TR(L"鼠标穿透（开启后悬浮窗不再响应鼠标，关闭需回此设置）"),
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            M + Sc(12), ct_y + Sc(24), Sc(440), Sc(20), hwnd,
+            (HMENU)(INT_PTR)IDC_CLICKTHRU_CHK, nullptr, nullptr);
+        SendMessageW(cchk, BM_SETCHECK,
+                     st.popup_click_through ? BST_CHECKED : BST_UNCHECKED, 0);
+        PtFont(cchk);
+        HWND cth = PtLabel(hwnd,
+            TR(L"（仅常驻/固定显示生效；置顶关闭时窗口贴桌面层；悬停弹出恒置顶）"),
+            M + Sc(12), ct_y + Sc(48), GW - Sc(24), Sc(20));
+        PtFont(cth);
+        if (st.popup_mode == 0) {
+            EnableWindow(tchk, FALSE);   // hover 模式：当前形态不适用
+            EnableWindow(cchk, FALSE);
+        }
     }
-    y += Sc(88) + (hetero ? Sc(24) : 0) + Sc(12);
+    y += Sc(88) + (hetero ? Sc(24) : 0) + Sc(72) + Sc(12);
 
     // ---- 窗口与外观 ----
     PtGroup(hwnd, TR(L"窗口与外观"), M, y, GW, Sc(88));
@@ -598,6 +633,8 @@ void PtOnOk(HWND hwnd) {
     int old_refresh = st.refresh_ms;
     std::wstring old_lang = st.lang;
     GpuScopeConfig old_scope = plugin.GpuScope();
+    bool old_topmost = st.popup_topmost;          // 方案②④：变化才走生效链
+    bool old_click_through = st.popup_click_through;
 
     int rms = PtCboSel(hwnd, IDC_REFRESH_CBO);
     HWND rc = GetDlgItem(hwnd, IDC_REFRESH_CBO);
@@ -645,6 +682,12 @@ void PtOnOk(HWND hwnd) {
             SendMessageW(GetDlgItem(hwnd, IDC_SHOWSYS_CHK),
                          BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+    // 置顶/穿透（方案②④）：hover 模式灰显但值照存（模态打开期间模式
+    // 不变；灰显只是「当前形态不生效」提示，切回常驻即生效）
+    st.popup_topmost = SendMessageW(GetDlgItem(hwnd, IDC_TOPMOST_CHK),
+                                    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    st.popup_click_through = SendMessageW(GetDlgItem(hwnd, IDC_CLICKTHRU_CHK),
+                                          BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.sensor_summary = SendMessageW(GetDlgItem(hwnd, IDC_SENSOR_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     st.debug_logs = SendMessageW(GetDlgItem(hwnd, IDC_DEBUG_CHK), BM_GETCHECK, 0, 0) == BST_CHECKED;
     // 崩溃转储开关：读回 + 即时生效（旗标/WER 注册当场翻转，不等重启）
@@ -679,6 +722,17 @@ void PtOnOk(HWND hwnd) {
     // 生效管线：口径 → 窗口形态（M6）→ 定时器 → 语言 → 立即落盘
     plugin.ApplySettingsToCollectors();
     plugin.ApplyWindowMode();   // popup_mode/multi_window/default_metric 生效
+    // 置顶切换链（方案② §3.4，右键 365 同款）：放 ApplyWindowMode 之后
+    // ——出现方式若同时改到常驻，ShowGroupAt 首显已按新键落层，此处幂等
+    if (st.popup_topmost != old_topmost) plugin.ApplyTopmostChange();
+    // 穿透（方案④ §4.2）：逐窗即时应用；hover 态不穿透（判定在调用点，
+    // 与 ShowAt 首显兜底同源）
+    if (st.popup_click_through != old_click_through) {
+        bool ct_on = st.popup_click_through && plugin.GroupDraggable();
+        WindowManager::Instance().ForEach([ct_on](CTopListWindow& w, int) {
+            w.ApplyClickThrough(ct_on);
+        });
+    }
     if (!(scope == old_scope)) plugin.ApplyGpuScope(scope);
     if (st.refresh_ms != old_refresh) plugin.RestartRefreshTimer();
     EtwFileCollector::SetDebugLogs(st.debug_logs);
@@ -692,6 +746,21 @@ void PtOnOk(HWND hwnd) {
 // ---- 取消：外观三项还原打开时快照（方案 §6 定案）----
 void PtOnCancel(HWND hwnd) {
     PtApplyAppearanceToAll(g_st.snap_color_mode, g_st.snap_effect, g_st.snap_opacity);
+    // 置顶/穿透还原打开时快照（2026-11-10 方案②④，外观三项同款模式；
+    // checkbox 无即时预览，正常路径值未动 = no-op，防御性还原位）
+    CProcessTopPlugin& plugin = CProcessTopPlugin::Instance();
+    if (plugin.m_settings.popup_topmost != g_st.snap_popup_topmost) {
+        plugin.m_settings.popup_topmost = g_st.snap_popup_topmost;
+        plugin.ApplyTopmostChange();
+    }
+    if (plugin.m_settings.popup_click_through != g_st.snap_popup_click_through) {
+        plugin.m_settings.popup_click_through = g_st.snap_popup_click_through;
+        bool ct_on = plugin.m_settings.popup_click_through
+                     && plugin.GroupDraggable();
+        WindowManager::Instance().ForEach([ct_on](CTopListWindow& w, int) {
+            w.ApplyClickThrough(ct_on);
+        });
+    }
     DestroyWindow(hwnd);
 }
 
@@ -778,6 +847,8 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
     g_st.snap_color_mode = plugin.m_settings.color_mode;
     g_st.snap_effect = plugin.m_settings.popup_effect;
     g_st.snap_opacity = plugin.m_settings.popup_opacity;
+    g_st.snap_popup_topmost = plugin.m_settings.popup_topmost;
+    g_st.snap_popup_click_through = plugin.m_settings.popup_click_through;
 
     // DPI：屏幕 DC 口径（96 基准）；布局常量全部经 Sc() 缩放
     HDC sdc = GetDC(nullptr);

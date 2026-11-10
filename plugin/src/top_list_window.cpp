@@ -567,15 +567,46 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_SIZING:
+        // §5.1③：本次 sizemove 是 resize（WM_EXITSIZEMOVE 落盘 w/h 的
+        // 判定位）；矩形本身全交系统拖拽循环，不干预
+        m_saw_sizing = true;
+        return DefWindowProcW(m_hwnd, msg, wp, lp);
+
+    case WM_ENTERSIZEMOVE:
+        // §2.2 冻结：拖动/resize 系统模态循环期间 Reposition 早退——
+        // 防刷新拍的 CalcLayout 把用户正在拖的尺寸打回公式值
+        m_sizemove = true;
+        m_saw_sizing = false;   // 清残留（纯移动不写 w/h）
+        return 0;
+
     case WM_EXITSIZEMOVE: {
-        // 拖动结束（常驻/pin 态才可拖，M6 §4.1.4）：位置立即写 cfg 并
-        // 落盘——缺陷①（M5/A1）治本路径保留，不等 30s 节流。记忆位置
-        // 语义 = 拖过（下次常驻/pin 恢复用）；hover 态不可拖不会到这里
+        // 拖动/resize 结束（常驻/pin 态才可拖，M6 §4.1.4）：位置立即写
+        // cfg 并落盘——缺陷①（M5/A1）治本路径保留，不等 30s 节流。记忆
+        // 位置语义 = 拖过（下次常驻/pin 恢复用）；hover 态不可拖不会到这里。
+        // resize（§5.1③，方案③）：w/h 落盘（物理像素）+ 同拍重灌——可视
+        // 行数按新高度生效；纯移动不写 w/h（保持「0 = 未自定义」语义）
         RECT rc;
         if (GetWindowRect(m_hwnd, &rc)) {
             m_cfg.x = rc.left;
             m_cfg.y = rc.top;
+            if (m_saw_sizing) {
+                m_cfg.w = rc.right - rc.left;
+                m_cfg.h = rc.bottom - rc.top;
+            }
         }
+        if (m_saw_sizing) {
+            m_saw_sizing = false;
+            m_topn = CalcVisibleRows();   // 高度反推行数（D2=A）
+            {
+                MetricsSnapshot snap;
+                bool valid = false;
+                CProcessTopPlugin::Instance().CopySnapshot(snap, valid);
+                ApplySnapshotForCurrentView(snap);
+            }
+            RecalcAndRepaint(true);
+        }
+        m_sizemove = false;
         CProcessTopPlugin::Instance().SaveWindowConfigsNow();
         // 松手强制终判（PNM 2026-10 实测经验）：同步矩形基准——拖动最后
         // 一帧位置没进过静止期路径的 m_last_snap_rect，不同步的话下一拍
@@ -601,6 +632,10 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowPos(m_hwnd, nullptr, prc->left, prc->top,
                          prc->right - prc->left, prc->bottom - prc->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            // §5.2⑨：自定义大小按建议矩形重记（w/h 存物理像素，跨屏
+            // 缩放自然闭环）；未自定义不动
+            if (m_cfg.w > 0) m_cfg.w = prc->right - prc->left;
+            if (m_cfg.h > 0) m_cfg.h = prc->bottom - prc->top;
         }
         UpdateDpiScale();
         InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -632,11 +667,28 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         // M6 问题①治本：系统拖动模态循环期间每帧发本消息——blur 与内容
         // 同帧成对移动。旧序 blur 只在刷新周期 Reposition() 里同步，拖动
         // 期间亚克力面板与内容分家（PNM tooltip_popup.cpp:231-235 同手法
-        // 用于锚跟随路径）。尺寸变化走 Reposition 成对重建，这里只跟位置
+        // 用于锚跟随路径）。§5.3⑩（方案③）：resize 期间（SWP_NOSIZE 未设）
+        // blur 尺寸全跟（位置+尺寸），否则只跟位置
         WINDOWPOS* p = (WINDOWPOS*)lp;
         if (p && m_blur_hwnd && !(p->flags & SWP_NOMOVE) && IsWindowVisible(m_hwnd)) {
-            SetWindowPos(m_blur_hwnd, nullptr, p->x, p->y, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            if (p->flags & SWP_NOSIZE) {
+                SetWindowPos(m_blur_hwnd, nullptr, p->x, p->y, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            } else {
+                SetWindowPos(m_blur_hwnd, nullptr, p->x, p->y, p->cx, p->cy,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        // §5.3⑪ ULW 视觉尺寸同步（方案③最大技术风险，单列）：系统
+        // resize 循环改的是窗口 rect（hit test/布局全正常），但 ULW 窗口
+        // 的画面尺寸由最后一次 ULW 提交的表面尺寸决定——尺寸变化帧强制
+        // invalidate → OnPaint → EnsureLayeredSurface(新 w,h)（按参数重建
+        // 表面）→ ULW 提交新尺寸，拖拽过程画面跟随 rect（否则显示旧尺寸
+        // 画面黑边/错位）。数据静止期不 Reposition，本路径只在数据变化拍
+        // 与拖拽帧触发，静止画面零重绘不受影响
+        if (p && !(p->flags & SWP_NOSIZE) && !(p->flags & SWP_HIDEWINDOW)
+            && IsWindowVisible(m_hwnd)) {
+            InvalidateRect(m_hwnd, nullptr, FALSE);
         }
         // 拖动/跟随移动中的实时反色（PNM AnchorJudgeThrottled 同款语义，
         // 2026-11-07 反馈「拖动自动反转颜色」补齐）：移动事件流上
@@ -677,15 +729,50 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(m_hwnd, msg, wp, lp);
 
+    case WM_GETMINMAXINFO: {
+        // §5.1②（方案③）：系统拖拽循环自动钳制——min = 最小可读尺寸公式
+        //（与 CalcLayout 用户尺寸优先分支共用小函数），max = 工作区（防
+        // 拉出屏幕）
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        if (mmi) {
+            mmi->ptMinTrackSize.x = MinTrackWidth();
+            mmi->ptMinTrackSize.y = MinTrackHeight();
+            RECT rc, wa, mon;
+            GetWindowRect(m_hwnd, &rc);
+            PTM_GetWorkAreaForRect(rc, wa, mon);
+            mmi->ptMaxTrackSize.x = wa.right - wa.left;
+            mmi->ptMaxTrackSize.y = wa.bottom - wa.top;
+        }
+        return 0;
+    }
+
     case WM_NCHITTEST: {
         // 常驻/pin 态：头部条 = 拖动柄（HTCAPTION 系统托管拖动，ULW 下
         // 同样工作），单窗模式指标区让给点击切换、多窗模式整头部条可拖
         // （本窗固定指标，无切换控件）。hover 态（未 pin）：恒 HTCLIENT
-        // ——不可拖，跟锚（M6 §4.1.3）
+        // ——不可拖，跟锚（M6 §4.1.3）。§5.1①（方案③）：边缘带 resize
+        // 命中加在头部条判定之前——角部与头部条重叠时 resize 优先（拖动
+        // 走中部头部条足够）；穿透开启时本消息根本收不到（输入漏走），
+        // 正交无冲突
         if (!CProcessTopPlugin::Instance().GroupDraggable())
             return HTCLIENT;
         POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
         ScreenToClient(m_hwnd, &pt);
+        RECT rc;
+        GetClientRect(m_hwnd, &rc);
+        int edge = std::max(5, (int)(5 * m_dpi_scale));   // 边带宽
+        bool left = pt.x < edge, right = pt.x >= rc.right - edge;
+        bool top = pt.y < edge, bottom = pt.y >= rc.bottom - edge;
+        if (left || right || top || bottom) {
+            if (top && left)    return HTTOPLEFT;
+            if (top && right)   return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right)return HTBOTTOMRIGHT;
+            if (left)  return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top)   return HTTOP;
+            return HTBOTTOM;
+        }
         bool multi = CProcessTopPlugin::Instance().m_settings.multi_window;
         if (PtInRect(&m_rc_header, pt) && (multi || !PtInRect(&m_rc_metric, pt)))
             return HTCAPTION;
@@ -753,8 +840,10 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
         } else if (id >= 600 && id <= 602) {
-            // 行数（每窗独立，方案 §2.4）：600/601/602 → 5/10/15
+            // 行数（每窗独立，方案 §2.4）：600/601/602 → 5/10/15。
+            // §5.2⑦（D2=A）：显式选行数 → 清高度记忆，回行数驱动
             m_cfg.topn = 5 * (id - 599);
+            m_cfg.h = 0;
             m_topn = m_cfg.topn;
             // 同拍重灌（问题②同类缺陷）：立即按新行数截断/补齐（快照供
             // 15 行），重画不再用旧行集
@@ -766,6 +855,36 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             }
             RecalcAndRepaint(true);
             CProcessTopPlugin::Instance().m_settings_dirty = true;
+        } else if (id == 365) {
+            // 窗口置顶开关（2026-11-10 方案② §3.1）：翻转 + 全组切换链
+            //（§3.4 HideGroup→ShowGroupAt 复用首显链按新键决定层）
+            auto& plugin = CProcessTopPlugin::Instance();
+            plugin.m_settings.popup_topmost = !plugin.m_settings.popup_topmost;
+            plugin.ApplyTopmostChange();
+            plugin.m_settings_dirty = true;
+        } else if (id == 366) {
+            // 鼠标穿透（2026-11-10 方案④ §4.1）：只能「从关到开」——开着
+            // 穿透的窗收不到右键（自锁，D4=A 取消入口唯一 = 设置面板）。
+            // 逐窗即时生效（读-改-写 ex-style，无需重显），落盘走节流
+            auto& plugin = CProcessTopPlugin::Instance();
+            plugin.m_settings.popup_click_through = true;
+            WindowManager::Instance().ForEach([](CTopListWindow& w, int) {
+                w.ApplyClickThrough(true);
+            });
+            plugin.m_settings_dirty = true;
+        } else if (id == 370) {
+            // 恢复默认大小（方案③ §5.2⑧，D3=A 仅自定义过才显示）：清
+            // w/h 记忆 + 行数回 cfg.topn 记忆值 + 同拍重灌（360 pin 同构）
+            m_cfg.w = m_cfg.h = 0;
+            m_topn = m_cfg.topn;
+            {
+                MetricsSnapshot snap;
+                bool valid = false;
+                CProcessTopPlugin::Instance().CopySnapshot(snap, valid);
+                ApplySnapshotForCurrentView(snap);
+            }
+            RecalcAndRepaint(true);
+            CProcessTopPlugin::Instance().SaveWindowConfigsNow();
         } else if (id >= 320 && id <= 324) {
             // 添加窗口（M6 §4.6）：kind 映射 320..324 → Cpu/Mem/DiskIo/
             // Gpu/Vram（CPU 视图合并后 325 核型退役，异构机 CPU 窗形态
@@ -862,6 +981,16 @@ void CTopListWindow::CycleKind(int step) {
 // ============================================================
 
 void CTopListWindow::BuildContextMenu(POINT pt) {
+    // §2.2（2026-11-10 方案）：RAII 置 m_menu_open 覆盖 for(;;) 重开与
+    // 全部退出路径——TrackPopupMenu 模态循环期间继续 dispatch 投递消息
+    //（WM_PTM_REFRESH 照常执行），Reposition 冻结早退（数据照收、重绘照
+    // 走，只冻结窗口几何），plugin::HoverTick 菜单期早退（纯 hover 态鼠标
+    // 移向菜单不触发离开收窗——owner 闪关）
+    struct MenuOpenGuard {
+        ~MenuOpenGuard() { CProcessTopPlugin::Instance().m_menu_open = false; }
+    } menu_open_guard;
+    CProcessTopPlugin::Instance().m_menu_open = true;
+
     // GPU 口径 toggle 后要重开菜单刷新勾选态（多选交互）；
     // 其余命令一次即走。
     for (;;) {
@@ -925,15 +1054,17 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, TR(L"GPU 口径"));
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         }
-        // 行数（每窗独立，恒显；M6 §4.6）
+        // 行数（每窗独立，恒显；M6 §4.6）。§5.2⑦（D2=A）：勾选态按
+        // CalcVisibleRows——自定义高度下反推值非 5/10/15 时全不勾（如实）
         {
             HMENU sub_rows = CreatePopupMenu();
             const int rows_n[3] = { 5, 10, 15 };
+            int vis_rows = CalcVisibleRows();
             for (int i = 0; i < 3; i++) {
                 wchar_t lab[16];
                 swprintf_s(lab, 16, L"%d \x884c", rows_n[i]);
                 UINT flags = MF_STRING;
-                if (m_cfg.topn == rows_n[i]) flags |= MF_CHECKED;
+                if (vis_rows == rows_n[i]) flags |= MF_CHECKED;
                 AppendMenuW(sub_rows, flags, 600 + i, TR(lab));
             }
             AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub_rows, TR(L"行数"));
@@ -969,6 +1100,20 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
         AppendMenuW(menu, MF_STRING, 360,
                     TR(CProcessTopPlugin::Instance().GroupPinned()
                            ? L"取消固定" : L"固定"));
+        // 窗口置顶 / 鼠标穿透（2026-11-10 方案②④：仅常驻/pin 态显示——
+        // hover 弹窗恒置顶且穿透对弹窗无意义，§3.2/§4.1）；恢复默认大小
+        //（方案③ §5.2⑧，D3=A：仅自定义过 w/h 才显示）
+        if (CProcessTopPlugin::Instance().GroupDraggable()) {
+            auto& plugin = CProcessTopPlugin::Instance();
+            AppendMenuW(menu,
+                        MF_STRING | (plugin.m_settings.popup_topmost ? MF_CHECKED : 0),
+                        365, TR(L"窗口置顶"));
+            AppendMenuW(menu,
+                        MF_STRING | (plugin.m_settings.popup_click_through ? MF_CHECKED : 0),
+                        366, TR(L"鼠标穿透"));
+            if (m_cfg.w > 0 || m_cfg.h > 0)
+                AppendMenuW(menu, MF_STRING, 370, TR(L"恢复默认大小"));
+        }
         // 「关闭」任何窗数可用：最后一窗 × = 退出悬浮窗模式（item 保留），
         // 单窗/多窗同一语义（方案 §3.2 关闭语义表）
         SetForegroundWindow(m_hwnd);
@@ -1011,6 +1156,17 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
 // ============================================================
 // backdrop (PNM-inherited)
 // ============================================================
+
+void CTopListWindow::SetAppearance(int color_mode, int effect, int opacity) {
+    m_color_mode = color_mode;
+    ApplyBackdrop(effect, opacity);
+    // §4.2 协调兜底（2026-11-10 方案四）：效果档热切换（尤其 opaque↔
+    // layered）会动 WS_EX_LAYERED 位，穿透按当前设置重校（幂等）——
+    // opaque↔layered 切换若不重校，穿透位会因 LAYERED 位增删而静默
+    // 失效/复活
+    ApplyClickThrough(CProcessTopPlugin::Instance().m_settings.popup_click_through
+                      && CProcessTopPlugin::Instance().GroupDraggable());
+}
 
 void CTopListWindow::ApplyBackdrop(int effect, int opacity) {
     if (!m_hwnd || !IsWindow(m_hwnd)) return;   // 死句柄（Destroy 后待收尸）
@@ -1082,6 +1238,37 @@ void CTopListWindow::ApplyBackdrop(int effect, int opacity) {
     if (content_change) m_cov_dirty = true;
     m_last_snap_rect = {};
     InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void CTopListWindow::ApplyClickThrough(bool on) {
+    // §4.2（2026-11-10 方案四）：内容窗对鼠标完全「不存在」（点击/拖选/
+    // 滚轮全落下层，纯显示 HUD）。技术前提：WS_EX_TRANSPARENT 只对带
+    // WS_EX_LAYERED 的窗口的鼠标输入生效——layered 档（acrylic/transparent/
+    // blur，effect≠3）本就 LAYERED 只动 TRANSPARENT 位；opaque 档（普通
+    // 窗口）开穿透 = 同时借 layered 路径（加 LAYERED + SLWA(255) 完全
+    // 不透明，GDI 绘制照常显示；layered 窗未设 alpha 前不显示，SLWA 必
+    // 须跟上）；关 = 视效果档归还（opaque 档去两个位恢复普通窗口）。
+    // 读-改-写保其它位；blur 层与行 tooltip 窗本来就 WS_EX_TRANSPARENT
+    //（纯视觉层，top_list_window.cpp EnsureBlurLayer/EnsureRowTooltip），
+    // 穿透与否都穿透，不动。即时生效无需重显；幂等（SetAppearance 效果
+    // 档切换后 / ShowAt 首显均重调兜底——ApplyBackdrop 的 LAYERED 位
+    // 写入点已核查为读-改-写，穿透位不会被擦，重调仅防御初建窗口）
+    if (!m_hwnd || !IsWindow(m_hwnd)) return;
+    LONG_PTR ex = GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE);
+    LONG_PTR want = ex;
+    if (on) {
+        want |= WS_EX_TRANSPARENT;
+        if (!(want & WS_EX_LAYERED)) want |= WS_EX_LAYERED;   // 借路径
+    } else {
+        want &= ~WS_EX_TRANSPARENT;
+        if (m_backdrop_effect == 3) want &= ~WS_EX_LAYERED;   // opaque 档归还
+    }
+    if (want != ex)
+        SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, want);
+    // 本次新借的 LAYERED 位必须补 SLWA(255)（已 layered 的窗口走 ULW/
+    // 既有 SLWA，不动）。opaque 档借路径后绘制照走 WM_PAINT 双缓冲
+    if (on && !(ex & WS_EX_LAYERED))
+        SetLayeredWindowAttributes(m_hwnd, 0, 255, LWA_ALPHA);
 }
 
 void CTopListWindow::EnsureBlurLayer() {
@@ -1711,7 +1898,11 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
 void CTopListWindow::UpdateFromSnapshot(const MetricsSnapshot& snap, MetricKind kind,
                                         int topn, int io_view, bool first_tick) {
     m_kind = kind;
-    m_topn = topn;
+    // §5.2⑥（方案③，D2=A）：自定义高度下可视行数由高度反推（CalcVisible
+    // Rows，与 CalcLayout 公式互逆）；h=0 = 行数驱动，即传入 topn（= 各窗
+    // cfg.topn）。m_rows 截断点（ApplySnapshotForCurrentView 内 m_topn
+    // resize）无需改——它读这里的 m_topn
+    m_topn = (m_cfg.h > 0) ? CalcVisibleRows() : topn;
     m_io_view = io_view;
     ApplySnapshotForCurrentView(snap);
 
@@ -1882,18 +2073,46 @@ void CTopListWindow::ShowAt(int x, int y) {
         m_cov_dirty = true;   // 首显判定结果（翻转/面板观感）影响双底内容
     }
 
-    // Z 序一次到位（2026-11-09 闪现治本）：旧序 blur 先 HWND_TOPMOST——已
-    // topmost 的窗再设 TOPMOST 会在带内提顶（真实窗实测），blur 那一瞬压在
-    // 内容之上，两步间若插入 DWM vsync 即合成一帧「纯模糊无字」（悬浮窗
-    // 不定时闪一下的根因）。改为内容先提顶、blur 以内容为 insert-after 落
-    // 在其正下方（ApplyBackdrop 可见热切换同款手法）——每步完成后 Z 序
-    // 形态都正确，压顶窗口期不存在
-    SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, pw, ph,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // Z 序纪律（2026-11-10 方案 §2.1 治本）：首显一次进组顶（或按置顶
+    // 开关落桌面层，§3.3），已可见重排恒 SWP_NOZORDER——旧实现每拍数据
+    // 刷新重排都带 HWND_TOPMOST，已 topmost 的窗再设 TOPMOST = 带内提顶
+    // （2026-11-09 闪现治本实测同款机制），置顶组内任何冒头的窗口（PTM
+    // 自己右键的菜单 #32768、其他软件的置顶菜单/悬浮窗）最多 500ms 就被
+    // 压到本窗之下——常驻右键菜单点不了的根因。修复后数据刷新重排不碰
+    // Z 序，其他软件后弹的置顶窗自然在 PTM 之上，谁也不压谁。2026-11-09
+    // 闪现治本的成对手法保留：blur 以内容为 insert-after 落正下方（两
+    // 分支同款——桌面层分支内容窗已在桌面层，blur 紧随其后仍在普通带
+    // 之下，无副作用）
+    auto& plugin = CProcessTopPlugin::Instance();
+    bool first_show = !m_visible;   // m_visible 在本函数尾才置 true，时点可靠
+    // hover 组恒置顶（§3.3：跟随弹出必须置顶，否则弹出来就被盖看不见，
+    // GroupDraggable()=false 即 hover 态）；常驻/pin 且开关关 → 桌面层
+    bool topmost_show = plugin.m_settings.popup_topmost || !plugin.GroupDraggable();
+    if (first_show && !topmost_show) {
+        // §3.3（D1=A）：去 topmost 扩展位 + 插桌面部件层（壁纸之上、桌面
+        // 图标 SHELLDLL_DefView 之下，Rainmeter「On desktop」同款）；探测
+        // 失败兜底 HWND_BOTTOM（Z 序最底同样贴壁纸层，仅可能被图标层盖
+        // 住图标区——极端路径可接受）。SetWindowPos(HWND_TOPMOST) 路径
+        //（开关开回）会自动恢复 WS_EX_TOPMOST 位，无需手动补
+        LONG_PTR ex = GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE);
+        if (ex & WS_EX_TOPMOST)
+            SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);
+        HWND anchor = PTM_DesktopLayerAnchor();
+        SetWindowPos(m_hwnd, anchor ? anchor : HWND_BOTTOM, x, y, pw, ph,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+        SetWindowPos(m_hwnd, first_show ? HWND_TOPMOST : nullptr, x, y, pw, ph,
+                     (first_show ? 0u : (UINT)SWP_NOZORDER)
+                         | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
     if (m_blur_hwnd)
         SetWindowPos(m_blur_hwnd, m_hwnd, x, y, pw, ph,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
     m_visible = true;
+    // 穿透按当前设置+组形态重校（§4.2：幂等；首显/重显/加窗/切换链全
+    // 场景兜底——hover 态恒不穿透，常驻/pin 按键值）
+    ApplyClickThrough(plugin.m_settings.popup_click_through
+                      && plugin.GroupDraggable());
     if (m_acrylic_active) UpdateWindow(m_hwnd);
 }
 
@@ -1913,9 +2132,14 @@ void CTopListWindow::Reposition() {
     // hover 状态机 300ms 后又收回。显示只由组显示路径
     // （ShowGroupAt/LayoutGroup → ShowAt 顶层）驱动，与
     // UpdateFromSnapshot 的 !m_visible 早退同一条纪律（问题⑤治本）。
-    // 常驻模式不受影响——InitOnce 常驻分支自己走 ShowGroupAt 显示
+    // 常驻模式不受影响——InitOnce 常驻分支自己走 ShowGroupAt 显示。
+    // §2.2（2026-11-10 方案）：交互期几何冻结——菜单模态循环 / 拖动
+    // resize 系统模态循环期间早退（数据照收、重绘照走，只冻结几何），
+    // 防刷新拍与用户手势打架（resize 中 CalcLayout 打回公式尺寸 / 菜单
+    // 被 owner 重排闪动）
     if (!m_hwnd || !IsWindow(m_hwnd)) return;
     if (!m_visible) return;
+    if (m_sizemove || CProcessTopPlugin::Instance().m_menu_open) return;
     RECT rc;
     GetWindowRect(m_hwnd, &rc);
     ShowAt(rc.left, rc.top);
@@ -1976,6 +2200,34 @@ int CTopListWindow::ValueAreaWidth() const {
     return VALUE_AREA_W;
 }
 
+int CTopListWindow::MinTrackWidth() const {
+    // §5.1④（方案③）：最小可读宽（WM_GETMINMAXINFO 拖拽钳制与 CalcLayout
+    // 用户尺寸优先分支共用）——左右 PADDING + 序号列 + 名字列下限 40px +
+    // 值区（双列形态自带加宽，ValueAreaWidth 形态感知）。全部为已 DPI
+    // 缩放的运行时成员
+    return 2 * PADDING + IDX_W + (int)(40 * m_dpi_scale) + ValueAreaWidth();
+}
+
+int CTopListWindow::MinTrackHeight() const {
+    // 最小高 = 上下 PADDING + 头部条 + 摘要 + 1 行（状态行按需挤压数据区）
+    return PADDING + HEADER_H + SUMMARY_H + ROW_HEIGHT + PADDING;
+}
+
+int CTopListWindow::CalcVisibleRows() const {
+    // §5.2⑥（方案③，D2=A）：自定义高度 → 可视行数。与 CalcLayout 高度
+    // 公式互逆（注释互指）：fixed = 非行区固定高（状态行/rest 行按当前
+    // 状态反推——慢变量，一拍内自愈；窗口高恒定，状态行出现时自动挤占
+    // 一行数据区）。上限 15 = 快照供数上限（agg.topn），超出部分钳在 15；
+    // h=0（未自定义）= 行数驱动，返回 m_topn（每拍与 cfg.topn 同步）
+    if (m_cfg.h <= 0) return m_topn;
+    StatusTone lines[4]; int n = 0;
+    ActiveStatusLines(lines, n);
+    int fixed = 2 * PADDING + HEADER_H + SUMMARY_H + n * STATUS_H
+              + ((m_rest_value >= 0 || m_rest_p >= 0) ? ROW_HEIGHT : 0);
+    int rows = (m_cfg.h - fixed) / ROW_HEIGHT;
+    return std::clamp(rows, 1, 15);
+}
+
 void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     HFONT hOld = (HFONT)SelectObject(hdc, m_font_normal);
     int rows = m_rows_has_value ? (int)m_rows.size() : 1;
@@ -2001,6 +2253,12 @@ void CTopListWindow::CalcLayout(HDC hdc, int& out_w, int& out_h) {
     if (m_rest_value >= 0 || m_rest_p >= 0) out_h += ROW_HEIGHT;
     if (out_h < HEADER_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING)
         out_h = HEADER_H + SUMMARY_H + ROW_HEIGHT + 2 * PADDING;
+    // §5.2⑤（方案③）：用户尺寸优先——拉过就以用户为准（min 钳防不可
+    // 读，与 GETMINMAXINFO 同公式），宽向内容自适应客户区；不随指标
+    // 切换/双列形态切换重置。0 = 未自定义 → 完全走上方公式（默认行为
+    // 分毫不动）
+    if (m_cfg.w > 0) out_w = std::max(m_cfg.w, MinTrackWidth());
+    if (m_cfg.h > 0) out_h = std::max(m_cfg.h, MinTrackHeight());
 }
 
 void CTopListWindow::DrawHeader(HDC hdc, int w, int y) {

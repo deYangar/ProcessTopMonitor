@@ -22,12 +22,17 @@
 // 核型双列），Clamp 把配置里的 7/8 一律归 0，枚举值保留作兼容占位）。
 // x/y 语义（M6 §3.1）：仅常驻/pin 态使用的「拖过的位置记忆」；
 // INT_MIN=未拖过（常驻态用组布局，hover 态忽略）
+// w/h 语义（2026-11-10 方案③）：自定义窗口大小记忆（物理像素，DPI 变更
+// 由 WM_DPICHANGED 按建议矩形重记）；0=未自定义 → 窗口尺寸走 CalcLayout
+// 行数公式。行数菜单点击清 h（显式选行数 = 回行数驱动）
 struct WindowCfg {
     int kind = 0;          // MetricKind as int（0=Cpu 1=Mem 2=DiskIo 5=Gpu 6=Vram；7/8 已退役归 0）
     int io_view = 0;       // 0=combined 1=read 2=write（仅 kind==2 有意义）
     int topn = 10;         // 5/10/15
     int x = INT_MIN;       // INT_MIN = 未拖过
     int y = INT_MIN;
+    int w = 0;             // 0 = 未自定义（方案③ resize 记忆，物理像素）
+    int h = 0;
 };
 
 struct PtSettings {
@@ -62,6 +67,15 @@ struct PtSettings {
     // cpu 视图总量口径（NtQSI）System 恒在 ranking，不受此键影响。
     // 缺键 = true（旧配置升级天然兼容）
     bool show_system_procs = true;
+    // 常驻悬浮窗置顶开关（2026-11-10 方案二）：false = 窗口落桌面部件层
+    // （壁纸之上、桌面图标之下，Rainmeter「On desktop」同款）。仅管常驻/
+    // pin 组——hover 弹窗恒置顶（跟随弹出必须置顶）。缺键 = true（现状）
+    bool popup_topmost = true;
+    // 鼠标穿透开关（2026-11-10 方案四）：true = 悬浮窗内容窗对鼠标完全
+    // 「不存在」（WS_EX_TRANSPARENT，点击/滚轮全落下层），纯显示 HUD。
+    // 自锁特性：开启后悬浮窗收不到任何输入，取消穿透唯一入口 = 设置面板。
+    // 仅常驻/pin 态生效。缺键 = false（现状）
+    bool popup_click_through = false;
     std::vector<WindowCfg> windows;   // 单窗模式≤1；多窗 1..6；空=悬浮窗模式退出
 
     // clamp everything to its legal domain (hand-edited settings.json must
@@ -103,6 +117,10 @@ struct PtSettings {
                 c.kind = 0;   // 3/4 是 DiskRead/DiskWrite 占位，不进配置
             if (c.io_view < 0 || c.io_view > 2) c.io_view = 0;
             if (c.topn != 5 && c.topn != 10 && c.topn != 15) c.topn = 10;
+            // w/h 防砖（方案③）：荒谬值视为未自定义（0），精确 min 钳由
+            // CalcLayout 运行时兜底（GETMINMAXINFO 拖拽期同款公式）
+            if (c.w < 50 || c.w > 8192) c.w = 0;
+            if (c.h < 50 || c.h > 8192) c.h = 0;
         }
     }
 
@@ -193,8 +211,8 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     FILE* f = _wfopen(tmp, L"w");
     if (!f) return false;
     // M6 §3.2：schema 固定写 3；新增三键；windows[] 每行只写
-    // {kind, io_view, topn, x, y}；dock_edge/docked/dock_target 与 v1 的
-    // metric/win_x/win_y 不再写出
+    // {kind, io_view, topn, x, y, w, h}（w/h=自定义大小记忆，方案③）；
+    // dock_edge/docked/dock_target 与 v1 的 metric/win_x/win_y 不再写出
     fprintf(f, "{\n");
     fprintf(f, "  \"schema\": 3,\n");
     fprintf(f, "  \"refresh_ms\": %d,\n", st.refresh_ms);
@@ -216,11 +234,13 @@ inline bool PtSaveSettings(const std::wstring& config_dir, const PtSettings& st)
     fprintf(f, "  \"multi_window\": %s,\n", st.multi_window ? "true" : "false");
     fprintf(f, "  \"cpu_view\": %d,\n", st.cpu_view);
     fprintf(f, "  \"show_system_procs\": %s,\n", st.show_system_procs ? "true" : "false");
+    fprintf(f, "  \"popup_topmost\": %s,\n", st.popup_topmost ? "true" : "false");
+    fprintf(f, "  \"popup_click_through\": %s,\n", st.popup_click_through ? "true" : "false");
     fprintf(f, "  \"windows\": [\n");
     for (size_t i = 0; i < st.windows.size(); i++) {
         const WindowCfg& c = st.windows[i];
-        fprintf(f, "    {\"kind\":%d,\"io_view\":%d,\"topn\":%d,\"x\":%d,\"y\":%d}%s\n",
-                c.kind, c.io_view, c.topn, c.x, c.y,
+        fprintf(f, "    {\"kind\":%d,\"io_view\":%d,\"topn\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}%s\n",
+                c.kind, c.io_view, c.topn, c.x, c.y, c.w, c.h,
                 (i + 1 < st.windows.size()) ? "," : "");
     }
     fprintf(f, "  ]\n");
@@ -300,6 +320,8 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
     getb("\"multi_window\"", st.multi_window);
     geti("\"cpu_view\"", st.cpu_view);   // 缺键 = 默认 1（Clamp 兜底非法值）
     getb("\"show_system_procs\"", st.show_system_procs);   // 缺键 = 默认 true
+    getb("\"popup_topmost\"", st.popup_topmost);           // 缺键 = 默认 true
+    getb("\"popup_click_through\"", st.popup_click_through);   // 缺键 = 默认 false
     int schema_read = 0;   // 无 schema 键 = v1/v2 旧文件，走迁移
     geti("\"schema\"", schema_read);
 
@@ -331,6 +353,8 @@ inline bool PtLoadSettings(const std::wstring& config_dir, PtSettings& st) {
                 c.topn = rowi("\"topn\"", 10);
                 c.x = rowi("\"x\"", INT_MIN);
                 c.y = rowi("\"y\"", INT_MIN);
+                c.w = rowi("\"w\"", 0);   // 缺键 = 0（未自定义，方案③）
+                c.h = rowi("\"h\"", 0);
                 st.windows.push_back(c);
                 cur = cb + 1;
             }

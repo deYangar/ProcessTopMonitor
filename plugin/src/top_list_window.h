@@ -80,13 +80,18 @@ public:
     void ApplyCfg(const WindowCfg& c);    // kind/io_view/topn 变更入口
     int  Index() const { return m_index; }   // manager 槽位（菜单命令用）
 
-    // settings pass-through for draw-time reads (effect/opacity/color mode)
-    void SetAppearance(int color_mode, int effect, int opacity) {
-        m_color_mode = color_mode;
-        ApplyBackdrop(effect, opacity);
-    }
+    // settings pass-through for draw-time reads (effect/opacity/color mode)。
+    // 实现在 cpp（SetAppearance 尾部带穿透兜底重调，引用 plugin 单例——
+    // header 里 inline 会撞 plugin_main.h ↔ 本头文件的循环 include）
+    void SetAppearance(int color_mode, int effect, int opacity);
 
     int GetIoView() const { return m_io_view; }   // plugin syncs it into settings
+
+    // 鼠标穿透（2026-11-10 方案四 §4.2，public：右键 366/设置面板 OK/
+    // 取消还原均从窗口外逐窗调用）：内容窗 ex-style 读-改-写，即时生效；
+    // opaque 档借 layered 路径（WS_EX_LAYERED + SLWA(255)）使
+    // WS_EX_TRANSPARENT 对鼠标输入生效。幂等
+    void ApplyClickThrough(bool on);
 
     // 预览实例入口（选项对话框外观反馈，PNM COpacityPreview 的 PTM
     // 形态）：灌固定示例数据并置预览模式（交互全短路），随后 ShowAt
@@ -138,6 +143,11 @@ private:
     // 8×DPI 列间距；其余视图单列。DrawRow 名字列缩减与 CalcLayout 窗宽联动
     // 都以此为单一事实源
     int ValueAreaWidth() const;
+    // 自定义大小（2026-11-10 方案③）：最小尺寸公式（GETMINMAXINFO 与
+    // CalcLayout 用户尺寸优先分支共用）+ 可视行数反推（高度公式互逆）
+    int MinTrackWidth() const;
+    int MinTrackHeight() const;
+    int CalcVisibleRows() const;
     // CPU 视图形态解析（合并方案 §3，每拍求值）：
     // SplitWanted = 异构 && 设置「核型分列」（用户意图，随设置翻转）；
     // SplitDisplayActive = SplitWanted && 核型数据有效（含粘滞保持期，
@@ -295,6 +305,15 @@ private:
     bool m_cov_dirty = true;           // 预览双底缓存脏标志：内容恒定，仅主题/翻转/效果档切换置脏
     RECT m_rc_header = {};             // 头部条（拖动柄 + 命中测试）
     RECT m_rc_metric = {};             // 指标区（点击切换；单窗模式可点）
+
+    // 交互期几何冻结（2026-11-10 方案 §2.2，UI 线程独占无竞态）：
+    // 菜单模态循环 / 拖动-resize 系统模态循环期间 Reposition() 入口早退
+    // ——数据照收（UpdateFromSnapshot 照跑、重绘照走），只冻结窗口几何，
+    // 防刷新拍与用户手势打架（resize 中 CalcLayout 打回公式尺寸 / 菜单
+    // 被 owner 闪关）。m_saw_sizing 区分本次 sizemove 是 resize 还是纯移动
+    //（纯移动不写 w/h，保持「0 = 未自定义」语义）
+    bool m_sizemove = false;
+    bool m_saw_sizing = false;
 
     // layout constants (96-DPI base, DPI-scaled members)
     int PADDING = 12, ROW_HEIGHT = 30, ICON_SIZE = 20, CORNER_RADIUS = 8;
