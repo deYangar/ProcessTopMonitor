@@ -533,7 +533,11 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 1) {
             ResolvePendingPaths();
-            if (PumpIconExtraction(2))
+            // 全量泵（2026-11-10 实测「图标逐个蹦太慢」治本）：
+            // icon_latency_probe 实测 12 个 exe 提取共 25ms——帧分片
+            // 每拍 2 个是 PNM 防几十进程首次风暴的旧设计，TopN=10
+            // 场景下一拍清空 pending 即「唰」全亮，稳态零成本
+            if (PumpIconExtraction((int)m_icon_pending.size()))
                 InvalidateRect(m_hwnd, nullptr, FALSE);
         } else if (wp == 2) {
             // hover 状态机 tick（挂组长窗，M6 §4.3.2；组隐藏不停 timer）
@@ -545,6 +549,12 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         // pull the latest snapshot on the UI thread (posted by the refresh
         // timer thread — same discipline as PNM's PopupRefreshFromSnapshot)
         CProcessTopPlugin::Instance().TopListRefreshFromSnapshot();
+        // 数据拍立即泵（2026-11-10）：路径解析+提取与数据同拍完成，
+        // 不等下个 200ms timer 拍——冷启动图标随首帧全亮、新上榜
+        // 行 ≤1 数据拍出图；稳态 pending 空、无路径行为 0 开销
+        ResolvePendingPaths();
+        if (PumpIconExtraction((int)m_icon_pending.size()))
+            InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
 
     case WM_PTM_LANG_CHANGED:

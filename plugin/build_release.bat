@@ -4,7 +4,9 @@ set MSVC=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
 set SDK=C:\Program Files (x86)\Windows Kits\10
 set SDKVER=10.0.26100.0
 
-set COMMON_FLAGS=/nologo /O2 /EHsc /MT /std:c++17 /utf-8 /Zi /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WINDLL /Isrc
+rem /FS: /Zi multi-pdb shared-write serialization, fixes C1041 when an indexer/AV
+rem briefly holds vc140.pdb (2026-11-10 iconfix build: dual-arch full C1041)
+set COMMON_FLAGS=/nologo /O2 /EHsc /MT /std:c++17 /utf-8 /Zi /FS /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WINDLL /Isrc
 rem /OPT:REF must be explicit: /DEBUG defaults to NOREF and keeps all dead
 rem code (2026-10-21 measured on PNM: x64 2.02MB -> 678KB, -67%)
 set COMMON_LINK=/DLL /DEBUG /MAP /OPT:REF gdi32.lib user32.lib shell32.lib dwmapi.lib advapi32.lib tdh.lib comctl32.lib imm32.lib msimg32.lib pdh.lib
