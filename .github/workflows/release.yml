@@ -1,0 +1,106 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 1.0.0，tag 为 v1.0.0）'
+        required: true
+        type: string
+  push:
+    tags: ['v*']
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+
+      # 编译参数与 plugin/build_release.bat 保持一致：
+      # /MT 静态 CRT、链接显式 /OPT:REF（/DEBUG 默认 NOREF 会保留全部死代码）
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build x64
+        shell: bash
+        working-directory: plugin
+        run: |
+          rc /nologo /fo src/resource.res src/resource.rc
+          set -o pipefail
+          cl /nologo /O2 /EHsc /MT /std:c++17 /utf-8 /Zi /FS \
+             /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WINDLL /Isrc \
+             /FeProcessTopMonitor.dll \
+             src/metrics_collector.cpp src/etw_file_collector.cpp src/core_class_mapper.cpp \
+             src/gpu_collector.cpp src/top_aggregator.cpp src/top_list_window.cpp \
+             src/window_manager.cpp src/options_dialog.cpp src/plugin_main.cpp src/i18n.cpp \
+             /link /DLL /DEBUG /MAP /OPT:REF \
+             gdi32.lib user32.lib shell32.lib dwmapi.lib advapi32.lib tdh.lib \
+             comctl32.lib imm32.lib msimg32.lib pdh.lib \
+             src/resource.res /OUT:ProcessTopMonitor.dll 2>&1 | tee build_x64.log
+          ! grep -qi "warning" build_x64.log
+
+      - name: Setup MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build x86
+        shell: bash
+        working-directory: plugin
+        run: |
+          set -o pipefail
+          cl /nologo /O2 /EHsc /MT /std:c++17 /utf-8 /Zi /FS \
+             /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WINDLL /Isrc \
+             /FeProcessTopMonitor_x86.dll \
+             src/metrics_collector.cpp src/etw_file_collector.cpp src/core_class_mapper.cpp \
+             src/gpu_collector.cpp src/top_aggregator.cpp src/top_list_window.cpp \
+             src/window_manager.cpp src/options_dialog.cpp src/plugin_main.cpp src/i18n.cpp \
+             /link /DLL /DEBUG /MAP /OPT:REF \
+             gdi32.lib user32.lib shell32.lib dwmapi.lib advapi32.lib tdh.lib \
+             comctl32.lib imm32.lib msimg32.lib pdh.lib \
+             src/resource.res /OUT:ProcessTopMonitor_x86.dll 2>&1 | tee build_x86.log
+          ! grep -qi "warning" build_x86.log
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          Compress-Archive -Path plugin/ProcessTopMonitor.dll, plugin/ProcessTopMonitor_x86.dll `
+            -DestinationPath "ProcessTopMonitor-v$v.zip"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "ProcessTopMonitor-v$VERSION.zip" \
+              --title "$TAG" \
+              --notes "ProcessTopMonitor $TAG。zip 内含 x64 / x86 双架构 DLL，按 TrafficMonitor 宿主位数取用：关闭 TrafficMonitor 后拷入 \`<TM>\plugins\\\` 再启动（管理员权限可解锁磁盘 IO 精确口径）。" || \
+            gh release upload "$TAG" "ProcessTopMonitor-v$VERSION.zip" --clobber
+          else
+            gh release create "$TAG" "ProcessTopMonitor-v$VERSION.zip" \
+              --title "$TAG" \
+              --target "$GITHUB_SHA" \
+              --notes "ProcessTopMonitor $TAG。zip 内含 x64 / x86 双架构 DLL，按 TrafficMonitor 宿主位数取用：关闭 TrafficMonitor 后拷入 \`<TM>\plugins\\\` 再启动（管理员权限可解锁磁盘 IO 精确口径）。"
+          fi
