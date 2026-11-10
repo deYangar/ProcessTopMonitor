@@ -704,7 +704,7 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(m_hwnd, nullptr, FALSE);
         }
         // 拖动/跟随移动中的实时反色（PNM AnchorJudgeThrottled 同款语义，
-        // 2026-11-07 反馈「拖动自动反转颜色」补齐）：移动事件流上
+        // 2026-11-07 用户反馈「拖动自动反转颜色」补齐）：移动事件流上
         // 150ms 节流截屏判定——否则静止期路径在拖动中每拍都走「矩形
         // 变了→重置计时」分支，永远进不了判定，颜色纹丝不动。覆盖自身
         // HTCAPTION 拖动与锚跟随 GroupDeltaMove 两种移动；截屏剔自身后
@@ -1561,7 +1561,7 @@ bool CTopListWindow::CaptureSnapNoFlash(const RECT& popup_rect, int w, int h) {
         m_affinity_ok = false;
         return false;
     }
-    // blur 层只在可见时排除（2026-11-10 磨砂旧采样治本，报障「呼起
+    // blur 层只在可见时排除（2026-11-10 磨砂旧采样治本，用户报障「呼起
     // 时背景模糊还是上一次的」）：隐藏窗本就不进 BitBlt 抓屏，对它做
     // affinity 开关纯属多余——且实测（tools/blur_resample_probe_20261110）
     // 该开关会把非 LAYERED SWCA 磨砂窗的 DWM 背景采样冻在旧值：呼起链
@@ -2428,7 +2428,7 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
             wchar_t r[32], wr[32];
             FormatSpeed(m_io_read_total, r, 32);
             FormatSpeed(m_io_write_total, wr, 32);
-            // 读/写文字前缀（2026-11-06 反馈：↓↑ 分不清哪边是读）。
+            // 读/写文字前缀（2026-11-06 用户反馈：↓↑ 分不清哪边是读）。
             // C-4（2026-11-10 审查）：TR() 译文进固定缓冲一律 _TRUNCATE
             // 截断语义——超长翻译文件截断显示而非 failfast 崩宿主
             _snwprintf_s(text, 160, _TRUNCATE, L"%s%s %s%s",
@@ -2581,7 +2581,7 @@ void CTopListWindow::DrawRow(HDC hdc, int y, int idx, const TopRow& row) {
     DrawTextW(hdc, name.c_str(), -1, &rc_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     // 4) 数值（右对齐 accent；双列视图 文字前缀——问题③，2026-11-06
-    //    反馈箭头 ↓↑ 分不清方向后改文字前缀；CPU 视图核型分列 P/E
+    //    用户反馈箭头 ↓↑ 分不清方向后改文字前缀；CPU 视图核型分列 P/E
     //    双列同款（IO 合计同形态），列标签随分类表（§0 拍板：Intel
     //    P核/E核、AMD X3D/标准））
     SetTextColor(hdc, GetAccentColor());

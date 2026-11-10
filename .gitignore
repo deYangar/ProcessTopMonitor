@@ -1,35 +1,40 @@
-plugin/*.obj
-plugin/*.res
+# ===== 构建产物（不入库） =====
 plugin/*.dll
 plugin/*.lib
 plugin/*.exp
 plugin/*.map
 plugin/*.pdb
+plugin/*.obj
+plugin/*.res
+plugin/*.ilk
 plugin/vc140.pdb
-plugin/build_log.txt
+plugin/src/*.res
 *.log
-# tools 测试产物（exe/obj/临时输出不入库；实测证据截图与关键结果 txt 保留）
-tools/*.exe
-tools/*.obj
-tools/*.i
-tools/accept_out.txt
-tools/deploy_watch_out.txt
-tools/diag_restart_out.txt
-tools/dll_loaded.txt
-tools/etw_sessions.txt
-tools/sess_now.txt
-tools/elev_marker.txt
-tools/enum_elevated.txt
-tools/g2_out.txt
-tools/g2_out2.txt
-tools/tm_alive.txt
-tools/load_err.txt
-tools/d3dkmt_probe_out.txt
-tools/switch_*.png
-tools/ptm_now.png
-tools/ptm_final.png
-tools/ptm_final2.png
-tools/ptm_after.png
-tools/ptm_mem.png
-tools/ptm_mem2.png
-tools/ptm_desktop.png
+*.obj
+*.exe
+*.dmp
+*.etl
+
+# ===== 构建日志 =====
+plugin/build_*.txt
+
+# ===== 内部文档（仅本地，不公开） =====
+PROGRESS.md
+AGENTS.md
+docs/plans/
+docs/技术方案.md
+docs/code_review_*/
+
+# ===== 内部工具与取证产物（仅本地，不公开） =====
+tools/
+
+# ===== 一次性开发脚本（仅本地） =====
+plugin/src/patch_*.py
+
+# ===== 会话 / 编辑器 / 系统杂项 =====
+.zcode/
+.workbuddy-ai/
+NUL
+Thumbs.db
+Desktop.ini
+*.msixbundle

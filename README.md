@@ -112,8 +112,6 @@ ProcessTopMonitor/
 │   ├── ProcessTopMonitor.dll        # 64 位编译输出
 │   └── ProcessTopMonitor_x86.dll    # 32 位编译输出
 ├── docs/
-│   ├── 技术方案.md                  # 技术方案（口径 / 降级链 / 视觉管线）
-│   ├── plans/                       # 各里程碑落地方案与验收记录
 │   └── screenshots/                 # README 界面图
 └── README.md
 ```
@@ -166,8 +164,6 @@ ProcessTopMonitor/
 - **崩溃日志不受开关控制**：crash.log / crash.dmp / werdumps 仅在崩溃时写入，平时不产生文件，保持始终启用以便排查闪退
 - **遇到闪退时**：把 `debug/` 目录（含 crash.log、werdumps 下的 .dmp）连同 DLL 版本一起反馈即可定位
 
-## 开发文档
+## 许可证
 
-- 技术方案：[docs/技术方案.md](docs/技术方案.md)
-- 里程碑方案与验收记录：[docs/plans/](docs/plans/)
-- 开发进度：[PROGRESS.md](PROGRESS.md)
+本项目采用 [GPL-3.0](LICENSE) 许可证。基于 TrafficMonitor 插件接口开发，遵循其 GPL-3.0 许可。

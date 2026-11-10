@@ -52,7 +52,7 @@ namespace {
 struct PtDlgState {
     HWND dlg = nullptr;
     HFONT font = nullptr;
-    HFONT font_title = nullptr;   // 组框标题：微软雅黑 13px（2026-11-07 拍板）
+    HFONT font_title = nullptr;   // 组框标题：微软雅黑 13px（2026-11-07 定稿）
     float dpi = 1.0f;
     int eng_rows = 0;                       // 引擎 checkbox 行数（动态）
     std::vector<std::wstring> engtypes;     // 打开时快照（确定时以此为准）
@@ -377,7 +377,7 @@ void PtCreateControls(HWND hwnd) {
     y += gpu_h + Sc(12);
 
     // ---- 磁盘 IO 采集 ----
-    // 2026-11-07 反馈：状态行原样暴露 A/B/C 档位与 ETW 会话名，用户
+    // 2026-11-07 用户反馈：状态行原样暴露 A/B/C 档位与 ETW 会话名，用户
     // 看不懂也看不出「这是什么设置」。改法：文案口语化（见
     // GetIoStatusForDialog）+ 板块内补一行口径说明，讲清「统计什么、
     // 什么时候降级、重试干什么」

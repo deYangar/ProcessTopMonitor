@@ -1063,7 +1063,7 @@ void CProcessTopPlugin::RefreshTick() {
         m_gpu.EnsureStarted();
         m_gpu_idle_since = 0;
         if (!was_running && m_gpu.IsRunning()) {
-            // 真冷启动当拍出值（问题①C 收尾，2026-11-06 反馈「切到
+            // 真冷启动当拍出值（问题①C 收尾，2026-11-06 用户反馈「切到
             // GPU 还是要预热」）：Utilization Percentage 是 cooked 计数器
             // 需两次采样，EnsureStarted 已采基准拍——这里跨时间戳补第 2
             // 次并让 Tick 把解析做完，本拍快照即有 GPU 数据，首帧零 hint
@@ -1383,7 +1383,7 @@ void CProcessTopPlugin::GetIoStatusForDialog(wchar_t* out, size_t cap) {
         wcsncpy_s(out, cap, TR(L"√ 正在按文件读写精确统计（不含网络流量，兼容模式）"), _TRUNCATE);
         break;
     case FileIoGrade::C: {
-        // 2026-11-07 反馈重写：不露 A/B/C 档位与 ETW 会话名等内部术语；
+        // 2026-11-07 用户反馈重写：不露 A/B/C 档位与 ETW 会话名等内部术语；
         // 面向用户的口径语义 + 中文原因 + 可操作指引（重试）
         wcsncpy_s(out, cap, TR(L"△ 精确统计不可用，已降级为全口径（含网络流量）"), _TRUNCATE);
         // 原因追加（GetStatusText 的 "C: reason" 段 → 中文映射）
