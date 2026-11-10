@@ -1248,11 +1248,9 @@ void CTopListWindow::ApplyClickThrough(bool on) {
     // 窗口）开穿透 = 同时借 layered 路径（加 LAYERED + SLWA(255) 完全
     // 不透明，GDI 绘制照常显示；layered 窗未设 alpha 前不显示，SLWA 必
     // 须跟上）；关 = 视效果档归还（opaque 档去两个位恢复普通窗口）。
-    // 读-改-写保其它位；blur 层与行 tooltip 窗本来就 WS_EX_TRANSPARENT
-    //（纯视觉层，top_list_window.cpp EnsureBlurLayer/EnsureRowTooltip），
-    // 穿透与否都穿透，不动。即时生效无需重显；幂等（SetAppearance 效果
-    // 档切换后 / ShowAt 首显均重调兜底——ApplyBackdrop 的 LAYERED 位
-    // 写入点已核查为读-改-写，穿透位不会被擦，重调仅防御初建窗口）
+    // 读-改-写保其它位。即时生效无需重显；幂等（SetAppearance 效果档
+    // 切换后 / ShowAt 首显均重调兜底——ApplyBackdrop 的 LAYERED 位写入
+    // 点已核查为读-改-写，穿透位不会被擦，重调仅防御初建窗口）
     if (!m_hwnd || !IsWindow(m_hwnd)) return;
     LONG_PTR ex = GetWindowLongPtrW(m_hwnd, GWL_EXSTYLE);
     LONG_PTR want = ex;
@@ -1269,6 +1267,31 @@ void CTopListWindow::ApplyClickThrough(bool on) {
     // 既有 SLWA，不动）。opaque 档借路径后绘制照走 WM_PAINT 双缓冲
     if (on && !(ex & WS_EX_LAYERED))
         SetLayeredWindowAttributes(m_hwnd, 0, 255, LWA_ALPHA);
+
+    // blur 层同步让路（2026-11-10 实测反馈修复）：亚克力/模糊档的
+    // blur 窗（PTMBlurTL_）本就 WS_EX_TRANSPARENT 但**无 WS_EX_LAYERED
+    // ——hit-test 不跳过它**。平时点击先命中内容窗轮不到 blur；穿透一
+    // 开内容窗被跳过，blur 成了挡在最上面的「看不见的玻璃」吃掉全部
+    // 点击（点不下下层窗口，实测「根本点不下去」；探针复现：T 无
+    // L 拦截 → +LAYERED+SLWA(255) 放行）。开 = blur 同款借 layered 路径
+    //（SLWA(255) 完全不透明，SWCA 磨砂照常）；关 = 去 LAYERED 位还原现
+    // 状形态（blur 无别处设 LAYERED，无条件去安全）
+    if (m_blur_hwnd && IsWindow(m_blur_hwnd)) {
+        LONG_PTR bex = GetWindowLongPtrW(m_blur_hwnd, GWL_EXSTYLE);
+        LONG_PTR bwant = bex;
+        if (on) {
+            if (!(bwant & WS_EX_LAYERED)) bwant |= WS_EX_LAYERED;
+        } else {
+            bwant &= ~WS_EX_LAYERED;
+        }
+        if (bwant != bex)
+            SetWindowLongPtrW(m_blur_hwnd, GWL_EXSTYLE, bwant);
+        if (on && !(bex & WS_EX_LAYERED))
+            SetLayeredWindowAttributes(m_blur_hwnd, 0, 255, LWA_ALPHA);
+    }
+    // 穿透开启时收起行 tooltip（懒创建窗 TOPMOST|TRANSPARENT 无 LAYERED，
+    // 残留会以同款机制挡点击；开启后无 mousemove 不会再弹）
+    if (on) HideRowTooltip();
 }
 
 void CTopListWindow::EnsureBlurLayer() {
