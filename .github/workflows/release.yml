@@ -83,12 +83,26 @@ jobs:
              src/resource.res /OUT:ProcessTopMonitor_x86.dll 2>&1 | tee build_x86.log
           ! grep -qi "warning" build_x86.log
 
-      - name: Package zip
+      - name: Read release note
+        id: note
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          NOTE="docs/release-notes/v${VERSION}.md"
+          if [ ! -f "$NOTE" ]; then
+            echo "::error::Release note not found: $NOTE — 发版前必须先写好 note 文件"
+            exit 1
+          fi
+          cp "$NOTE" release_body.md
+
+      - name: Package lang bundle
         shell: pwsh
         run: |
           $v = "${{ steps.ver.outputs.version }}"
-          Compress-Archive -Path plugin/ProcessTopMonitor.dll, plugin/ProcessTopMonitor_x86.dll `
-            -DestinationPath "ProcessTopMonitor-v$v.zip"
+          New-Item -ItemType Directory -Force -Path bundle/ProcessTopMonitor/lang | Out-Null
+          Copy-Item plugin/ProcessTopMonitor.dll, plugin/ProcessTopMonitor_x86.dll bundle/
+          Copy-Item plugin/src/lang/English.ini bundle/ProcessTopMonitor/lang/
+          Compress-Archive -Path bundle/* -DestinationPath "ProcessTopMonitor-lang-v$v.zip"
 
       - name: Create GitHub Release
         env:
@@ -97,14 +111,15 @@ jobs:
         run: |
           TAG="${{ steps.ver.outputs.tag }}"
           VERSION="${{ steps.ver.outputs.version }}"
+          ASSETS=(plugin/ProcessTopMonitor.dll plugin/ProcessTopMonitor_x86.dll "ProcessTopMonitor-lang-v$VERSION.zip")
           if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" "ProcessTopMonitor-v$VERSION.zip" \
+            gh release create "$TAG" "${ASSETS[@]}" \
               --title "$TAG" \
-              --notes "ProcessTopMonitor $TAG。zip 内含 x64 / x86 双架构 DLL，按 TrafficMonitor 宿主位数取用：关闭 TrafficMonitor 后拷入 \`<TM>\plugins\\\` 再启动（管理员权限可解锁磁盘 IO 精确口径）。" || \
-            gh release upload "$TAG" "ProcessTopMonitor-v$VERSION.zip" --clobber
+              --notes-file release_body.md || \
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
           else
-            gh release create "$TAG" "ProcessTopMonitor-v$VERSION.zip" \
+            gh release create "$TAG" "${ASSETS[@]}" \
               --title "$TAG" \
               --target "$GITHUB_SHA" \
-              --notes "ProcessTopMonitor $TAG。zip 内含 x64 / x86 双架构 DLL，按 TrafficMonitor 宿主位数取用：关闭 TrafficMonitor 后拷入 \`<TM>\plugins\\\` 再启动（管理员权限可解锁磁盘 IO 精确口径）。"
+              --notes-file release_body.md
           fi
