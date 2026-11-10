@@ -1,4 +1,8 @@
 // gpu_collector.cpp — PDH GPU Engine / Process Memory / Adapter Memory (G1)
+// 2026-11-10 显存口径修复：per-pid 显存数值源切 D3DKMTQueryStatistics
+// （任务管理器性能页同款 VidMM 会计）；PDH GPU Process Memory 的 cooked
+// 值是只增不减的累计假账（Starward 实测虚报 660 倍且每秒 +750MB，
+// 微软 known-issue 文档在案），只保留其实例名作 (pid×LUID) 枚举。
 #include "gpu_collector.h"
 #include "utils.h"
 #include <pdh.h>
@@ -6,7 +10,17 @@
 #include <algorithm>
 #include <cinttypes>
 
+// SDK 官方 D3DKMT 查询布局（shared 头）。WDDM2.1 起 PROCESS_SEGMENT_GROUP
+// 存在且尾部参数 union 偏移恒定（WDDM2.1/3.1 编译布局一致：tail@800，
+// 探针实测 26300）。宏必须显式定义——否则条件编译全走最老分支。
+// winternl.h 先行：LEAN_AND_MEAN 下 NTSTATUS 未定义（shared 头 typedef
+// 全线 C2059——旧手抄版废弃注释里的 C2059 事故同源）
+#define DXGKDDI_INTERFACE_VERSION 0x6003
+#include <winternl.h>
+#include <d3dkmthk.h>
+
 #pragma comment(lib, "pdh.lib")
+#pragma comment(lib, "gdi32.lib")
 
 // ============================================================
 // PDH wrappers (raw fn-typedefs not needed: pdh.h + pdh.lib direct link,
@@ -21,8 +35,11 @@ constexpr wchar_t kPathUtil[] = L"\\GPU Engine(*)\\Utilization Percentage";
 constexpr wchar_t kPathMemDed[] = L"\\GPU Process Memory(*)\\Dedicated Usage";
 constexpr wchar_t kPathMemLocal[] = L"\\GPU Process Memory(*)\\Local Usage";
 constexpr wchar_t kPathMemShared[] = L"\\GPU Process Memory(*)\\Shared Usage";
-constexpr wchar_t kPathAdaptDed[] = L"\\GPU Adapter Memory(*)\\DedicatedUsage";
-constexpr wchar_t kPathAdaptShared[] = L"\\GPU Adapter Memory(*)\\SharedUsage";
+// 2026-11-10 修复：注册表（Perflib\009）注册名带空格，无空格的
+// "DedicatedUsage" 自上线起 PdhAddEnglishCounterW 恒失败，系统级汇总
+// 从未生效、恒走「进程加总」fallback——假账直接顶到标题栏
+constexpr wchar_t kPathAdaptDed[] = L"\\GPU Adapter Memory(*)\\Dedicated Usage";
+constexpr wchar_t kPathAdaptShared[] = L"\\GPU Adapter Memory(*)\\Shared Usage";
 
 bool AddCounter(void* query, const wchar_t* path, void** out) {
     PDH_HCOUNTER h = nullptr;
@@ -68,11 +85,63 @@ bool ParseEngineInstance(const std::wstring& inst, DWORD& pid, std::wstring& eng
     return true;
 }
 
-bool ParsePidInstance(const std::wstring& inst, DWORD& pid) {
+// pid_1234_luid_0x00000000_0x00014ab5_phys_0 → (pid, LUID)。luid 段缺失时
+// luid 置零（调用方按「仅 pid 汇总」防御）。返回是否拿到了 pid。
+bool ParsePidInstance(const std::wstring& inst, DWORD& pid, LUID& luid) {
+    luid.LowPart = luid.HighPart = 0;
     size_t p = inst.find(L"pid_");
     if (p == std::wstring::npos) return false;
     pid = (DWORD)wcstoul(inst.c_str() + p + 4, nullptr, 10);
-    return pid != 0;
+    if (!pid) return false;
+    size_t l = inst.find(L"luid_0x", p);
+    if (l != std::wstring::npos)
+        swscanf_s(inst.c_str() + l, L"luid_0x%x_0x%x",
+                  &luid.HighPart, &luid.LowPart);
+    return true;
+}
+
+// SeDebugPrivilege 一次性启用（提权宿主内可用；失败=普通进程口径，
+// 受保护进程如实缺席）。返回是否成功。token 权限是进程级的，启用后
+// 一直有效，EnsureStarted 调一次即可。
+bool EnableSeDebug() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return false;
+    LUID lid;
+    bool ok = false;
+    if (LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &lid)) {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = lid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        ok = GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(tok);
+    return ok;
+}
+
+// per-pid per-adapter 的 LOCAL/NON_LOCAL Usage（VidMM 会计，任务管理器
+// 性能页同款）。hProcess 需 PROCESS_QUERY_INFORMATION；该 (pid,LUID) 无
+// GPU 上下文时内核拒收（C000000D），返回 false 按无数据处理。
+bool QueryProcessSegmentUsage(HANDLE hp, LUID luid,
+                              uint64_t& local, uint64_t& non_local) {
+    local = non_local = 0;
+    bool any = false;
+    for (int g = 0; g < 2; g++) {
+        D3DKMT_QUERYSTATISTICS q = {};
+        q.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
+        q.AdapterLuid = luid;
+        q.hProcess = hp;
+        q.QueryProcessSegmentGroup =
+            (D3DKMT_MEMORY_SEGMENT_GROUP)g;   // 0=LOCAL 1=NON_LOCAL
+        if (D3DKMTQueryStatistics(&q) != 0) return false;
+        uint64_t usage = q.QueryResult.ProcessSegmentGroupInformation.Usage;
+        if (g == 0) local = usage; else non_local = usage;
+        any = true;
+    }
+    return any;
 }
 
 } // namespace
@@ -153,6 +222,9 @@ bool GpuCollector::EnsureStarted() {
     std::wstring why;
     DetectGrade(why);
     GpuGrade g = Grade();
+    // 2026-11-10：per-pid 显存走 D3DKMT（PROCESS_QUERY_INFORMATION），
+    // SeDebug 一次启用（提权宿主内成功；非提权=dwm 等受保护进程缺席）
+    if (!m_se_debug) m_se_debug = EnableSeDebug();
     if (g == GpuGrade::G1) {
         if (!OpenQuery()) {
             // C-7：失败分支经锁内写入通道
@@ -234,135 +306,63 @@ void GpuCollector::CloseQuery() {
 
 // ============================================================
 // G2 — D3DKMTQueryStatistics (Win8 ~ Win10 1607)
+// 2026-11-10：手抄最小布局废弃（尾部参数 union 实际偏移 800，
+// 手抄版 Param@1048 内核读不到，group/node/segment 参数全部失效），
+// 改用文件头 include 的 SDK 官方 d3dkmthk.h 类型直调（gdi32 静态链接，
+// D3DKMTQueryStatistics/D3DKMTEnumAdapters 自 Vista 起 gdi32 导出）。
 // ============================================================
 
-namespace {
-
-// ---- 最小手抄结构（成员顺序 = 本机 SDK d3dkmthk.h，探针已验证偏移）----
-
-struct PtD3dkmtAdapterInfo {
-    ULONG hAdapter;
-    LUID  AdapterLuid;
-    ULONG NumOfSources;
-    BOOL  bPrecisePresentRegionsPreferred;
-};
-struct PtD3dkmtEnumAdapters {
-    ULONG NumAdapters;
-    PtD3dkmtAdapterInfo Adapters[16];
-};
-
-// 查询结构：头部字段与官方逐一对应（Type@0 Luid@4 hProcess@ptr对齐），
-// 结果 union 用 1KB 冗余缓冲替代（任何 per-process 结果 << 1KB），尾部
-// query-param union 只有一个 ULONG 大小——用 Param 收尾保持布局。
-struct PtD3dkmtQuery {
-    ULONG  Type;
-    LUID   AdapterLuid;
-    HANDLE hProcess;
-    UCHAR  Result[1024];
-    ULONG  Param;
-};
-enum PtQType {
-    PtQAdapter = 0, PtQProcess = 1, PtQSegment = 3, PtQProcessSegment = 4,
-    PtQProcessNode = 6, PtQProcessSegmentGroup = 9,
-};
-
-// 结果头部读取（Win8+ 布局；只读已知字段，尾部不碰）
-struct PtSegHead {            // PtQSegment
-    ULONGLONG CommitLimit, BytesCommitted, BytesResident;
-    ULONGLONG TotalBytesEvicted; ULONG AllocsCommitted, AllocsResident;
-    ULONG Aperture;
-};
-
-// WIN32_LEAN_AND_MEAN 不含 ntdef.h（26100 SDK 实测：NTSTATUS 未定义，
-// C2059 事故源头）——这里等价用 LONG
-typedef LONG(APIENTRY* PFN_D3dkmtQuery)(const void*);
-typedef LONG(APIENTRY* PFN_D3dkmtEnum)(void*);
-
-} // namespace
-
 bool GpuCollector::InitG2() {
-    if (m_pfn_d3dkmt_query) return true;
-    m_gdi32 = (void*)LoadLibraryW(L"gdi32.dll");
-    if (!m_gdi32) return false;
-    m_pfn_d3dkmt_query = (void*)GetProcAddress((HMODULE)m_gdi32,
-                                               "D3DKMTQueryStatistics");
-    m_pfn_d3dkmt_enum = (void*)GetProcAddress((HMODULE)m_gdi32,
-                                              "D3DKMTEnumAdapters");
-    if (!m_pfn_d3dkmt_query || !m_pfn_d3dkmt_enum) {
-        FreeLibrary((HMODULE)m_gdi32);
-        m_gdi32 = nullptr;
-        return false;
-    }
-    auto pEnum = (PFN_D3dkmtEnum)m_pfn_d3dkmt_enum;
-    auto pQuery = (PFN_D3dkmtQuery)m_pfn_d3dkmt_query;
-
-    PtD3dkmtEnumAdapters ea = {};
-    ea.NumAdapters = 16;
-    if (pEnum(&ea) != 0 || ea.NumAdapters == 0) {
-        FreeLibrary((HMODULE)m_gdi32);
-        m_gdi32 = nullptr;
-        m_pfn_d3dkmt_query = m_pfn_d3dkmt_enum = nullptr;
-        return false;
-    }
+    if (!m_g2_adapters.empty()) return true;
+    D3DKMT_ENUMADAPTERS ea = {};
+    ea.NumAdapters = MAX_ENUM_ADAPTERS;
+    if (D3DKMTEnumAdapters(&ea) != 0 || ea.NumAdapters == 0) return false;
     m_g2_adapters.clear();
     for (ULONG i = 0; i < ea.NumAdapters; i++) {
         G2Adapter a;
         a.luid = ea.Adapters[i].AdapterLuid;
-        // 适配器统计：NodeCount/NbSegments（无 hProcess，Win7 时代类型）
-        PtD3dkmtQuery q = {};
-        q.Type = PtQAdapter;
+        // 适配器统计：NbSegments/NodeCount（无 hProcess）
+        D3DKMT_QUERYSTATISTICS q = {};
+        q.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
         q.AdapterLuid = a.luid;
-        if (pQuery(&q) != 0) continue;
-        a.nb_segments = *(ULONG*)(q.Result + 0);
-        a.node_count = *(ULONG*)(q.Result + 4);
+        if (D3DKMTQueryStatistics(&q) != 0) continue;
+        a.nb_segments = q.QueryResult.AdapterInformation.NbSegments;
+        a.node_count = q.QueryResult.AdapterInformation.NodeCount;
         if (!a.node_count || !a.nb_segments) continue;
         // 段属性（Aperture）：WDDM2.1+ 用 SEGMENT_GROUP，不需要；老系统
-        // 专用/共享拆分依赖它——探针一次，存档
+        // 专用/共享拆分依赖它——探针一次，存档（0xFF=unknown）
         a.seg_aperture.assign(a.nb_segments > 32 ? 32 : a.nb_segments, 0xFF);
         for (ULONG s = 0; s < a.seg_aperture.size(); s++) {
-            PtD3dkmtQuery qs = {};
-            qs.Type = PtQSegment;
+            D3DKMT_QUERYSTATISTICS qs = {};
+            qs.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
             qs.AdapterLuid = a.luid;
-            qs.Param = s;
-            if (pQuery(&qs) == 0) {
-                a.seg_aperture[s] = ((PtSegHead*)qs.Result)->Aperture;
-            }
+            qs.QuerySegment.SegmentId = s;
+            if (D3DKMTQueryStatistics(&qs) == 0)
+                a.seg_aperture[s] =
+                    qs.QueryResult.SegmentInformation.Aperture ? 1 : 0;
         }
         // SEGMENT_GROUP 类型可用性（WDDM2.1+ = Win10 1607+）：空 hProcess
         // 的探测调用，接受即走新路径（Win8~1511 落到逐段求和）
-        PtD3dkmtQuery qg = {};
-        qg.Type = PtQProcessSegmentGroup;
+        D3DKMT_QUERYSTATISTICS qg = {};
+        qg.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
         qg.AdapterLuid = a.luid;
-        qg.Param = 0;   // LOCAL
-        LONG rcg = pQuery(&qg);
-        a.seg_group_ok = (rcg == 0);
+        qg.QueryProcessSegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
+        a.seg_group_ok = (D3DKMTQueryStatistics(&qg) == 0);
         m_g2_adapters.push_back(a);
     }
-    if (m_g2_adapters.empty()) {
-        FreeLibrary((HMODULE)m_gdi32);
-        m_gdi32 = nullptr;
-        m_pfn_d3dkmt_query = m_pfn_d3dkmt_enum = nullptr;
-        return false;
-    }
-    return true;
+    return !m_g2_adapters.empty();
 }
 
 void GpuCollector::StopG2() {
     m_g2_adapters.clear();
     m_g2_last_rt.clear();
     m_g2_last_wall_us = 0;
-    if (m_gdi32) {
-        FreeLibrary((HMODULE)m_gdi32);
-        m_gdi32 = nullptr;
-    }
-    m_pfn_d3dkmt_query = m_pfn_d3dkmt_enum = nullptr;
 }
 
 // G2 一拍：候选 pid × 适配器 × 节点查询 + delta 换算（方案 §2.4 G2 行）
 bool GpuCollector::TickG2(GpuTickData& out,
                           const std::vector<DWORD>& pid_candidates) {
-    auto pQuery = (PFN_D3dkmtQuery)m_pfn_d3dkmt_query;
-    if (!pQuery) return false;
+    if (m_g2_adapters.empty()) return false;
 
     LARGE_INTEGER f, t;
     QueryPerformanceFrequency(&f);
@@ -392,13 +392,15 @@ bool GpuCollector::TickG2(GpuTickData& out,
             if (a.seg_group_ok) {
                 // ---- 显存：SEGMENT_GROUP LOCAL/NON_LOCAL（WDDM2.1+）----
                 for (int g = 0; g < 2; g++) {
-                    PtD3dkmtQuery qg = {};
-                    qg.Type = PtQProcessSegmentGroup;
+                    D3DKMT_QUERYSTATISTICS qg = {};
+                    qg.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
                     qg.AdapterLuid = a.luid;
                     qg.hProcess = hp;
-                    qg.Param = (ULONG)g;
-                    if (pQuery(&qg) == 0) {
-                        ULONGLONG usage = *(ULONGLONG*)(qg.Result + 16);
+                    qg.QueryProcessSegmentGroup =
+                        (D3DKMT_MEMORY_SEGMENT_GROUP)g;
+                    if (D3DKMTQueryStatistics(&qg) == 0) {
+                        ULONGLONG usage =
+                            qg.QueryResult.ProcessSegmentGroupInformation.Usage;
                         if (g == 0) { ded += usage; pid_mem_ok = true; }
                         else shr += usage;
                     }
@@ -407,13 +409,14 @@ bool GpuCollector::TickG2(GpuTickData& out,
                 // ---- 老路径：PROCESS_SEGMENT 逐段求和（Win8~1511）----
                 for (ULONG s = 0; s < a.seg_aperture.size(); s++) {
                     if (a.seg_aperture[s] == 0xFF) continue;
-                    PtD3dkmtQuery qp = {};
-                    qp.Type = PtQProcessSegment;
+                    D3DKMT_QUERYSTATISTICS qp = {};
+                    qp.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT;
                     qp.AdapterLuid = a.luid;
                     qp.hProcess = hp;
-                    qp.Param = s;
-                    if (pQuery(&qp) == 0) {
-                        ULONGLONG committed = *(ULONGLONG*)(qp.Result + 0);
+                    qp.QueryProcessSegment.SegmentId = s;
+                    if (D3DKMTQueryStatistics(&qp) == 0) {
+                        ULONGLONG committed =
+                            qp.QueryResult.ProcessSegmentInformation.BytesCommitted;
                         if (a.seg_aperture[s]) shr += committed;
                         else { ded += committed; pid_mem_ok = true; }
                     }
@@ -424,13 +427,14 @@ bool GpuCollector::TickG2(GpuTickData& out,
             if (dt_us > 0 && state[ai].size() < a.node_count)
                 state[ai].resize(a.node_count, -1);
             for (ULONG n = 0; n < a.node_count && dt_us > 0; n++) {
-                PtD3dkmtQuery qn = {};
-                qn.Type = PtQProcessNode;
+                D3DKMT_QUERYSTATISTICS qn = {};
+                qn.Type = D3DKMT_QUERYSTATISTICS_PROCESS_NODE;
                 qn.AdapterLuid = a.luid;
                 qn.hProcess = hp;
-                qn.Param = n;
-                if (pQuery(&qn) != 0) { state[ai][n] = -1; continue; }
-                LONGLONG rt = ((LARGE_INTEGER*)qn.Result)->QuadPart;
+                qn.QueryProcessNode.NodeId = n;
+                if (D3DKMTQueryStatistics(&qn) != 0) { state[ai][n] = -1; continue; }
+                LONGLONG rt =
+                    qn.QueryResult.ProcessNodeInformation.RunningTime.QuadPart;
                 // 实测定案：RunningTime 单位是 100ns（NT 时间惯例），WDK 头里
                 // "micro-second" 注释是错的——强制 G2 实测 G2 值恰为 G1(PDH)
                 // 的 10 倍，除以 10 后逐进程吻合
@@ -570,58 +574,92 @@ void GpuCollector::Tick(GpuTickData& out,
         out.total_util_pct = cap(out.total_util_pct);
     }
 
-    // ---- GPU Process Memory: per-pid dedicated (+shared) bytes ----
-    auto collect_mem = [&](void* counter,
-                           std::unordered_map<DWORD, uint64_t>& dst) {
+    // ---- GPU Process Memory: (pid×LUID) 枚举 + D3DKMT 真值 ----
+    // 2026-11-10 口径修复：PDH 这组 per-pid 计数器的 cooked 值是只增不减
+    // 的累计假账（Starward 实测虚报 660 倍、每秒 +750MB；微软 known-issue
+    // 文档在案——任务管理器详情页同源同病，性能页口径才是真值）。PDH 实例
+    // 名保留：它是内核记账的 (pid×LUID) 视图清单，天然只含活跃视图（镜像
+    // LUID 不会重复出现，DXGI 全枚举会双计）；数值改走 D3DKMT
+    // PROCESS_SEGMENT_GROUP 的 Usage（VidMM 会计，与任务管理器性能页同源）。
+    std::vector<std::pair<DWORD, LUID>> gpu_pairs;
+    auto collect_mem = [&](void* counter) {
         if (!counter) return false;
         if (!GetFormattedArray(counter, m_fmt_buf, items)) return false;
         for (auto& it : items) {
             if (!ValueOk(it.FmtValue)) continue;
-            DWORD pid = 0;
             std::wstring inst = it.szName ? it.szName : L"";
+            DWORD pid = 0;
+            LUID luid = {};
             auto cached = m_pid_cache.find(inst);
-            if (cached != m_pid_cache.end()) pid = cached->second;
-            else {
-                if (!ParsePidInstance(inst, pid)) {
-                    m_pid_cache[inst] = 0;
+            if (cached != m_pid_cache.end()) {
+                pid = cached->second.first;
+                luid = cached->second.second;
+            } else {
+                if (!ParsePidInstance(inst, pid, luid)) {
+                    m_pid_cache[inst] = { 0, LUID{} };   // negative cache
                     continue;
                 }
-                m_pid_cache[inst] = pid;
+                m_pid_cache[inst] = { pid, luid };
             }
             if (pid) seen_pids.insert(pid);
-            double v = it.FmtValue.doubleValue;
-            if (v < 0) v = 0;
-            dst[pid] += (uint64_t)v;
+            if (!pid) continue;
+            bool dup = false;
+            for (auto& x : gpu_pairs)
+                if (x.first == pid && x.second.LowPart == luid.LowPart &&
+                    x.second.HighPart == luid.HighPart) { dup = true; break; }
+            if (!dup) gpu_pairs.push_back({ pid, luid });
         }
         return true;
     };
-    std::unordered_map<DWORD, uint64_t> ded, shr;
-    collect_mem(m_cnt_mem_ded, ded);
-    if (m_cnt_mem_shared) collect_mem(m_cnt_mem_shared, shr);
-    for (auto& kv : ded) {
-        uint64_t s = 0;
-        auto it = shr.find(kv.first);
-        if (it != shr.end()) s = it->second;
-        out.mem_by_pid[kv.first] = { kv.second, s };
+    bool mem_enum_any = collect_mem(m_cnt_mem_ded);
+    if (!mem_enum_any && m_cnt_mem_shared)
+        mem_enum_any = collect_mem(m_cnt_mem_shared);
+    // 无 LUID 实例（ded 与 shared 计数器都缺席）也照常走 D3DKMT 吗——
+    // 不：无清单则无 per-pid 维度，按无数据（mem_valid 维持 false 语义
+    // 由调用方判定，这里仅不产数据）
+    std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> mem;
+    for (auto& pl : gpu_pairs) {
+        // per tick open/close：几十次内核调用，微秒级；SeDebug 未启用时
+        // 受保护进程（dwm 等）拒开，如实缺席
+        HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pl.first);
+        if (!hp) continue;
+        uint64_t lo = 0, nl = 0;
+        if (QueryProcessSegmentUsage(hp, pl.second, lo, nl)) {
+            auto& slot = mem[pl.first];
+            slot.first += lo;    // 跨 LUID 求和（进程在多 GPU 各有记账）
+            slot.second += nl;
+        }
+        CloseHandle(hp);
     }
-    // shared-only pids (rare but legal)
-    for (auto& kv : shr) {
-        if (out.mem_by_pid.count(kv.first)) continue;
-        out.mem_by_pid[kv.first] = { 0, kv.second };
-    }
+    for (auto& kv : mem)
+        out.mem_by_pid[kv.first] = { kv.second.first, kv.second.second };
 
     // ---- GPU Adapter Memory (system-wide, summary line) ----
-    std::unordered_map<DWORD, uint64_t> adapt_ded, adapt_shr;
-    bool adapt_ok = collect_mem(m_cnt_adapt_ded, adapt_ded);
-    if (m_cnt_adapt_shared) collect_mem(m_cnt_adapt_shared, adapt_shr);
+    // adapter 级计数器是 gauge 真值（与任务管理器性能页一致，实测无假账）。
+    // 实例名 luid_*_phys_N 无 pid_ 前缀——不走 pid 解析，全实例直加。
+    auto collect_adapter = [&](void* counter, uint64_t& dst) {
+        if (!counter) return false;
+        if (!GetFormattedArray(counter, m_fmt_buf, items)) return false;
+        for (auto& it : items) {
+            if (!ValueOk(it.FmtValue)) continue;
+            double v = it.FmtValue.doubleValue;
+            if (v > 0) dst += (uint64_t)v;
+        }
+        return true;
+    };
+    uint64_t adapt_ded = 0, adapt_shr = 0;
+    bool adapt_ok = collect_adapter(m_cnt_adapt_ded, adapt_ded);
+    if (m_cnt_adapt_shared) collect_adapter(m_cnt_adapt_shared, adapt_shr);
     if (adapt_ok) {
         out.sys_mem_valid = true;
-        for (auto& kv : adapt_ded) out.sys_dedicated += kv.second;
-        for (auto& kv : adapt_shr) out.sys_shared += kv.second;
+        out.sys_dedicated += adapt_ded;
+        out.sys_shared += adapt_shr;
     } else {
         // fallback: sum the per-process view (still an honest system total)
-        for (auto& kv : ded) out.sys_dedicated += kv.second;
-        for (auto& kv : shr) out.sys_shared += kv.second;
+        for (auto& kv : mem) {
+            out.sys_dedicated += kv.second.first;
+            out.sys_shared += kv.second.second;
+        }
         out.sys_mem_valid = out.mem_valid;
     }
 
@@ -632,7 +670,7 @@ void GpuCollector::Tick(GpuTickData& out,
         it = (it->second.first && !seen_pids.count(it->second.first))
                  ? m_eng_cache.erase(it) : ++it;
     for (auto it = m_pid_cache.begin(); it != m_pid_cache.end();)
-        it = (it->second && !seen_pids.count(it->second))
+        it = (it->second.first && !seen_pids.count(it->second.first))
                  ? m_pid_cache.erase(it) : ++it;
 }
 

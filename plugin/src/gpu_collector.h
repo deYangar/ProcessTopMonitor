@@ -136,25 +136,36 @@ private:
     void* m_cnt_util = nullptr;                  // GPU Engine Utilization Percentage
     void* m_cnt_mem_ded = nullptr;               // GPU Process Memory Dedicated/Local Usage
     void* m_cnt_mem_shared = nullptr;            // GPU Process Memory Shared Usage (optional)
-    void* m_cnt_adapt_ded = nullptr;             // GPU Adapter Memory DedicatedUsage (optional)
-    void* m_cnt_adapt_shared = nullptr;          // GPU Adapter Memory SharedUsage (optional)
+    void* m_cnt_adapt_ded = nullptr;             // GPU Adapter Memory Dedicated Usage (optional)
+    void* m_cnt_adapt_shared = nullptr;          // GPU Adapter Memory Shared Usage (optional)
     bool m_mem_ded_is_local = false;             // Local Usage fallback (older builds)
     int m_collections = 0;
+    // 2026-11-10 显存口径修复：per-pid 数值源切 D3DKMT（PDH cooked 值是
+    // 只增不减的累计假账，虚报百倍级——微软 known-issue 文档在案）。PDH
+    // 实例名仍用（pid×LUID 对，内核记账视图天然去重镜像 LUID），数值弃用。
+    bool m_se_debug = false;                     // SeDebugPrivilege 状态（EnsureStarted 一次启用）
 
     // instance-name parse caches (tick thread only): instance -> pid/engtype
     std::unordered_map<std::wstring, std::pair<DWORD, std::wstring>> m_eng_cache;
-    std::unordered_map<std::wstring, DWORD> m_pid_cache;
+    // instance -> (pid, LUID)。LUID 为 0 表示实例名里没有 luid 段（只按
+    // pid 汇总，老格式防御）
+    std::unordered_map<std::wstring, std::pair<DWORD, LUID>> m_pid_cache;
     std::unordered_set<std::wstring> m_engtypes;
 
     std::vector<BYTE> m_fmt_buf;                 // reused formatted-array buffer
 
     // ---- G2 (D3DKMTQueryStatistics, Win8~Win10 1607) ----
-    // 按本机 SDK d3dkmthk.h 转录的最小查询布局：成员顺序与官方一致，Result
-    // 用冗余缓冲替代结果 union（内核只写不超缓冲，我们只读已知头部字段）。
-    // 实测定案（2026-10-25 探针+插件双路验证）：PROCESS_NODE/SEGMENT_GROUP
+    // 2026-11-10 修复：旧手抄布局（Result[1024]+Param）尾部参数 union 实际
+    // 偏移在 800（官方 sizeof=808，26100 SDK offsetof 实测；WDDM2.1/3.1
+    // 编译布局相同），手抄版 Param@1048 从未被内核读到——group/node/segment
+    // 参数全部失效（恒 0）。现直接 include SDK 官方 d3dkmthk.h（宏 WDDM2.1），
+    // 布局由 SDK 保证。Win8.x 上 RESULT union 可能更小、偏移或有差异：未验证，
+    // 如实标注（探针见 tools/vram_probe_20261110/）。
+    // 实测定案（2026-11-10 探针双路验证）：PROCESS_NODE/SEGMENT_GROUP
     // 在 26300 上可用，但要求 hProcess 为 PROCESS_QUERY_INFORMATION 权限
     // （LIMITED 被拒 C000000D），且进程在该适配器有 GPU 统计（无上下文进程
-    // 同样拒收）——失败按无数据处理，受保护进程（dwm 等）如实缺席。
+    // 同样拒收）——失败按无数据处理；受保护进程（dwm 等）经 SeDebugPrivilege
+    // 可达（提权宿主内启用，实测全通）。
     struct G2Adapter {
         LUID luid;
         ULONG node_count = 0;
@@ -163,10 +174,8 @@ private:
         bool seg_group_ok = false;               // PROCESS_SEGMENT_GROUP 可用(WDDM2.1+)
     };
     std::vector<G2Adapter> m_g2_adapters;
-    // per-pid delta 基线：adapter idx -> per-node RunningTime（µs，WDK 注释）
+    // per-pid delta 基线：adapter idx -> per-node RunningTime（100ns，WDK
+    // 注释写 µs 是错的，实测 G2/G1×10 换算定案）
     std::unordered_map<DWORD, std::vector<std::vector<LONGLONG>>> m_g2_last_rt;
     LONGLONG m_g2_last_wall_us = 0;
-    void* m_gdi32 = nullptr;
-    void* m_pfn_d3dkmt_query = nullptr;          // D3DKMTQueryStatistics
-    void* m_pfn_d3dkmt_enum = nullptr;           // D3DKMTEnumAdapters
 };
