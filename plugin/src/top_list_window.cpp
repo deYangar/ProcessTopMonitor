@@ -2,6 +2,7 @@
 #include "top_list_window.h"
 #include "plugin_main.h"    // WM_PTM_REFRESH pulls the snapshot via the plugin
 #include "window_manager.h"
+#include "options_dialog.h" // 371 右键直达插件设置（2026-11-10 方案）
 #include "utils.h"
 #include "i18n.h"
 #include <shellapi.h>
@@ -917,6 +918,12 @@ LRESULT CTopListWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id == 360) {
             // 固定/取消固定（M6 §4.6）：与点任务栏 item 同一函数
             CProcessTopPlugin::Instance().PinGroup(nullptr);
+        } else if (id == 371) {
+            // 插件设置（2026-11-10 方案）：右键直达选项窗（与 TM 菜单路径
+            // 同窗同函数）。调用发生在 BuildContextMenu 栈内（m_menu_open
+            // 仍置位）→ 模态期间 HoverTick 早退，悬浮窗冻结不闪收
+            //（173786a 菜单守卫免费搭车）
+            PtShowOptionsDialog(m_hwnd);
         }
         // GPU 口径菜单（400 全部 / 410+N 引擎 toggle / 500 截断开关）由
         // BuildContextMenu 直接处理（toggle 后需重开菜单刷新勾选态）
@@ -1114,6 +1121,9 @@ void CTopListWindow::BuildContextMenu(POINT pt) {
             if (m_cfg.w > 0 || m_cfg.h > 0)
                 AppendMenuW(menu, MF_STRING, 370, TR(L"恢复默认大小"));
         }
+        // 插件设置（2026-11-10 方案）：恒显（hover/常驻两形态都能直达；
+        // 选项窗自带防重入），与 TM「选项设置→插件→插件设置」同窗
+        AppendMenuW(menu, MF_STRING, 371, TR(L"插件设置"));
         // 「关闭」任何窗数可用：最后一窗 × = 退出悬浮窗模式（item 保留），
         // 单窗/多窗同一语义（方案 §3.2 关闭语义表）
         SetForegroundWindow(m_hwnd);

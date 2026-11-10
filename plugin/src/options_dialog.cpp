@@ -827,6 +827,15 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 } // namespace
 
 ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
+    // 防重入（2026-11-10 方案 §3.3）：g_st 是全局单例状态，函数开头会整体
+    // 清空——两个实例并存（TM 菜单路径 × 右键直达路径交叉）会互相毁掉
+    // 未保存状态且双层模态循环嵌套。已开实例 → 拉起前台即返回
+    HWND existing = FindWindowW(L"ProcessTopMonitorOptionsDlg", nullptr);
+    if (existing) {
+        ShowWindow(existing, SW_SHOWNORMAL);
+        SetForegroundWindow(existing);
+        return ITMPlugin::OR_OPTION_UNCHANGED;
+    }
     static bool registered = false;
     if (!registered) {
         // trackbar 属 comctl32 通用控件，首用前显式注册（幂等）
