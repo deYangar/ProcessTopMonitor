@@ -3,8 +3,8 @@
 
 // 版本信息（发版时同步 FILEVERSION 与 FileVersion/ProductVersion 四段）
 1 VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,1,0,1
+PRODUCTVERSION  1,1,0,1
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          0x40004L
@@ -17,12 +17,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "deYangar"
             VALUE "FileDescription",  "TrafficMonitor plugin: per-process CPU / memory / disk IO / GPU / VRAM ranking"
-            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "FileVersion",      "1.1.0.1"
             VALUE "InternalName",     "ProcessTopMonitor"
             VALUE "LegalCopyright",   "GPL-3.0"
             VALUE "OriginalFilename", "ProcessTopMonitor.dll"
             VALUE "ProductName",      "ProcessTopMonitor"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "ProductVersion",   "1.1.0-beta.1"
         END
     END
     BLOCK "VarFileInfo"
