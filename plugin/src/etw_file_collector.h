@@ -75,6 +75,11 @@ public:
         // CSwitch 时间戳结算的调度器时间账 = NtQSI 同源口径，无此失真）
         std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> sample_pid;
         uint64_t sample_total = 0;      // 全部核时间 ticks（校准分母，含 Idle/System/unknown）
+        // 群分母（2026-11-16 全面板口径统一：本群容量归一、上限 100）：
+        // [0]=E/StdCcd 群、[1]=P/VCache 群各自的全部核时间 ticks——与
+        // sample_total 同语义（分母含 Idle/System/unknown，免疫丢包与
+        // 归因缺口）；Homog/未知核时间只进 total 不进群（与分子口径配对）
+        uint64_t sample_class_total[2] = { 0, 0 };
         bool sample_valid = false;      // 异构且交付窗口完整才置 true
         uint64_t events_lost = 0;
         // 本次交付覆盖的真实窗口长度（上次被消费的 handoff → 本次 handoff，
@@ -196,6 +201,10 @@ private:
     std::unordered_map<DWORD, SampleAcc> m_out_sample;   // 累计式 handed-off
     uint64_t m_sample_total_acc = 0;    // 消费者私有：窗口内全部样本（含 Idle）
     uint64_t m_sample_total_out = 0;    // 累计式（窗口不完整时跨窗合并）
+    // 群分母（2026-11-16 口径统一）：与 m_sample_total_acc/out 完全同班
+    // 车——[0]=E/StdCcd、[1]=P/VCache，累计/清零时机逐一配对
+    uint64_t m_sample_class_acc[2] = { 0, 0 };
+    uint64_t m_sample_class_out[2] = { 0, 0 };
     std::atomic<bool> m_sample_ever{false};   // 本会话交付过有效样本窗（预热判定）
     std::atomic<bool> m_show_system{ true };  // System(pid4) 归因（方案①，见 public setter）
     // 窗口记账（方案三）：m_out 改累计式——tick 不消费（超时/窗口不完整）

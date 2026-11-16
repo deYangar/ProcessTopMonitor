@@ -15,7 +15,8 @@ struct Acc {
     double io_r = 0, io_w = 0;
     double gpu = 0;              // %, scope+clamp applied by gpu_collector
     uint64_t vram_ded = 0, vram_shared = 0;
-    // 核型样本占比（§4.3：窗口样本数/全部样本 ×100，全机容量口径）
+    // 核型样本占比（§4.3：本群核时间/群全部核时间 ×100，群内容量口径，
+    // 2026-11-16 统一：与群摘要同基准，上限 100）
     double cpu_p = 0, cpu_e = 0;
 };
 
@@ -39,18 +40,21 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
     // 系统级核群占用率透传（§4.5；同构时恒 -1 → 摘要不显示）
     out.cpu_p_total_pct = m.cpu_split_total_pct[1];
     out.cpu_e_total_pct = m.cpu_split_total_pct[0];
-    // LP 换算系数（方案②其余合计行）：群总（群内容量口径）× share →
-    // 全核口径贡献，与行值（分母=全部核）同量纲；同构恒 0 → rest 不显示
-    if (m.cpu_lp_total > 0) {
-        out.cpu_split_lp_share[1] = (double)m.cpu_split_lp[1] / m.cpu_lp_total;
-        out.cpu_split_lp_share[0] = (double)m.cpu_split_lp[0] / m.cpu_lp_total;
-    }
 
-    // 核型样本占比（§4.3）：sample_valid = 异构且交付窗口完整。占比 =
-    // 该 pid 该类样本 / 全部样本（分母含 Idle/System/unknown = 全机容量
-    // 的采样投影；免疫采样间隔差异与均匀丢包）
+    // 核型样本占比（§4.3）：sample_valid = 异构且交付窗口完整。
+    // 2026-11-16 全面板口径统一（咩咩拍板）：行值改群内归一——sp_p 分母
+    // = P 群全部核时间、sp_e 分母 = E 群全部核时间（分母含 Idle/System/
+    // unknown，免疫丢包与归因缺口），上限 100，与上方群摘要同基准同量纲
+    //（time-based busy，非 TM Utility）；账面直接闭合：Σ行 + 其余 = 群总。
+    // 群分母 0（会话重建瞬拍防御）→ 该列 0
     bool split_valid = io_delta && io_delta->sample_valid && io_delta->sample_total > 0;
-    double pfac = split_valid ? 100.0 / (double)io_delta->sample_total : 0.0;
+    double pfac_p = 0, pfac_e = 0;
+    if (split_valid) {
+        if (io_delta->sample_class_total[1] > 0)
+            pfac_p = 100.0 / (double)io_delta->sample_class_total[1];
+        if (io_delta->sample_class_total[0] > 0)
+            pfac_e = 100.0 / (double)io_delta->sample_class_total[0];
+    }
     out.cpu_split_valid = split_valid;
 
     // 精确口径速率分母（方案三窗口对齐）：handoff 真实窗口，tick 假 dt
@@ -82,8 +86,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
         if (split_valid) {
             auto sit = io_delta->sample_pid.find(p.pid);
             if (sit != io_delta->sample_pid.end()) {
-                sp_p = (double)sit->second.first * pfac;
-                sp_e = (double)sit->second.second * pfac;
+                sp_p = (double)sit->second.first * pfac_p;   // 群内归一：分母=本群核时间
+                sp_e = (double)sit->second.second * pfac_e;
             }
         }
         double gpu_pct = 0;
@@ -129,7 +133,7 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             if (gpu_pct > a.gpu) a.gpu = gpu_pct;
             a.vram_ded += vram_d;
             a.vram_shared += vram_s;
-            // 核型占比按同名进程累加（分母统一全机样本，可加）
+            // 核型占比按同名进程累加（分母统一本群核时间，群内可加）
             a.cpu_p += sp_p;
             a.cpu_e += sp_e;
             // representative = biggest live contributor by CPU (stable pick)
@@ -162,8 +166,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
             if (split_valid) {
                 auto sit = io_delta->sample_pid.find(kv.first);
                 if (sit != io_delta->sample_pid.end()) {
-                    sp_p = (double)sit->second.first * pfac;
-                    sp_e = (double)sit->second.second * pfac;
+                    sp_p = (double)sit->second.first * pfac_p;   // 群内归一
+                    sp_e = (double)sit->second.second * pfac_e;
                 }
             }
             auto it = by_name.find(nm);
@@ -203,8 +207,8 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
                     swprintf_s(tmp, L"<PID %lu>", kv.first);
                     nm = tmp;
                 }
-                double sp_p = (double)kv.second.first * pfac;
-                double sp_e = (double)kv.second.second * pfac;
+                double sp_p = (double)kv.second.first * pfac_p;   // 群内归一
+                double sp_e = (double)kv.second.second * pfac_e;
                 auto it = by_name.find(nm);
                 if (it == by_name.end()) {
                     by_name[nm] = merged.size();

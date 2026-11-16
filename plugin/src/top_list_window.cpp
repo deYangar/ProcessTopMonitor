@@ -1936,27 +1936,24 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     }
 
     // 其余合计行（2026-11-10 方案②）：相对本窗实际显示的行集算（截断
-    // 口径）。核型分列形态：群总 × LP占比换算到全核口径 − Σ行 P/E
-    //（行值分母 = 全部核的 CSwitch 总时间，群总分母 = 本群 LP，量纲先
-    // 换齐再对账）；瞬时负值钳 0——群总走 idle 差分窗、行值走 ETW
-    // handoff 窗，两窗滑动错位时的噪声（量级一两个点），且残差行天然
-    // 吸收未归因时间（unknown tid/丢缓冲），只会偏小不会负。纯总量/
-    // 预热/D2 回退形态：总量 − Σ行值（同源同窗 NtQSI，账最齐，残差 =
-    // 截断 + 中断/DPC 等不属于任何进程的时间）。粘滞拍行集沿用、群总
-    // 照刷，同样成立
+    // 口径）。核型分列形态（2026-11-16 口径统一后）：群总 − Σ行 P/E，
+    // 同群内归一基准直接对账，不再 × LP 占比换算；瞬时负值钳 0——群总
+    // 走 idle 差分窗、行值走 ETW handoff 窗，两窗滑动错位时的噪声（量级
+    // 一两个点），且残差行天然吸收未归因时间（unknown tid/丢缓冲），只会
+    // 偏小不会负。纯总量/预热/D2 回退形态：总量 − Σ行值（同源同窗
+    // NtQSI，账最齐，残差 = 截断 + 中断/DPC 等不属于任何进程的时间）。
+    // 粘滞拍行集沿用、群总照刷，同样成立
     m_rest_value = m_rest_p = m_rest_e = -1;
     if (m_kind == MetricKind::Cpu && m_rows_has_value && !m_rows.empty()) {
         if (SplitDisplayActive()) {
-            double sp = snap.cpu_split_lp_share[1];
-            double se = snap.cpu_split_lp_share[0];
-            if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0 && sp > 0 && se > 0) {
+            if (m_cpu_p_total >= 0 && m_cpu_e_total >= 0) {
                 double sum_p = 0, sum_e = 0;
                 for (const auto& r : m_rows) {
                     sum_p += r.cpu_p_pct;
                     sum_e += r.cpu_e_pct;
                 }
-                double rp = m_cpu_p_total * sp - sum_p;
-                double re = m_cpu_e_total * se - sum_e;
+                double rp = m_cpu_p_total - sum_p;
+                double re = m_cpu_e_total - sum_e;
                 m_rest_p = rp > 0 ? rp : 0;
                 m_rest_e = re > 0 ? re : 0;
             }

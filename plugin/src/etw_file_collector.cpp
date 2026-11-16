@@ -513,6 +513,7 @@ void EtwFileCollector::ConsumerLoop() {
         m_acc.clear();
         m_acc_sample.clear();
         m_sample_total_acc = 0;
+        m_sample_class_acc[0] = m_sample_class_acc[1] = 0;   // 群分母同班车作废
         if (m_ccm && m_ccm->heterogeneous && m_ccm->total_lp > 0) {
             m_cur_tid.assign((size_t)m_ccm->total_lp, 0);
             m_last_sw_t.assign((size_t)m_ccm->total_lp, 0);   // 0 = 无区间起点
@@ -591,6 +592,9 @@ void EtwFileCollector::DoHandoffLocked() {
     }
     m_sample_total_out += m_sample_total_acc;
     m_sample_total_acc = 0;
+    m_sample_class_out[0] += m_sample_class_acc[0];   // 群分母同一班车（口径统一）
+    m_sample_class_out[1] += m_sample_class_acc[1];
+    m_sample_class_acc[0] = m_sample_class_acc[1] = 0;
     m_take_req.store(false, std::memory_order_release);
     m_take_seq.fetch_add(1, std::memory_order_release);
 }
@@ -625,6 +629,18 @@ void EtwFileCollector::OnSampleOrSwitch(PEVENT_RECORD rec) {
     if (last && t > last) {
         uint64_t dt = t - last;
         m_sample_total_acc += dt;               // 全部核时间进分母（含 Idle/System/unknown）
+        // 群分母（2026-11-16 口径统一）：本区间所在核的群容量账——分子
+        //（sample_pid）按同一 lp[] 归群，分母同键配对，群内占比分母一致；
+        // Homog/未知核只进 total（防御分支：异构机上不出现）
+        if (m_ccm && core < m_ccm->lp.size()) {
+            switch (m_ccm->lp[core]) {
+            case CoreClass::P:
+            case CoreClass::VCache: m_sample_class_acc[1] += dt; break;
+            case CoreClass::E:
+            case CoreClass::StdCcd: m_sample_class_acc[0] += dt; break;
+            default: break;
+            }
+        }
         uint32_t tid = m_cur_tid[core];
         if (tid && tid != 0xFFFFFFFF) {
             // 低频换表（tick 每 ~500ms 供新表；dirty 检查 ~1ns/事件）
@@ -799,6 +815,7 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
     out.valid = false;
     out.sample_valid = false;
     out.sample_total = 0;
+    out.sample_class_total[0] = out.sample_class_total[1] = 0;
     out.window_us = 0;
     if (!m_running.load()) return;
 
@@ -819,8 +836,10 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
                 if (kv.second.read || kv.second.write)
                     out.per_pid[kv.first] = { kv.second.read, kv.second.write };
             }
-            // 核型样本通道同班车交付（§4.4）
+            // 核型样本通道同班车交付（§4.4）；群分母同交付（口径统一）
             out.sample_total = m_sample_total_out;
+            out.sample_class_total[0] = m_sample_class_out[0];
+            out.sample_class_total[1] = m_sample_class_out[1];
             for (auto& kv : m_out_sample) {
                 if (kv.second.p || kv.second.e)
                     out.sample_pid[kv.first] = { kv.second.p, kv.second.e };
@@ -852,6 +871,7 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
             if (out.valid || out.sample_valid) {
                 m_out_sample.clear();
                 m_sample_total_out = 0;
+                m_sample_class_out[0] = m_sample_class_out[1] = 0;   // 群账同清
             }
             if (out.sample_valid)
                 m_sample_ever.store(true, std::memory_order_relaxed);
@@ -873,9 +893,12 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
                 ULONGLONG now = GetTickCount64();
                 if (now - m_log_sample_tick >= 5000) {
                     m_log_sample_tick = now;
-                    LogLine(L"coretime window: total=%lluticks(%.2f core-seconds) pids=%u valid=%d",
+                    LogLine(L"coretime window: total=%lluticks(%.2f core-seconds) "
+                            L"p/e-denom=%llu/%llu pids=%u valid=%d",
                             (unsigned long long)out.sample_total,
                             (double)out.sample_total / 10000000.0,
+                            (unsigned long long)out.sample_class_total[1],
+                            (unsigned long long)out.sample_class_total[0],
                             (unsigned)out.sample_pid.size(),
                             (int)out.sample_valid);
                     int n = 0;

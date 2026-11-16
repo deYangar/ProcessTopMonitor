@@ -50,13 +50,10 @@ struct MetricsSnapshot {
     double cpu_total_pct = -1;
     uint64_t mem_total = 0, mem_used = 0;
     double io_read_total_bps = 0, io_write_total_bps = 0;
-    // 系统级核群占用率（§4.5，核群自身容量口径；-1 = 无效/同构）
+    // 系统级核群占用率（§4.5；-1 = 无效/同构）。2026-11-16 全面板口径
+    // 统一：本群容量归一、上限 100（time-based busy，非 TM Utility），
+    // 与下行进程行同基准——摘要 = Σ行 + 其余合计，直接对账不再换算
     double cpu_p_total_pct = -1, cpu_e_total_pct = -1;
-    // 群总→全核口径换算系数 LP_g/total_lp（2026-11-10 方案②其余合计
-    // 行用）：窗口层 rest = 群总×share − Σ已显示行（行值分母 = 全部核
-    // 的 CSwitch 总时间，群总分母 = 本群 LP——量纲先换齐再对账）。
-    // [1]=P/VCache 群 [0]=E/StdCcd 群；0 = 无拓扑（同构）→ rest 不显示
-    double cpu_split_lp_share[2] = { 0, 0 };
     // 核型列可用性（§6：会话 C 档/窗口不完整 = false → 列不可用态）与
     // 标签风格（true: X3D/标准；false: P核/E核）
     bool cpu_split_valid = false;
