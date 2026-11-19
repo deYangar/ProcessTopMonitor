@@ -687,7 +687,14 @@ std::vector<std::wstring> GpuCollector::EnumerateEngines() {
     if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) return out;
     PDH_HCOUNTER c = nullptr;
     if (AddCounter(q, kPathUtil, (void**)&c)) {
-        PdhCollectQueryData(q);   // 实例名首拍即现；利用率数值不取
+        // Utilization Percentage 是 rate 型：PDH formatted array 首拍整体
+        // PDH_INVALID_DATA，实例名绑在 cooked 数组里一起拿不到——冷启动
+        // （GPU tick 未跑过）直接开设置页 GPU 区块空白的根因。2026-11-19
+        // 探针实测：首拍 rc=0xc0000bba，双样本后 1095 实例/13 engtype 全齐。
+        // 首拍只作预热，+60ms 双样本即取（同 tick 侧 +50ms 有效实测）。
+        PdhCollectQueryData(q);
+        Sleep(60);
+        PdhCollectQueryData(q);
         std::vector<PDH_FMT_COUNTERVALUE_ITEM_W> items;
         std::vector<BYTE> buf;
         if (GetFormattedArray(c, buf, items)) {
