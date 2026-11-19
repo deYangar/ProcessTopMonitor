@@ -130,7 +130,6 @@ private:
     void CycleKind(int step);
     enum StatusTone {
         ToneIoGrade,      // 黄：IO C 档警示
-        ToneEventsLost,   // 黄：ETW 丢事件
         ToneGpuG2,        // 灰：G2 档无引擎命名说明
         ToneGpuHidden,    // 黄：GPU 维度不可用原因
         ToneSplitWarmup,  // 灰：核型采样预热中（会话未交付首窗，闪现治本刀3）
@@ -216,7 +215,6 @@ private:
     uint64_t m_mem_total = 0, m_mem_used = 0;
     double m_io_read_total = 0, m_io_write_total = 0;
     FileIoGrade m_io_grade = FileIoGrade::C;
-    uint64_t m_io_events_lost = 0;
     // GPU / VRAM
     double m_gpu_total = 0;
     bool m_gpu_total_valid = false;

@@ -64,7 +64,7 @@ enum class FileIoGrade { A, B, C, Off };
 class EtwFileCollector {
 public:
     // IoDelta: 内核会话增量（FileIo 字节 + 核型样本），自上次被接管的
-    // TakeDelta 起累计，外加会话累计 EventsLost（低频查询）。
+    // TakeDelta 起累计。
     struct IoDelta {
         std::unordered_map<DWORD, std::pair<uint64_t, uint64_t>> per_pid; // pid -> (read,write)
         // ---- 核型时间账通道（§4.2 定案 + 2026-11-09 实测口径修正，与 IO
@@ -81,7 +81,6 @@ public:
         // 归因缺口）；Homog/未知核时间只进 total 不进群（与分子口径配对）
         uint64_t sample_class_total[2] = { 0, 0 };
         bool sample_valid = false;      // 异构且交付窗口完整才置 true
-        uint64_t events_lost = 0;
         // 本次交付覆盖的真实窗口长度（上次被消费的 handoff → 本次 handoff，
         // µs；方案三窗口记账）——Build 的速率分母，不再除 tick 假 dt
         uint64_t window_us = 0;
@@ -226,8 +225,7 @@ private:
     bool m_own_session = false;         // consumer thread
     TRACEHANDLE m_own_session_handle = 0;
     bool m_using_kernel_logger = false; // B grade: NT Kernel Logger
-    uint64_t m_events_lost = 0;
-    uint64_t m_events_lost_last_query = 0;
+    uint64_t m_events_lost = 0;         // 会话累计 EventsLost（仅日志留痕，UI 不显示）
     ULONGLONG m_last_lost_query = 0;
 
     // payload pointer width: kernel bitness, resolved once at Start()

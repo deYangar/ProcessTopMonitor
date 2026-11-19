@@ -77,7 +77,6 @@ struct MetricsSnapshot {
     int tm_gpu_temp = 0;
     int tm_cpu_freq = 0;                 // MHz
     FileIoGrade io_grade = FileIoGrade::C;
-    uint64_t io_events_lost = 0;
     ULONGLONG stamp = 0;
 };
 

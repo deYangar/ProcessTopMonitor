@@ -492,7 +492,6 @@ void EtwFileCollector::ConsumerLoop() {
         m_using_kernel_logger = use_kernel_logger;
         m_cur_consumer = consumer;
         m_events_lost = 0;
-        m_events_lost_last_query = 0;
         c_fast_left = 4;   // 会话成功重建：C 档快重试配额重置（方案二）
         m_log_was_valid = false;   // 新会话：接管转换日志从头记
 
@@ -764,7 +763,10 @@ ULONG WINAPI EtwFileCollector::BufferCallback(PEVENT_TRACE_LOGFILEW logfile) {
 }
 
 void EtwFileCollector::QueryEventsLost() {
-    // low-rate ControlTrace QUERY for the cumulative EventsLost counter
+    // low-rate ControlTrace QUERY for the cumulative EventsLost counter.
+    // UI 警示行已删（2026-11-19 拍板）：EventsLost 是会话累计值，一次突发
+    // 就常驻黄警到会话重建，且丢帧量级（百万分之一以下）对显示无感——
+    // 这里只做 debug 日志增量留痕，诊断取证用
     if (!m_own_session_handle && !m_using_kernel_logger) return;
     ULONGLONG now = GetTickCount64();
     if (m_last_lost_query && now - m_last_lost_query < 5000) return;
@@ -777,7 +779,12 @@ void EtwFileCollector::QueryEventsLost() {
         rc = ControlTraceW(m_own_session_handle, nullptr, p, EVENT_TRACE_CONTROL_QUERY);
     else
         rc = ControlTraceW(0, KERNEL_LOGGER_NAMEW, p, EVENT_TRACE_CONTROL_QUERY);
-    if (rc == ERROR_SUCCESS) m_events_lost = p->EventsLost;
+    if (rc == ERROR_SUCCESS && p->EventsLost != m_events_lost) {
+        LogLine(L"EventsLost %llu (+%llu)",
+                (unsigned long long)p->EventsLost,
+                (unsigned long long)(p->EventsLost - m_events_lost));
+        m_events_lost = p->EventsLost;
+    }
 }
 
 void EtwFileCollector::FlushForHandoff() {
@@ -916,7 +923,6 @@ void EtwFileCollector::TakeDelta(IoDelta& out, uint64_t min_window_us) {
                 }
             }
             QueryEventsLost();
-            out.events_lost = m_events_lost;
             return;
         }
         Sleep(1);

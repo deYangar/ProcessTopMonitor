@@ -1415,19 +1415,6 @@ void CProcessTopPlugin::GetIoStatusForDialog(wchar_t* out, size_t cap) {
         wcsncpy_s(out, cap, TR(L"未运行（当前没有磁盘 IO 窗口，自动停止）"), _TRUNCATE);
         break;
     }
-    uint64_t lost = 0;
-    {
-        EnterCriticalSection(&m_data_lock);
-        lost = m_snapshot.io_events_lost;
-        LeaveCriticalSection(&m_data_lock);
-    }
-    if (lost > 0) {
-        wchar_t lbuf[48];
-        // C-4：TR 译文进固定缓冲 → _TRUNCATE 截断语义（failfast 免疫）
-        _snwprintf_s(lbuf, 48, _TRUNCATE, TR(L"｜丢事件：%llu"),
-                     (unsigned long long)lost);
-        if (wcslen(out) + wcslen(lbuf) < cap) wcscat_s(out, cap, lbuf);
-    }
 }
 
 void CProcessTopPlugin::DataRequired() {

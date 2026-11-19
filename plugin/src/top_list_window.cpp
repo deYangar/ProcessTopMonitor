@@ -1848,7 +1848,6 @@ void CTopListWindow::ApplySnapshotForCurrentView(const MetricsSnapshot& snap) {
     m_io_read_total = snap.io_read_total_bps;
     m_io_write_total = snap.io_write_total_bps;
     m_io_grade = snap.io_grade;
-    m_io_events_lost = snap.io_events_lost;
     m_gpu_total = snap.gpu_total_pct;
     m_gpu_total_valid = snap.gpu_total_valid;
     m_vram_sys_ded = snap.vram_sys_dedicated;
@@ -2048,7 +2047,6 @@ void CTopListWindow::LoadDemoSnapshot(int kind) {
     m_kind = (MetricKind)kind;
     m_io_view = 0;
     m_io_grade = FileIoGrade::A;   // 正常档：黄警/灰说明状态行全不出
-    m_io_events_lost = 0;
     m_gpu_grade = GpuGrade::G1;
     m_gpu_reason.clear();
     m_gpu_total = 37.5;
@@ -2244,9 +2242,6 @@ void CTopListWindow::ActiveStatusLines(StatusTone out[4], int& count) const {
     count = 0;
     if (m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C)
         out[count++] = ToneIoGrade;
-    if (m_io_events_lost > 0 &&
-        !(m_kind == MetricKind::DiskIo && m_io_grade == FileIoGrade::C))
-        out[count++] = ToneEventsLost;
     if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G2)
         out[count++] = ToneGpuG2;
     if (m_kind == MetricKind::Gpu && m_gpu_grade == GpuGrade::G3 &&
@@ -2493,7 +2488,7 @@ void CTopListWindow::DrawSummary(HDC hdc, int w, int y) {
 }
 
 void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y, StatusTone tone) {
-    // 黄色警示：档位/丢事件如实标注（口径不冒充，方案 §2.3）；
+    // 黄色警示：档位如实标注（口径不冒充，方案 §2.3）；
     // 灰色：信息性档位说明（G2 无引擎命名）
     wchar_t text[256] = L"";
     // C-4（2026-11-10 审查）：TR() 译文进固定缓冲一律 _TRUNCATE 截断
@@ -2502,9 +2497,6 @@ void CTopListWindow::DrawStatusLine(HDC hdc, int w, int y, StatusTone tone) {
     if (tone == ToneIoGrade) {
         _snwprintf_s(text, 256, _TRUNCATE,
                      TR(L"\u26a0 IO 口径：全句柄（含网络）——需要管理员权限获取精确磁盘口径"));
-    } else if (tone == ToneEventsLost) {
-        _snwprintf_s(text, 256, _TRUNCATE,
-                     TR(L"\u26a0 ETW 缓冲不足，已丢失 %llu 个事件"), m_io_events_lost);
     } else if (tone == ToneGpuG2) {
         _snwprintf_s(text, 256, _TRUNCATE,
                      TR(L"GPU 口径：全部节点求和（本系统无引擎类型细分）"));

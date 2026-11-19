@@ -311,7 +311,6 @@ void TopAggregator::Build(const CpuMemIoMetrics& m,
         out.io_write_total_bps = w;
     }
     out.io_grade = etw_exact ? FileIoGrade::A : FileIoGrade::C;   // caller overwrites with the true grade (A/B/C)
-    out.io_events_lost = io_delta ? io_delta->events_lost : 0;
 
     // GPU/VRAM summary + grade passthrough (窗口状态行/口径菜单用)
     if (gpu) {
