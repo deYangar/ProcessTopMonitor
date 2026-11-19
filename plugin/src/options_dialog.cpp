@@ -49,6 +49,14 @@ enum {
 
 // ---- 对话框会话状态（单开，模态期内独占）----
 namespace {
+// 宽度锚点（issue #2 方案 D）：窗口可拖宽，子控件按锚点重排
+enum PtAnchor { PA_LEFT = 0, PA_RIGHT = 1, PA_STRETCH = 2 };
+struct PtDlgItem {
+    HWND h;
+    RECT r;        // 基线客户区 rect（y_off=0、内容宽=GW 时采集）
+    int anchor;
+};
+
 struct PtDlgState {
     HWND dlg = nullptr;
     HFONT font = nullptr;
@@ -63,6 +71,10 @@ struct PtDlgState {
     bool snap_popup_topmost = true, snap_popup_click_through = false;
     int preview_color = -1;   // 预览实例当前颜色模式（变化时置双底脏）
     ULONGLONG retry_tick = 0; // IO 重试请求发出时刻（轮询刷新计时用，C-1/P-3）
+    // 滚动与锚点重排（issue #2 方案 A+D，2026-11-19）
+    int content_h = 0;             // 滚动内容总高（基线坐标，按钮行上缘+余量）
+    int y_off = 0;                 // 当前垂直滚动偏移（0=顶部）
+    std::vector<PtDlgItem> items;  // 子控件基线与锚点（WM_CREATE 尾部采集）
     bool changed = false;
 } g_st;
 
@@ -178,6 +190,135 @@ void PtCboAdd(HWND dlg, int id, const wchar_t* text, int data) {
     HWND c = GetDlgItem(dlg, id);
     int at = (int)SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)text);
     SendMessageW(c, CB_SETITEMDATA, at, (LPARAM)data);
+}
+
+// ---- 滚动 + 锚点重排（issue #2 方案 A+D，2026-11-19）----
+// 内容高度超客户区时垂直滚动，确定/取消固定底部；宽度可拖大，子控件按
+// 锚点重排：组框/宽说明行拉伸，右缘控件（预设/重试/打开目录/颜色模式/
+// 确定取消）随右缘平移，其余左锚不动。宽度不可拖小于内容宽（控件全部
+// SS_LEFTNOWORDWRAP 不换行，压窄必截断）。
+
+// 锚点自动判定（基线采集时逐控件跑一遍；新增控件无需登记，规则兜底）
+// 阈值 GW-140：STRETCH 集合（G3 reason/G2 说明/IO 状态行/IO 说明/日志
+// 路径/穿透说明，基线宽 ≥ GW-140）与 LEFT 集合（最宽 checkbox 440）之间
+// 的安全带
+int PtAnchorOf(HWND ctrl, int ctrl_w) {
+    int id = GetDlgCtrlID(ctrl);
+    LONG_PTR style = GetWindowLongPtrW(ctrl, GWL_STYLE);
+    if ((style & BS_GROUPBOX) == BS_GROUPBOX) return PA_STRETCH;
+    if (id == IDOK || id == IDCANCEL || id == IDC_PRESET_ALL || id == IDC_PRESET_D3D ||
+        id == IDC_PRESET_COMPUTE || id == IDC_IO_RETRY || id == IDC_OPENDEBUG_BTN ||
+        id == IDC_COLOR_CBO)
+        return PA_RIGHT;
+    if (id == IDC_IO_STATUS) return PA_STRETCH;
+    wchar_t cls[16];
+    if (GetClassNameW(ctrl, cls, 16) && wcscmp(cls, L"STATIC") == 0 &&
+        ctrl_w >= Sc(660) - 2 * Sc(16) - Sc(140))
+        return PA_STRETCH;
+    return PA_LEFT;
+}
+
+// 基线采集：WM_CREATE 尾部（控件全建完、y_off=0、内容宽=GW）跑一次
+void PtCollectItems(HWND hwnd) {
+    g_st.items.clear();
+    struct Helper {   // EnumChildWindows 回调走静态中转
+        static BOOL CALLBACK OnItem(HWND h, LPARAM lp) {
+            RECT r;
+            GetWindowRect(h, &r);
+            MapWindowPoints(HWND_DESKTOP, (HWND)lp, (LPPOINT)&r, 2);
+            g_st.items.push_back({ h, r, PtAnchorOf(h, r.right - r.left) });
+            return TRUE;
+        }
+    };
+    EnumChildWindows(hwnd, Helper::OnItem, (LPARAM)hwnd);
+    // 滚动内容高 = 按钮行上缘 + 按钮行高 + 滚到底留缝（含在内容账里，
+    // 保证滚到底时最后一组底与固定底部的按钮栏之间不重叠；按钮自身 y
+    // 不参与滚动）。配套 dock 公式 y = ch - Sc(26) - Sc(14)：无滚动时与
+    // 基线位逐像素一致（客户高 = rb.bottom + Sc(14)）
+    HWND bok = GetDlgItem(hwnd, IDOK);
+    RECT rb;
+    GetWindowRect(bok, &rb);
+    MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&rb, 2);
+    g_st.content_h = rb.top + Sc(30);
+}
+
+// 滚动条是否可见（GWL_STYLE 的 WS_VSCROLL 位由 ShowScrollBar 维护）
+bool PtVScrollVisible(HWND hwnd) {
+    return (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_VSCROLL) != 0;
+}
+
+// 统一布局（WM_SIZE / 滚动条显隐切换 / 复位）：全量重排，低频路径
+void PtLayout(HWND hwnd) {
+    RECT crc;
+    GetClientRect(hwnd, &crc);
+    int ch = crc.bottom;
+    bool need = g_st.content_h > ch;
+    if (need != PtVScrollVisible(hwnd)) {
+        ShowScrollBar(hwnd, SB_VERT, need);   // 触发 WM_SIZE 重入，态已一致即收敛
+        GetClientRect(hwnd, &crc);
+    }
+    // ew = 客户宽（GetClientRect 对 WS_VSCROLL 窗口已扣滚动条宽，不再重复
+    // 减——2026-11-19 实测钉死：964+26(SM_CXVSCROLL@150%)=990=Sc(660)）
+    int ew = crc.right;
+    int max_off = need ? g_st.content_h - ch : 0;
+    if (g_st.y_off > max_off) g_st.y_off = max_off;
+    if (need) {
+        SCROLLINFO si = { sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS };
+        si.nMin = 0;
+        si.nMax = g_st.content_h - 1;
+        si.nPage = (UINT)ch;
+        si.nPos = g_st.y_off;
+        SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    }
+    // 拉伸量基准 = 基线窗口客户宽 Sc(660)：无滚动时 delta=0 布局与旧版逐
+    // 像素一致；滚动条出现吃掉的宽由创建期 +Sc(20) 补偿（见重设块）
+    int delta_w = ew - Sc(660);
+    for (auto& it : g_st.items) {
+        int x = it.r.left, w = it.r.right - it.r.left;
+        if (it.anchor == PA_RIGHT) x += delta_w;
+        else if (it.anchor == PA_STRETCH) w += delta_w;
+        int y = it.r.top - g_st.y_off;
+        int id = GetDlgCtrlID(it.h);
+        if (id == IDOK || id == IDCANCEL) y = ch - Sc(26) - Sc(14);   // 固定底部
+        SetWindowPos(it.h, nullptr, x, y, w, it.r.bottom - it.r.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+    }
+    InvalidateRect(hwnd, nullptr, TRUE);
+}
+
+// 垂直滚动快路径（滚轮/键盘/拖滚动条）：ScrollWindowEx 位搬运 + 按钮回位
+void PtScrollBy(HWND hwnd, int dy) {
+    RECT crc;
+    GetClientRect(hwnd, &crc);
+    int ch = crc.bottom;
+    if (g_st.content_h <= ch) {   // 无滚动需求（防御）：复位即返
+        if (PtVScrollVisible(hwnd)) PtLayout(hwnd);
+        return;
+    }
+    int max_off = g_st.content_h - ch;
+    int new_off = g_st.y_off + dy;
+    if (new_off < 0) new_off = 0;
+    if (new_off > max_off) new_off = max_off;
+    int actual = new_off - g_st.y_off;
+    if (!actual) return;
+    g_st.y_off = new_off;
+    ScrollWindowEx(hwnd, 0, -actual, nullptr, nullptr, 0, nullptr,
+                   SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+    // 滚动条位置（SetScrollInfo 不回发 WM_VSCROLL，无递归）
+    SCROLLINFO si = { sizeof(si), SIF_POS };
+    si.nPos = new_off;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    // 确定取消被 SW_SCROLLCHILDREN 带走，拉回底部固定位（水平位不动：
+    // 基线采集/PtLayout 已按当前宽度落定）
+    HWND bok = GetDlgItem(hwnd, IDOK), bcan = GetDlgItem(hwnd, IDCANCEL);
+    RECT rb, rc;
+    GetWindowRect(bok, &rb);
+    MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&rb, 2);
+    GetWindowRect(bcan, &rc);
+    MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&rc, 2);
+    int y = crc.bottom - Sc(26) - Sc(14);
+    SetWindowPos(bok, nullptr, rb.left, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(bcan, nullptr, rc.left, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // ---- IO 状态行文案（方案 §5）----
@@ -773,6 +914,7 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         PtCreateControls(hwnd);
+        PtCollectItems(hwnd);   // 基线与锚点采集（issue #2 滚动/重排的地基）
         return 0;
     case WM_COMMAND: {
         int id = LOWORD(wp);
@@ -829,9 +971,62 @@ LRESULT CALLBACK PtOptionsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_VSCROLL: {
+        // 拖滚动条/点击箭头与滑槽（issue #2 方案 A）
+        int dy = 0;
+        RECT crc;
+        GetClientRect(hwnd, &crc);
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: dy = -Sc(20); break;
+        case SB_LINEDOWN: dy = Sc(20); break;
+        case SB_PAGEUP: dy = -(crc.bottom - Sc(60)); break;
+        case SB_PAGEDOWN: dy = crc.bottom - Sc(60); break;
+        case SB_THUMBTRACK: {
+            SCROLLINFO si = { sizeof(si), SIF_TRACKPOS };
+            if (GetScrollInfo(hwnd, SB_VERT, &si)) {
+                int new_off = si.nTrackPos;
+                if (new_off < 0) new_off = 0;
+                dy = new_off - g_st.y_off;
+            }
+            break;
+        }
+        default: break;
+        }
+        if (dy) PtScrollBy(hwnd, dy);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        // 滚轮一档滚三行（combo 焦点截胡见模态循环——comctl 会自翻选中项）
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        PtScrollBy(hwnd, delta > 0 ? -Sc(60) : Sc(60));
+        return 0;
+    }
+    case WM_SIZE:
+        PtLayout(hwnd);   // 拖拽缩放/滚动条显隐切换：锚点重排 + 滚动参数更新
+        return 0;
+    case WM_GETMINMAXINFO: {
+        // 最小尺寸钳（方案 D）：宽=内容宽+滚动条补偿（不换行设计，只能拉
+        // 大不能压窄；内容按锚点弹性拉伸，拉大不留白）；高=约两个半组
+        //（再小滚动操作本身失去意义）
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        RECT r = { 0, 0, Sc(680), Sc(420) };
+        AdjustWindowRectEx(&r,
+                           (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE),
+                           FALSE, (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+        mmi->ptMinTrackSize.x = r.right - r.left;
+        mmi->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
     case WM_KEYDOWN:
         if (wp == VK_RETURN) { PtOnOk(hwnd); return 0; }
         if (wp == VK_ESCAPE) { PtOnCancel(hwnd); return 0; }
+        // PgUp/PgDn 滚一页（焦点控件不消费键盘导航键，模态循环截胡投来）
+        if (wp == VK_PRIOR || wp == VK_NEXT) {
+            RECT crc;
+            GetClientRect(hwnd, &crc);
+            PtScrollBy(hwnd, (wp == VK_PRIOR ? -1 : 1) * (crc.bottom - Sc(60)));
+            return 0;
+        }
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CLOSE:
         PtOnCancel(hwnd);
@@ -903,7 +1098,7 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"ProcessTopMonitorOptionsDlg",
         TR(L"插件设置"),
-        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,   // 可拖拽缩放（issue #2 方案 D）
         0, 0, dlg_w, dlg_h,
         hParent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
@@ -912,22 +1107,38 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
         return ITMPlugin::OR_OPTION_NOT_PROVIDED;
     }
 
-    // 高度自适应：引擎行数动态 → 按控件实际底缘重设（±Sc 余量）
+    // 高度自适应：引擎行数动态 → 按控件实际底缘重设（±Sc 余量）；
+    // 超目标屏工作区时 clamp 到工作区（issue #2 方案 A：超高不再出屏，
+    // 内容改走垂直滚动，确定/取消固定底部）。clamp 生效 = 滚动条将出现，
+    // 窗口宽补 Sc(20)：滚动条吃掉 ~17 逻辑客户宽，组框右缘不被压
     {
         HWND last = GetDlgItem(hwnd, IDOK);
         if (last) {
             RECT rc;
             GetWindowRect(last, &rc);
             MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&rc, 2);
-            int need = rc.bottom + Sc(14);
-            if (need != dlg_h) {
-                RECT adj = { 0, 0, dlg_w, need };
-                DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
-                DWORD ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                AdjustWindowRectEx(&adj, style, FALSE, ex);
-                SetWindowPos(hwnd, nullptr, 0, 0, adj.right - adj.left,
-                             adj.bottom - adj.top, SWP_NOMOVE | SWP_NOZORDER);
+            int need_client = rc.bottom + Sc(14);   // 理想客户高（与旧公式同源）
+            DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+            DWORD ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            RECT adj = { 0, 0, dlg_w, need_client };
+            AdjustWindowRectEx(&adj, style, FALSE, ex);
+            int win_w = adj.right - adj.left;
+            int win_h = adj.bottom - adj.top;
+            bool clamped = false;
+            HMONITOR mon = MonitorFromWindow(hParent ? hParent : hwnd,
+                                             MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = { sizeof(mi) };
+            if (GetMonitorInfoW(mon, &mi)) {
+                int wa_h = mi.rcWork.bottom - mi.rcWork.top;
+                if (win_h > wa_h) { win_h = wa_h; clamped = true; }
             }
+            if (clamped) {
+                RECT wadj = { 0, 0, dlg_w + Sc(20), need_client };
+                AdjustWindowRectEx(&wadj, style, FALSE, ex);
+                win_w = wadj.right - wadj.left;
+            }
+            SetWindowPos(hwnd, nullptr, 0, 0, win_w, win_h,
+                         SWP_NOMOVE | SWP_NOZORDER);   // 触发 WM_SIZE→PtLayout
         }
     }
 
@@ -954,13 +1165,33 @@ ITMPlugin::OptionReturn PtShowOptionsDialog(HWND hParent) {
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
-    // 模态循环（PNM 同款）
+    // 模态循环（PNM 同款）+ 输入截胡（issue #2 滚动配套）：
+    // ① 滚轮默认路由到焦点控件——焦点在 combo 上时 comctl 会自翻选中项
+    //   （把「刷新间隔」滚成别的值），下拉未展开时改投主窗走页面滚动；
+    //   展开中的下拉是独立 popup 窗口，IsChild 为 FALSE 不进分支（归列表）
+    // ② PgUp/PgDn 键盘消息发给焦点控件，主窗收不到——改投主窗滚一页
     HWND hPar = hParent;
     if (hPar) EnableWindow(hPar, FALSE);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (!IsWindow(hwnd)) break;
-        if (!IsDialogMessageW(hwnd, &msg)) {
+        bool redirected = false;
+        if (IsChild(hwnd, msg.hwnd)) {
+            if (msg.message == WM_MOUSEWHEEL) {
+                HWND f = GetFocus();
+                bool combo_open = f && SendMessageW(f, CB_GETDROPPEDSTATE, 0, 0) != 0;
+                if (!combo_open) { msg.hwnd = hwnd; redirected = true; }
+            } else if (msg.message == WM_KEYDOWN &&
+                       (msg.wParam == VK_PRIOR || msg.wParam == VK_NEXT)) {
+                msg.hwnd = hwnd;
+                redirected = true;
+            }
+        }
+        if (redirected) {
+            // 截胡消息不走 IsDialogMessage（防它把 PgUp 当导航键消化掉）
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        } else if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
